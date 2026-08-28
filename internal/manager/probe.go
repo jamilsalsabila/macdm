@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"macdm/internal/dash"
-	"macdm/internal/engine"
 	"macdm/internal/extractor"
 	"macdm/internal/hls"
 	"macdm/internal/sniff"
@@ -34,7 +33,7 @@ type ProbeResult struct {
 // Probe inspects a URL without downloading. It is best-effort: network hiccups
 // return a minimal result rather than an error so the dialog still opens.
 func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]string) *ProbeResult {
-	ctx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	u, err := url.Parse(strings.TrimSpace(rawurl))
@@ -93,7 +92,11 @@ func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]s
 		res.Filename = strings.TrimSuffix(res.Filename, path.Ext(res.Filename)) + ".mp4"
 
 	default: // plain HTTP
-		pr, err := engine.New(m.cfg.Engine).ProbeURL(ctx, rawurl, headers)
+		// A short cap: the dialog only needs size/resume, and a CDN that is
+		// going to reject us (TikTok) should not hold "Detecting…" for 10s.
+		pctx, pcancel := context.WithTimeout(ctx, 5*time.Second)
+		defer pcancel()
+		pr, err := m.eng.ProbeURL(pctx, rawurl, headers)
 		if err != nil {
 			res.Note = err.Error()
 			return res

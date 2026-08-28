@@ -195,7 +195,11 @@ final class DownloadDetailWindowController: NSWindowController, NSTableViewDataS
     private func cleanError(_ s: String) -> String {
         var e = s
         for p in ["yt-dlp: ERROR: ", "ERROR: "] where e.hasPrefix(p) { e.removeFirst(p.count) }
-        if e.contains("HTTP Error 403") || e.contains("403: Forbidden") { return "blocked by the site (HTTP 403)" }
+        // Keep a server-supplied reason ("403 Forbidden — <reason>"); only
+        // collapse a bare 403 with nothing useful after it.
+        if (e.contains("403") && !e.contains(" — ")) || e.contains("HTTP Error 403") {
+            return "blocked by the site (HTTP 403)"
+        }
         if e.contains("Unsupported URL") { return "this link isn't a downloadable video page" }
         if e.contains("Unable to download webpage") { return "couldn't reach the video page" }
         if e.count > 160 { e = String(e.prefix(157)) + "…" }

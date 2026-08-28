@@ -136,6 +136,10 @@ func (e *Engine) ProbeURL(ctx context.Context, rawurl string, headers map[string
 	defer func() { _, _ = io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		snip, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		if s := strings.TrimSpace(collapseWS(string(snip))); s != "" {
+			return nil, fmt.Errorf("probe: %s — %s", resp.Status, s)
+		}
 		return nil, fmt.Errorf("probe: unexpected status %s", resp.Status)
 	}
 
@@ -423,7 +427,7 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 	defer resp.Body.Close()
 
 	if single && resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("expected 200, got %s", resp.Status)
+		return 0, statusErr(resp)
 	}
 	// The server ignored our Range header and sent the whole body (some CDNs —
 	// Instagram/Facebook — range via query params instead). If this is the
@@ -434,7 +438,7 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 		return 0, errRangeIgnored
 	}
 	if !single && resp.StatusCode != http.StatusPartialContent && !fullBody {
-		return 0, fmt.Errorf("expected 206, got %s", resp.Status)
+		return 0, statusErr(resp)
 	}
 
 	setChunkStatus(scMu, c, "receiving")
@@ -490,6 +494,22 @@ func filenameFrom(rawurl, contentDisposition string) string {
 		}
 	}
 	return "download"
+}
+
+// collapseWS turns any run of whitespace into a single space — for squeezing a
+// server error page into one readable line.
+func collapseWS(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// statusErr builds an error from a non-2xx response, appending a snippet of the
+// body (CDN 403 pages usually say *why* — bad signature, expired, region).
+func statusErr(resp *http.Response) error {
+	snip, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+	if s := collapseWS(string(snip)); s != "" {
+		return fmt.Errorf("%s — %s", resp.Status, s)
+	}
+	return fmt.Errorf("unexpected status %s", resp.Status)
 }
 
 func sanitizeName(s string) string {
