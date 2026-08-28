@@ -448,7 +448,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             }));
             break;
           }
-          // 2. Fall back to the caught <video> stream URL — needs the tiktok.com
+          // 2. On a real video page, hand the permalink to yt-dlp (nightly).
+          const permalink = /\/@[\w.-]+\/(video|photo)\/\d+/.test(new URL(referer).pathname)
+            ? referer : (isExtractableURL(msg.url) ? msg.url : null);
+          if (permalink) {
+            sendResponse(await startDownload({
+              url: permalink, referer,
+              title: msg.title || tab?.title,
+            }));
+            break;
+          }
+          // 3. Fall back to the caught <video> stream URL — needs the tiktok.com
           //    cookies (httpOnly ttwid etc.) or it 403s.
           if (cookie) {
             sendResponse(await startDownload({
@@ -458,7 +468,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             }));
             break;
           }
-          sendResponse({ ok: false, error: "let the video play for a second, then try again" });
+          sendResponse({ ok: false, error: "open the video on its own page, then try again" });
           break;
         }
 
