@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MacDM</title>
+<style>
+  :root {
+    --bg: #f6f6f7; --card: #fff; --fg: #1c1c1e; --muted: #8a8a8e;
+    --accent: #0a84ff; --border: #e2e2e4; --ok: #34c759; --err: #ff3b30;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1c1c1e; --card:#2c2c2e; --fg:#f2f2f7; --muted:#98989e; --border:#3a3a3c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
+         background:var(--bg); color:var(--fg); padding:24px; }
+  h1 { font-size:18px; margin:0 0 16px; }
+  form { display:flex; gap:8px; margin-bottom:20px; }
+  input[type=url] { flex:1; padding:8px 10px; border:1px solid var(--border);
+                    border-radius:8px; background:var(--card); color:var(--fg); }
+  button { padding:8px 14px; border:0; border-radius:8px; background:var(--accent);
+           color:#fff; cursor:pointer; font-weight:600; }
+  button.ghost { background:transparent; color:var(--accent); font-weight:500; padding:4px 8px; }
+  .job { background:var(--card); border:1px solid var(--border); border-radius:10px;
+         padding:12px 14px; margin-bottom:10px; }
+  .job .top { display:flex; justify-content:space-between; gap:12px; align-items:baseline; }
+  .name { font-weight:600; word-break:break-all; }
+  .meta { color:var(--muted); font-size:12px; margin-top:4px; }
+  .bar { height:6px; background:var(--border); border-radius:3px; margin-top:8px; overflow:hidden; }
+  .bar > i { display:block; height:100%; background:var(--accent); width:0; transition:width .3s; }
+  .segbar { position:relative; height:10px; background:var(--border); border-radius:3px;
+            margin-top:8px; overflow:hidden; }
+  .segbar > span { position:absolute; top:0; height:100%; background:var(--accent);
+                   border-right:1px solid var(--card); box-sizing:border-box; transition:width .3s; }
+  .segbar > span.done { background:var(--ok); }
+  .segbar > span.connecting { background:#ff9f0a; }
+  .conns { margin-top:8px; width:100%; border-collapse:collapse; font-size:11px; }
+  .conns th, .conns td { text-align:left; padding:2px 6px; border-bottom:1px solid var(--border);
+                         color:var(--muted); }
+  .conns th { font-weight:600; }
+  details.det { margin-top:6px; }
+  details.det summary { cursor:pointer; color:var(--accent); font-size:12px; }
+  .status { font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  .status.completed { color:var(--ok); }
+  .status.error, .status.drm_protected { color:var(--err); }
+  .actions { margin-top:6px; display:flex; gap:4px; }
+  .empty { color:var(--muted); }
+</style>
+</head>
+<body>
+<h1>MacDM &mdash; downloads</h1>
+<form id="add">
+  <input type="url" id="url" placeholder="Paste a URL to download" required>
+  <button type="submit">Add</button>
+</form>
+<div id="list"><p class="empty">No downloads yet.</p></div>
+
+<script>
+const jobs = new Map();
+
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + " " + u[i];
+}
+function fmtSpeed(n) { return n ? fmtBytes(n) + "/s" : ""; }
+
+function render() {
+  const list = document.getElementById("list");
+  if (jobs.size === 0) { list.innerHTML = '<p class="empty">No downloads yet.</p>'; return; }
+  const arr = [...jobs.values()].sort((a,b) => (b.created_at||"").localeCompare(a.created_at||""));
+  list.innerHTML = arr.map(j => {
+    const pct = j.total_bytes ? Math.min(100, 100*j.done_bytes/j.total_bytes) : 0;
+    const size = j.total_bytes ? fmtBytes(j.done_bytes)+" / "+fmtBytes(j.total_bytes) : fmtBytes(j.done_bytes);
+    const conns = j.conns || [];
+    const covered = conns.reduce((s, c) => s + Math.max(0, c.total || 0), 0);
+    const realSplit = conns.length && j.total_bytes && covered >= j.total_bytes * 0.95;
+    const span = realSplit
+      ? conns.map(c => {
+          const w = 100 * (c.total||0) / j.total_bytes;
+          const l = 100 * (c.start||0) / j.total_bytes;
+          const fill = c.total ? Math.min(w, w * (c.downloaded||0) / c.total) : 0;
+          return `<span class="${c.status}" style="left:${l}%;width:${fill}%"></span>`;
+        }).join("")
+      : `<span class="${j.status==='completed'?'done':''}" style="left:0;width:${j.status==='completed'?100:pct}%"></span>`;
+    const table = conns.length ? `
+      <details class="det"><summary>Show details &mdash; progress by connections</summary>
+      <table class="conns"><tr><th>#</th><th>Downloaded</th><th>Info</th></tr>
+      ${conns.map(c => `<tr><td>${(c.index??0)+1}</td><td>${fmtBytes(c.downloaded||0)}${c.total?' / '+fmtBytes(c.total):''}</td><td>${c.info||c.status||''}</td></tr>`).join("")}
+      </table></details>` : "";
+    return `<div class="job">
+      <div class="top">
+        <span class="name">${j.filename||j.url}</span>
+        <span class="status ${j.status}">${j.status}</span>
+      </div>
+      <div class="segbar">${span}</div>
+      <div class="meta">${size} &middot; ${pct.toFixed(1)}% &middot; ${fmtSpeed(j.speed_bps)} &middot; ${j.connections||1} conn${j.quality ? ' &middot; '+j.quality : ''}${j.error ? ' &middot; <span style="color:var(--err)">'+j.error+'</span>' : ''}</div>
+      ${table}
+      <div class="actions">
+        <button class="ghost" onclick="cmd('${j.id}','pause')">Pause</button>
+        <button class="ghost" onclick="cmd('${j.id}','resume')">Resume</button>
+        <button class="ghost" onclick="del('${j.id}')">Remove</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function cmd(id, action) {
+  await fetch(`/api/jobs/${id}/${action}`, { method: "POST" });
+}
+async function del(id) {
+  await fetch(`/api/jobs/${id}`, { method: "DELETE" });
+  jobs.delete(id); render();
+}
+
+document.getElementById("add").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const url = document.getElementById("url").value.trim();
+  if (!url) return;
+  const r = await fetch("/api/jobs", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url })
+  });
+  if (!r.ok) { alert((await r.json()).error || "failed"); return; }
+  document.getElementById("url").value = "";
+});
+
+const es = new EventSource("/api/events");
+es.onmessage = (m) => {
+  const ev = JSON.parse(m.data);
+  if (ev.type === "delete") jobs.delete(ev.job.id);
+  else jobs.set(ev.job.id, ev.job);
+  render();
+};
+</script>
+</body>
+</html>

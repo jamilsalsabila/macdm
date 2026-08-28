@@ -1,0 +1,13 @@
+/bin/
+/app/.build/
+*.part
+*.macdm
+*.macdmf
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Extension signing key — private, never publish
+*.pem
+.keys/*.pem

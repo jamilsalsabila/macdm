@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    width: 340px; margin: 0; padding: 12px;
+    font: 13px/1.4 -apple-system, system-ui, sans-serif;
+    background: Canvas; color: CanvasText;
+  }
+  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  h1 { font-size: 14px; margin: 0; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+  .dot.up { background: #34c759; } .dot.down { background: #ff3b30; }
+  .status { font-size: 11px; color: GrayText; }
+  .item { border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+          border-radius: 8px; padding: 8px; margin-bottom: 6px; }
+  .item .k { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: GrayText; }
+  .item .u { word-break: break-all; font-size: 11px; margin: 2px 0 6px; }
+  button { font: inherit; border: 0; border-radius: 6px; padding: 5px 10px;
+           background: #0a84ff; color: #fff; cursor: pointer; }
+  .empty { color: GrayText; text-align: center; padding: 16px 0; }
+  .page-dl { width: 100%; margin-bottom: 10px; background: #5856d6; }
+  .group { font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
+           color: GrayText; margin: 8px 0 4px; }
+  .foot { margin-top: 10px; padding-top: 8px; border-top: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+          font-size: 11px; display: flex; align-items: center; gap: 6px; color: GrayText; }
+</style>
+</head>
+<body>
+<header>
+  <h1>MacDM</h1>
+  <span class="status"><span id="dot" class="dot down"></span><span id="stat">checking…</span></span>
+</header>
+<button class="page-dl" id="pageDl">Extract video from this page</button>
+<div id="list"><div class="empty">Nothing caught on this tab yet.<br>Play a video or start a download.</div></div>
+<label class="foot"><input type="checkbox" id="takeover"> Catch every browser download (aggressive)</label>
+<script src="popup.js"></script>
+</body>
+</html>

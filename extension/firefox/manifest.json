@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "MacDM Integration",
+  "version": "0.1.0",
+  "description": "Catch media streams the browser loads and send them (or any link) to the MacDM download manager.",
+  "browser_specific_settings": {
+    "gecko": { "id": "macdm@example.invalid", "strict_min_version": "121.0" }
+  },
+  "permissions": ["webRequest", "tabs", "storage", "contextMenus", "nativeMessaging", "downloads"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "scripts": ["background.js"] },
+  "action": { "default_popup": "popup.html", "default_title": "MacDM" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
