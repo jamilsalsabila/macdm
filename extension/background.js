@@ -196,6 +196,13 @@ const RELEVANT_HEADERS = ["referer", "origin", "user-agent", "cookie", "authoriz
 // (the daemon sets its own ranges).
 const CAPTURE_HEADERS = [...RELEVANT_HEADERS, "range"];
 
+// "extraHeaders" is a Chrome-only opt-in for seeing Cookie/Referer/etc. Firefox
+// exposes those headers without it and *rejects* the unknown spec value.
+const IS_FIREFOX =
+  typeof navigator !== "undefined" && /firefox/i.test(navigator.userAgent || "");
+const reqSpec = IS_FIREFOX ? ["requestHeaders"] : ["requestHeaders", "extraHeaders"];
+const respSpec = IS_FIREFOX ? ["responseHeaders"] : ["responseHeaders", "extraHeaders"];
+
 chrome.webRequest.onSendHeaders.addListener(
   (details) => {
     if (details.tabId < 0) return;
@@ -209,7 +216,7 @@ chrome.webRequest.onSendHeaders.addListener(
     }
   },
   { urls: ["<all_urls>"] },
-  ["requestHeaders", "extraHeaders"]
+  reqSpec
 );
 
 chrome.webRequest.onHeadersReceived.addListener(
@@ -271,7 +278,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     }
   },
   { urls: ["<all_urls>"] },
-  ["responseHeaders", "extraHeaders"]
+  respSpec
 );
 
 chrome.tabs.onRemoved.addListener((tabId) => { caught.delete(tabId); fragGroups.delete(tabId); });

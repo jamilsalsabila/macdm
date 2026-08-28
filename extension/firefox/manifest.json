@@ -4,7 +4,10 @@
   "version": "0.1.0",
   "description": "Catch media streams the browser loads and send them (or any link) to the MacDM download manager.",
   "browser_specific_settings": {
-    "gecko": { "id": "macdm@example.invalid", "strict_min_version": "121.0" }
+    "gecko": {
+      "id": "macdm@example.invalid",
+      "strict_min_version": "128.0"
+    }
   },
   "permissions": ["webRequest", "tabs", "storage", "contextMenus", "nativeMessaging", "downloads"],
   "host_permissions": ["<all_urls>"],

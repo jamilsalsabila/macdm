@@ -32,9 +32,17 @@ bundled**), the unpacked browser extension, and `INSTALL.txt`. To install:
    ad-hoc signed, not notarised — this is a one-time Gatekeeper step). The
    menu-bar arrow icon means it's running. The app registers the native-
    messaging host and clears its own quarantine flag automatically.
-3. **Add the extension:** `chrome://extensions` → enable **Developer mode** →
-   **Load unpacked** → pick the **MacDM Extension** folder. Click the toolbar
-   icon; it should say *daemon connected*.
+3. **Add the extension:**
+   - **Chrome / Edge / Brave / Vivaldi / Arc:** `chrome://extensions` → enable
+     **Developer mode** → **Load unpacked** → pick the **MacDM Extension
+     (Chrome)** folder (copy it somewhere permanent first).
+   - **Firefox:** regular Firefox refuses unsigned add-ons. On Firefox Developer
+     Edition / Nightly / ESR, set `xpinstall.signatures.required = false` in
+     `about:config`, then open **MacDM Extension (Firefox).xpi**. On any Firefox,
+     `about:debugging` → *This Firefox* → *Load Temporary Add-on* works until the
+     next restart.
+
+   Then click the toolbar icon; it should say *daemon connected*.
 
 The daemon keeps its bundled `yt-dlp` current (daily check, or **Settings →
 Bundled tools → Update now**); the fresh copy lands in
@@ -118,7 +126,7 @@ web page      (:7345/)     ──HTTP + SSE──►  │  engine · sniff · hl
 | `internal/hls` `internal/dash` | Go | manifest parsing + concurrent segment assembly (+ AES-128) |
 | `internal/extractor` | Go | `yt-dlp` wrapper (format probe, download, progress) |
 | `internal/mux` | Go | `ffmpeg` wrapper (remux / combine tracks, stream copy only) |
-| `extension/` | JS | MV3 extension (Chrome/Edge/Brave + a Firefox manifest) |
+| `extension/` | JS | MV3 extension; shared JS, `extension/firefox/manifest.json` for the Firefox build (`scripts/build-firefox-xpi.sh`) |
 | `app/` | Swift | AppKit menu-bar app (`NSStatusItem` + popover) |
 
 ---
@@ -134,8 +142,11 @@ go build -o bin/macdm-nmhost ./cmd/macdm-nmhost
 # menu-bar app (Command Line Tools are enough — no full Xcode)
 ( cd app && ./build.sh bundle )        # -> app/.build/MacDM.app
 
-# distributable disk image
+# distributable disk image (also builds the Firefox .xpi)
 scripts/make-dmg.sh                    # -> dist/MacDM-<version>.dmg
+
+# just the Firefox extension
+scripts/build-firefox-xpi.sh          # -> build/firefox-extension/ + dist/MacDM-firefox.xpi
 ```
 
 `app/build.sh bundle` runs `app/fetch-tools.sh`, which downloads the
@@ -229,9 +240,14 @@ the connection table. Handy for headless boxes.
    to have MacDM intercept `.zip` / `.dmg` / `.pdf` / … downloads the way IDM
    does. Off by default.
 
-**Firefox:** `about:debugging` → *This Firefox* → *Load Temporary Add-on* →
-`extension/firefox/manifest.json`. The host script also installs the Firefox
-manifest (fixed id `macdm@example.invalid`).
+**Firefox:** `scripts/build-firefox-xpi.sh` assembles the shared JS with
+`extension/firefox/manifest.json` into `build/firefox-extension/` and
+`dist/MacDM-firefox.xpi`. Load the folder via `about:debugging` → *This Firefox*
+→ *Load Temporary Add-on* (gone on restart), or the `.xpi` on Developer
+Edition / Nightly / ESR after setting `xpinstall.signatures.required = false`.
+Regular Firefox needs an AMO-signed build. `background.js` drops the Chrome-only
+`extraHeaders` spec when it detects Firefox; the app / `scripts/install-host.sh`
+register the native-messaging host (fixed id `macdm@example.invalid`).
 
 ---
 
