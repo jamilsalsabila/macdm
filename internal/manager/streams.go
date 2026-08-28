@@ -270,12 +270,34 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 	if d := filepath.Dir(j.Dest); d != "." && d != "" {
 		outDir = d
 	}
-	res, err := ex.Download(ctx, j.URL, extractor.DownloadOptions{
+
+	// Watchdog: if yt-dlp never starts downloading (stuck in extraction —
+	// throttled, broken extractor, dead network) fail with a clear message
+	// instead of leaving the job on "Resolving…" forever.
+	wdCtx, wdCancel := context.WithCancel(ctx)
+	defer wdCancel()
+	started := make(chan struct{}, 1)
+	stalled := make(chan struct{})
+	go func() {
+		select {
+		case <-started:
+		case <-wdCtx.Done():
+		case <-time.After(75 * time.Second):
+			close(stalled)
+			wdCancel() // kills the yt-dlp subprocess via ctx
+		}
+	}()
+
+	res, err := ex.Download(wdCtx, j.URL, extractor.DownloadOptions{
 		OutDir:         outDir,
 		FormatSelector: j.FormatID, // "" => extractor's 1080p-capped default
 		CookiesFrom:    m.cfg.CookiesFrom,
 		MergeFormat:    "mp4",
 	}, func(p extractor.Progress) {
+		select {
+		case started <- struct{}{}: // first callback — extraction got somewhere
+		default:
+		}
 		_, _ = m.st.Update(id, func(jj *store.Job) {
 			jj.Status = store.StatusDownloading
 			switch p.Stage {
@@ -303,6 +325,11 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		})
 	})
 	if err != nil {
+		select {
+		case <-stalled:
+			return fmt.Errorf("yt-dlp couldn't resolve this video within 75s — it may be throttled or need a newer yt-dlp (Settings → Update now)")
+		default:
+		}
 		if strings.Contains(strings.ToLower(err.Error()), "drm") {
 			return drm(err.Error())
 		}
