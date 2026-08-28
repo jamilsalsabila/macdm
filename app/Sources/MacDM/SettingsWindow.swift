@@ -16,6 +16,7 @@ final class SettingsWindowController: NSWindowController {
     private let ffmpegLabel = NSTextField(labelWithString: "ffmpeg: …")
     private let autoUpdate = NSButton(checkboxWithTitle: "Keep yt-dlp updated automatically", target: nil, action: nil)
     private let updateBtn = NSButton(title: "Update now", target: nil, action: nil)
+    private let channelPop = NSPopUpButton(frame: .zero, pullsDown: false)
 
     private var folder: String = (NSHomeDirectory() as NSString).appendingPathComponent("Downloads/MacDM")
 
@@ -74,12 +75,19 @@ final class SettingsWindowController: NSWindowController {
         updateBtn.action = #selector(updateNow)
         updateBtn.bezelStyle = .rounded
 
+        channelPop.addItems(withTitles: ["nightly (recommended)", "stable"])
+        channelPop.target = self
+        channelPop.action = #selector(channelChanged)
+        let channelRow = NSStackView(views: [NSTextField(labelWithString: "Channel:"), channelPop])
+        channelRow.spacing = 6
+
         let sep = NSBox()
         sep.boxType = .separator
 
         let toolsBox = NSStackView(views: [
             ytdlpLabel,
             NSStackView(views: [autoUpdate, updateBtn]),
+            channelRow,
             ffmpegLabel,
         ])
         toolsBox.orientation = .vertical
@@ -137,6 +145,7 @@ final class SettingsWindowController: NSWindowController {
             self.ytdlpLabel.stringValue = s
             self.ffmpegLabel.stringValue = "ffmpeg: " + (info.ffmpeg.version.isEmpty ? "not found" : info.ffmpeg.version)
             self.autoUpdate.state = info.auto_update ? .on : .off
+            self.channelPop.selectItem(at: (yt.channel == "stable") ? 1 : 0)
         }
     }
 
@@ -144,6 +153,10 @@ final class SettingsWindowController: NSWindowController {
 
     @objc private func autoUpdateToggled() {
         DaemonClient.shared.setConfig(["auto_update_ytdlp": autoUpdate.state == .on])
+    }
+
+    @objc private func channelChanged() {
+        DaemonClient.shared.setConfig(["ytdlp_channel": channelPop.indexOfSelectedItem == 1 ? "stable" : "nightly"])
     }
 
     @objc private func updateNow() {

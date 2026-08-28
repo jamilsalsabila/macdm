@@ -421,17 +421,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         // yt-dlp resolves a real permalink to the FULL muxed video+audio at best
         // quality — prefer it, EXCEPT on hosts whose yt-dlp extractor is
-        // currently flaky (TikTok), where a directly sniffed progressive URL
-        // (headers replayed) is what actually works, like Neat DM.
+        // currently flaky (TikTok). There, use the progressive URL the content
+        // script pulled from the page JSON (msg.ttURL) — the sniffed <video>
+        // URL is a session-locked DASH stream that 403s. Replay the browser's
+        // captured session headers (Cookie / ttwid / UA) with it.
         const sniffed = bestCaughtMedia(tab?.id);
-        if (YTDLP_UNRELIABLE.test(tabHost) && sniffed) {
-          sendResponse(await startDownload({
-            url: sniffed.url,
-            headers: sniffed.headers,
-            referer: tab?.url,
-            title: msg.title || tab?.title,
-          }));
-          break;
+        if (YTDLP_UNRELIABLE.test(tabHost)) {
+          const direct = msg.ttURL || sniffed?.url;
+          if (direct) {
+            // TikTok's CDN 403s anything that doesn't look like a <video>
+            // element request — even a fetch() from the page itself. Force the
+            // fetch-metadata headers a media element sends.
+            const headers = Object.assign({}, sniffed?.headers, {
+              "Sec-Fetch-Dest": "video",
+              "Sec-Fetch-Mode": "no-cors",
+              "Sec-Fetch-Site": "same-site",
+              "Accept": "*/*",
+              "Referer": "https://www.tiktok.com/",
+            });
+            sendResponse(await startDownload({
+              url: direct, headers, referer: "https://www.tiktok.com/",
+              title: msg.title || tab?.title,
+            }));
+            break;
+          }
         }
 
         const pageURL = isExtractableURL(msg.url) ? msg.url

@@ -30,6 +30,15 @@ var (
 
 const ytDlpAsset = "yt-dlp_macos"
 
+// ytDlpRepo maps a channel name to its GitHub repo. Nightly builds live in a
+// separate repo but use the same asset + SHA2-256SUMS layout.
+func ytDlpRepo(channel string) string {
+	if channel == "stable" {
+		return "yt-dlp/yt-dlp"
+	}
+	return "yt-dlp/yt-dlp-nightly-builds"
+}
+
 // managedYtDlp is where the auto-updated binary lives; tools.find() prefers it.
 func managedYtDlp() string {
 	return filepath.Join(config.SupportDir(), "bin", "yt-dlp")
@@ -40,18 +49,20 @@ type YtDlpStatus struct {
 	Path            string `json:"path"`
 	Version         string `json:"version"`
 	Latest          string `json:"latest"`
+	Channel         string `json:"channel"`
 	UpdateAvailable bool   `json:"update_available"`
 }
 
-// CheckYtDlp reports the installed yt-dlp version and the latest release tag.
-// A network failure is not fatal — the local fields are still filled.
-func CheckYtDlp(ctx context.Context, set Set) (YtDlpStatus, error) {
-	s := YtDlpStatus{Path: set.YtDlp}
+// CheckYtDlp reports the installed yt-dlp version and the latest release tag on
+// the given channel ("nightly"/"stable"). A network failure is not fatal — the
+// local fields are still filled.
+func CheckYtDlp(ctx context.Context, set Set, channel string) (YtDlpStatus, error) {
+	s := YtDlpStatus{Path: set.YtDlp, Channel: channel}
 	if set.YtDlp != "" {
 		v := Version(ctx, set.YtDlp) // "yt-dlp 2025.08.20" or "2025.08.20"
 		s.Version = strings.TrimSpace(strings.TrimPrefix(v, "yt-dlp"))
 	}
-	latest, err := githubLatestTag(ctx)
+	latest, err := githubLatestTag(ctx, ytDlpRepo(channel))
 	if err != nil {
 		return s, err
 	}
@@ -60,16 +71,17 @@ func CheckYtDlp(ctx context.Context, set Set) (YtDlpStatus, error) {
 	return s, nil
 }
 
-// UpdateYtDlp downloads the latest yt-dlp_macos build into the managed bin dir,
-// verifying its SHA-256 against the release's SHA2-256SUMS before swapping it in
-// atomically. Returns the old and new version strings.
-func UpdateYtDlp(ctx context.Context) (from, to string, err error) {
+// UpdateYtDlp downloads the latest yt-dlp_macos build for the channel into the
+// managed bin dir, verifying its SHA-256 against the release's SHA2-256SUMS
+// before swapping it in atomically. Returns the old and new version strings.
+func UpdateYtDlp(ctx context.Context, channel string) (from, to string, err error) {
+	repo := ytDlpRepo(channel)
 	dest := managedYtDlp()
 	if fi, e := os.Stat(dest); e == nil && !fi.IsDir() {
 		from = strings.TrimSpace(strings.TrimPrefix(Version(ctx, dest), "yt-dlp"))
 	}
 
-	tag, err := githubLatestTag(ctx)
+	tag, err := githubLatestTag(ctx, repo)
 	if err != nil {
 		return from, "", fmt.Errorf("check latest: %w", err)
 	}
@@ -77,12 +89,12 @@ func UpdateYtDlp(ctx context.Context) (from, to string, err error) {
 		return from, from, nil // already current
 	}
 
-	want, err := releaseSHA(ctx, tag, ytDlpAsset)
+	want, err := releaseSHA(ctx, repo, tag, ytDlpAsset)
 	if err != nil {
 		return from, "", fmt.Errorf("fetch checksums: %w", err)
 	}
 
-	binURL := fmt.Sprintf("%s/yt-dlp/yt-dlp/releases/download/%s/%s", githubDL, tag, ytDlpAsset)
+	binURL := fmt.Sprintf("%s/%s/releases/download/%s/%s", githubDL, repo, tag, ytDlpAsset)
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return from, "", err
 	}
@@ -122,7 +134,7 @@ func AutoUpdateLoop(ctx context.Context, cfg config.Config) {
 		if fi, err := os.Stat(stamp); err == nil && time.Since(fi.ModTime()) < 24*time.Hour {
 			return
 		}
-		from, to, err := UpdateYtDlp(ctx)
+		from, to, err := UpdateYtDlp(ctx, cfg.YtDlpChannelName())
 		switch {
 		case err != nil:
 			log.Printf("yt-dlp auto-update: %v", err)
@@ -156,9 +168,9 @@ func AutoUpdateLoop(ctx context.Context, cfg config.Config) {
 
 // --- helpers ---
 
-func githubLatestTag(ctx context.Context) (string, error) {
+func githubLatestTag(ctx context.Context, repo string) (string, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
-		githubAPI+"/repos/yt-dlp/yt-dlp/releases/latest", nil)
+		githubAPI+"/repos/"+repo+"/releases/latest", nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -178,8 +190,8 @@ func githubLatestTag(ctx context.Context) (string, error) {
 }
 
 // releaseSHA returns the hex SHA-256 for asset within a release's SHA2-256SUMS.
-func releaseSHA(ctx context.Context, tag, asset string) (string, error) {
-	u := fmt.Sprintf("%s/yt-dlp/yt-dlp/releases/download/%s/SHA2-256SUMS", githubDL, tag)
+func releaseSHA(ctx context.Context, repo, tag, asset string) (string, error) {
+	u := fmt.Sprintf("%s/%s/releases/download/%s/SHA2-256SUMS", githubDL, repo, tag)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

@@ -102,6 +102,7 @@ struct ToolsInfo: Codable {
         var path: String
         var version: String
         var latest: String
+        var channel: String?
         var update_available: Bool
     }
     var ffmpeg: Tool

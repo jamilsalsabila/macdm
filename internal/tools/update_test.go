@@ -51,7 +51,7 @@ func TestCheckYtDlp(t *testing.T) {
 	defer srv.Close()
 	withServer(t, srv)
 
-	st, err := CheckYtDlp(context.Background(), Set{})
+	st, err := CheckYtDlp(context.Background(), Set{}, "stable")
 	if err != nil {
 		t.Fatalf("CheckYtDlp: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestUpdateYtDlpInstallsAndVerifies(t *testing.T) {
 	defer srv.Close()
 	withServer(t, srv)
 
-	from, to, err := UpdateYtDlp(context.Background())
+	from, to, err := UpdateYtDlp(context.Background(), "stable")
 	if err != nil {
 		t.Fatalf("UpdateYtDlp: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestUpdateYtDlpRejectsBadChecksum(t *testing.T) {
 	defer srv.Close()
 	withServer(t, srv)
 
-	if _, _, err := UpdateYtDlp(context.Background()); err == nil ||
+	if _, _, err := UpdateYtDlp(context.Background(), "stable"); err == nil ||
 		!strings.Contains(err.Error(), "checksum") {
 		t.Fatalf("expected checksum error, got %v", err)
 	}

@@ -3,7 +3,7 @@ import Foundation
 /// Wire version this app expects from macdmd. Must match internal/config.Version.
 /// On mismatch the app restarts the daemon so a stale background macdmd left
 /// over from a previous build never lingers.
-let MacDMExpectedVersion = "0.4.0"
+let MacDMExpectedVersion = "0.4.1"
 
 /// Starts and supervises a local `macdmd`. In a shipped app this would be a
 /// LaunchAgent; spawning a child keeps the dev loop simple.

@@ -73,21 +73,23 @@ type toolInfo struct {
 
 func (s *Server) getTools(w http.ResponseWriter, r *http.Request) {
 	set := s.mgr.Tools()
-	yt, _ := tools.CheckYtDlp(r.Context(), set) // best-effort; local fields still filled
+	cfg := config.Load()
+	yt, _ := tools.CheckYtDlp(r.Context(), set, cfg.YtDlpChannelName()) // best-effort
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ffmpeg": toolInfo{Path: set.Ffmpeg, Version: tools.Version(r.Context(), set.Ffmpeg)},
 		"ytdlp": map[string]any{
 			"path":             yt.Path,
 			"version":          yt.Version,
 			"latest":           yt.Latest,
+			"channel":          yt.Channel,
 			"update_available": yt.UpdateAvailable,
 		},
-		"auto_update": config.Load().AutoUpdateYtDlpEnabled(),
+		"auto_update": cfg.AutoUpdateYtDlpEnabled(),
 	})
 }
 
 func (s *Server) updateYtDlp(w http.ResponseWriter, r *http.Request) {
-	from, to, err := tools.UpdateYtDlp(r.Context())
+	from, to, err := tools.UpdateYtDlp(r.Context(), config.Load().YtDlpChannelName())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
@@ -99,6 +101,7 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AutoUpdateYtDlp *bool   `json:"auto_update_ytdlp"`
 		CookiesFrom     *string `json:"cookies_from"`
+		YtDlpChannel    *string `json:"ytdlp_channel"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -110,6 +113,9 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CookiesFrom != nil {
 		c.CookiesFrom = *req.CookiesFrom
+	}
+	if req.YtDlpChannel != nil && (*req.YtDlpChannel == "stable" || *req.YtDlpChannel == "nightly") {
+		c.YtDlpChannel = *req.YtDlpChannel
 	}
 	if err := config.Save(c); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)

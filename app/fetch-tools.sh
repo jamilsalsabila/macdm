@@ -30,10 +30,10 @@ if [[ ! -x "$TOOLS/ffmpeg" ]]; then
   chmod +x "$TOOLS/ffmpeg"
 fi
 
-# --- yt-dlp ---
+# --- yt-dlp (nightly: site fixes land here first; MacDM auto-updates it too) ---
 if [[ ! -x "$TOOLS/yt-dlp" ]]; then
-  echo "yt-dlp: downloading yt-dlp_macos from GitHub Releases"
-  curl -fSL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" \
+  echo "yt-dlp: downloading yt-dlp_macos (nightly) from GitHub Releases"
+  curl -fSL "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_macos" \
     -o "$TOOLS/yt-dlp"
   chmod +x "$TOOLS/yt-dlp"
 fi

@@ -112,6 +112,44 @@
     return location.href;
   }
 
+  // TikTok's <video> plays a session-locked DASH URL (chain_token / btag) that
+  // 403s outside the browser. The page embeds the real progressive URL in a
+  // JSON <script> — that's what Neat DM / yt-dlp use. Read it straight from the
+  // DOM (works in the content-script world; no page-context access needed).
+  function deepFindURL(obj, keys, depth) {
+    if (!obj || typeof obj !== "object" || depth > 9) return null;
+    const good = (s) =>
+      typeof s === "string" && /^https?:\/\/[^ ]+\/video\//.test(s) && !/chain_token/.test(s);
+    for (const k of keys) {
+      const v = obj[k];
+      if (good(v)) return v;
+      if (v && typeof v === "object") {
+        const list = v.UrlList || v.url_list;
+        if (Array.isArray(list)) {
+          const hit = list.find(good) || [...list].reverse().find((s) => /^https?:/.test(s));
+          if (hit) return hit;
+        }
+      }
+    }
+    for (const v of Array.isArray(obj) ? obj : Object.values(obj)) {
+      const r = deepFindURL(v, keys, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  function tiktokVideoURL() {
+    for (const id of ["__UNIVERSAL_DATA_FOR_REHYDRATION__", "SIGI_STATE"]) {
+      const tag = document.getElementById(id);
+      if (!tag) continue;
+      let data;
+      try { data = JSON.parse(tag.textContent); } catch { continue; }
+      const u = deepFindURL(data, ["playAddr", "play_addr", "downloadAddr", "download_addr", "PlayAddr", "bitrateInfo"], 0);
+      if (u) return u;
+    }
+    return null;
+  }
+
   function place(video) {
     const r = video.getBoundingClientRect();
     if (r.width < MIN_W || r.height < MIN_H) {
@@ -186,6 +224,7 @@
     busy = true;
     btn.textContent = "sending…";
     const url = bestURL(currentVideo);
+    const ttURL = /(^|\.)tiktok\.com$/i.test(location.hostname) ? tiktokVideoURL() : null;
 
     const done = (txt, ok) => {
       btn.textContent = txt;
@@ -195,12 +234,12 @@
       setTimeout(() => { busy = false; btn.textContent = "⬇ MacDM"; }, cool);
     };
 
-    if (!url) { done("✗ open the video first", false); return; }
+    if (!url && !ttURL) { done("✗ open the video first", false); return; }
 
     const timeout = setTimeout(() => done("✗ no daemon", false), 12000);
     try {
       chrome.runtime.sendMessage(
-        { type: "downloadPage", url, title: document.title },
+        { type: "downloadPage", url: url || location.href, ttURL, title: document.title },
         (resp) => {
           clearTimeout(timeout);
           if (chrome.runtime.lastError) { done("✗ " + chrome.runtime.lastError.message, false); return; }
