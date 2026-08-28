@@ -110,22 +110,27 @@ const MacDMClassify = (() => {
 
 const NATIVE_HOST = "com.macdm.nmhost";
 
-// A URL yt-dlp can resolve to a full video: a known page host, or any host with
-// a permalink-shaped path (…/reel/<id>, …/p/<id>, …/watch?v=…, …/video/<id>…).
-// Bare origins and raw CDN media URLs are NOT extractable.
-const PERMALINK_PATH = /\/(p|reel|reels|tv|watch|shorts|video|status|clip|v|e|embed)\/[\w-]{3,}/i;
-// Hosts where yt-dlp has a dedicated extractor and even a bare path (e.g.
-// vimeo.com/123456789) resolves. Subdomains match too.
-const PAGE_HOSTS = /(^|\.)(youtube\.com|youtu\.be|vimeo\.com|tiktok\.com|instagram\.com|facebook\.com|fb\.watch|twitter\.com|x\.com|threads\.net|reddit\.com|twitch\.tv|dailymotion\.com|bilibili\.com|soundcloud\.com|streamable\.com|rumble\.com|vk\.com|nicovideo\.jp|ok\.ru|bitchute\.com|odysee\.com)$/i;
+// A URL yt-dlp can resolve to a full video: a permalink-shaped path
+// (…/reel/<id>, …/p/<id>, …/watch?v=…, …/video/<id>…) on a real page host, or a
+// known video host with any path. Bare origins and raw CDN media URLs are NOT.
+const PERMALINK_PATH = /\/(p|reel|reels|tv|watch|shorts|video|photo|status|clip|v|e|embed)\/[\w-]{3,}/i;
+// Canonical page hosts only — `www.`/`m.`/`vm.`/`vt.` or bare. This deliberately
+// does NOT match media-CDN subdomains like v16-webapp-prime.tiktok.com.
+const CANON_PAGE_HOSTS = /^(?:(?:www|m|mobile|vm|vt)\.)?(youtube\.com|youtu\.be|vimeo\.com|tiktok\.com|instagram\.com|facebook\.com|fb\.watch|twitter\.com|x\.com|threads\.net|reddit\.com|twitch\.tv|dailymotion\.com|bilibili\.com|soundcloud\.com|streamable\.com|rumble\.com|vk\.com|nicovideo\.jp|ok\.ru|bitchute\.com|odysee\.com)$/i;
+// Raw media CDNs — a URL here is a signed, short-lived stream chunk, useless to
+// yt-dlp (403). TikTok uses v<NN>-*.tiktok.com plus several bytedance domains.
+const MEDIA_CDN_HOSTS = /(^|\.)(tiktokcdn[\w-]*\.com|tiktokv\.com|muscdn\.com|byteoversea\.com|ibyte[\w-]*\.com|akamaized\.net|fbcdn\.net|cdninstagram\.com|googlevideo\.com)$/i;
+const TIKTOK_MEDIA_HOST = /^v\d+[\w-]*\.tiktok\.com$/i;
+
 function isExtractableURL(u) {
   let p;
   try { p = new URL(u); } catch { return false; }
   if (!/^https?:$/.test(p.protocol)) return false;
+  if (MEDIA_CDN_HOSTS.test(p.hostname) || TIKTOK_MEDIA_HOST.test(p.hostname)) return false;
   if (FRAGMENT_HOSTS.test(p.hostname)) return false;
+  if (CANON_PAGE_HOSTS.test(p.hostname) && p.pathname.length > 1) return true;
   if (PERMALINK_PATH.test(p.pathname)) return true;
   if (/[?&](v|video_id|vid)=[\w-]{3,}/i.test(p.search)) return true;
-  // A known video host with any non-root path (vimeo.com/123, tiktok share URL…).
-  if (PAGE_HOSTS.test(p.hostname) && p.pathname.length > 1) return true;
   return false;
 }
 
@@ -388,9 +393,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // *track* (video and audio arrive as separate progressive files), so
         // assembling one group alone gives a silent clip or audio only — use
         // that path only when there is no usable page URL.
-        if (isExtractableURL(msg.url)) {
+        // The content script's best guess, else the tab's own URL (often the
+        // permalink when the user opened the video directly).
+        const pageURL = isExtractableURL(msg.url) ? msg.url
+                      : isExtractableURL(tab?.url) ? tab.url
+                      : null;
+        if (pageURL) {
           sendResponse(await startDownload({
-            url: msg.url,
+            url: pageURL,
             referer: tab?.url,
             title: msg.title || tab?.title,
           }));
@@ -417,8 +427,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             break;
           }
         }
+        // Nothing usable: a bare feed URL (tiktok.com/) or an expiring CDN chunk.
+        // Sending either to yt-dlp just yields "Unsupported URL" / 403.
+        if (!isExtractableURL(msg.url)) {
+          sendResponse({ ok: false, error: "open the video on its own page first, then use MacDM" });
+          break;
+        }
         sendResponse(await startDownload({
-          url: msg.url || tab?.url,
+          url: msg.url,
           referer: tab?.url,
           title: msg.title || tab?.title,
         }));

@@ -48,13 +48,17 @@
     } catch { return false; }
   }
 
-  const POST_LINK = /\/(p|reel|reels|tv|watch|shorts|video|status|clip|v)\/[\w-]/i;
+  const POST_LINK = /\/(p|reel|reels|tv|watch|shorts|video|photo|status|clip|v)\/[\w-]/i;
+  const POST_CONTAINERS =
+    "article, [role='article'], [data-testid='tweet']," +
+    "[data-e2e='recommend-list-item-container'], [data-e2e='video-detail']," +
+    "[class*='DivItemContainer'], [class*='DivVideoFeed'], .x1qjc9v5, section";
 
   function postLinkNear(video) {
     // Walk up to the post/article container, then take the first permalink.
     let el = video;
-    for (let i = 0; i < 12 && el; i++, el = el.parentElement) {
-      const scope = el.closest ? el.closest("article, [role='article'], [data-testid='tweet'], .x1qjc9v5, section") : null;
+    for (let i = 0; i < 14 && el; i++, el = el.parentElement) {
+      const scope = el.closest ? el.closest(POST_CONTAINERS) : null;
       const root = scope || el;
       for (const a of root.querySelectorAll ? root.querySelectorAll("a[href]") : []) {
         if (POST_LINK.test(a.getAttribute("href") || "")) return a.href;
@@ -101,6 +105,10 @@
     }
 
     if (inFrame && document.referrer && hasRealPath(document.referrer)) return document.referrer;
+
+    // On a social feed with no permalink found, a bare origin (tiktok.com/,
+    // instagram.com/) is useless to the extractor — signal "can't" instead.
+    if (social && !hasRealPath(location.href)) return null;
     return location.href;
   }
 
@@ -183,9 +191,12 @@
       btn.textContent = txt;
       // On success keep the button disabled for 6s so a double/triple click
       // (dialog behind the browser) can't queue duplicates.
-      const cool = ok ? 6000 : 800;
+      const cool = ok ? 6000 : 2500;
       setTimeout(() => { busy = false; btn.textContent = "⬇ MacDM"; }, cool);
     };
+
+    if (!url) { done("✗ open the video first", false); return; }
+
     const timeout = setTimeout(() => done("✗ no daemon", false), 12000);
     try {
       chrome.runtime.sendMessage(

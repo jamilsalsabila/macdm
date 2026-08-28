@@ -50,9 +50,18 @@ final class DownloadDetailWindowController: NSWindowController, NSTableViewDataS
             let s = NSStackView(views: [detailLabelField(l), v])
             s.orientation = .horizontal
             s.spacing = 8
+            s.alignment = .firstBaseline
             (s.views.first as? NSTextField)?.widthAnchor.constraint(equalToConstant: 110).isActive = true
+            v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             return s
         }
+
+        // Status can be a long yt-dlp error — let it wrap instead of stretching
+        // the window, and keep the full text in a tooltip.
+        statusField.lineBreakMode = .byWordWrapping
+        statusField.maximumNumberOfLines = 3
+        statusField.cell?.wraps = true
+        statusField.cell?.isScrollable = false
 
         connStepper.minValue = 1
         connStepper.maxValue = 32
@@ -128,9 +137,11 @@ final class DownloadDetailWindowController: NSWindowController, NSTableViewDataS
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16),
+            stack.widthAnchor.constraint(equalToConstant: 500), // fixed — long errors wrap, don't stretch
             bar.widthAnchor.constraint(equalTo: stack.widthAnchor),
             detailBox.widthAnchor.constraint(equalTo: stack.widthAnchor),
             buttons.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            info.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         win.contentView = root
     }
@@ -141,6 +152,7 @@ final class DownloadDetailWindowController: NSWindowController, NSTableViewDataS
         urlField.stringValue = Fmt.short(j.url)
         urlField.toolTip = j.url
         statusField.stringValue = statusText(j)
+        statusField.toolTip = j.status == "error" ? j.error : nil
 
         sizeField.stringValue = j.streamingSegments ? "adaptive stream (\(j.total_bytes) segments)" : j.sizeText
         doneField.stringValue = j.doneText
@@ -173,9 +185,21 @@ final class DownloadDetailWindowController: NSWindowController, NSTableViewDataS
         case "paused": return "Paused"
         case "completed": return "Complete"
         case "drm_protected": return "Cannot download — DRM protected"
-        case "error": return "Error — \(j.error ?? "")"
+        case "error": return "Error — \(cleanError(j.error ?? ""))"
         default: return j.status
         }
+    }
+
+    /// Trim yt-dlp's boilerplate so the common failures read in one line; the
+    /// full text is still on the field's tooltip.
+    private func cleanError(_ s: String) -> String {
+        var e = s
+        for p in ["yt-dlp: ERROR: ", "ERROR: "] where e.hasPrefix(p) { e.removeFirst(p.count) }
+        if e.contains("HTTP Error 403") || e.contains("403: Forbidden") { return "blocked by the site (HTTP 403)" }
+        if e.contains("Unsupported URL") { return "this link isn't a downloadable video page" }
+        if e.contains("Unable to download webpage") { return "couldn't reach the video page" }
+        if e.count > 160 { e = String(e.prefix(157)) + "…" }
+        return e
     }
 
     @objc private func toggleDetails(_ sender: NSButton) {

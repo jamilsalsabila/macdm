@@ -2,8 +2,33 @@ import AppKit
 
 /// The main MacDM window: a toolbar and a table of all downloads. Double-click a
 /// row to open its detail window (the IDM-style per-download progress view).
+/// NSTableView that reports the Delete key and handles ⌘A itself (the app has no
+/// main menu to route those through).
+final class JobsTableView: NSTableView {
+    var onDeleteKey: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let del = Character(UnicodeScalar(NSDeleteCharacter)!)
+        let fwd = Character(UnicodeScalar(NSDeleteFunctionKey)!)
+        if let c = event.charactersIgnoringModifiers?.first, c == del || c == fwd {
+            onDeleteKey?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers?.lowercased() == "a" {
+            selectAll(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
-    private let table = NSTableView()
+    private let table = JobsTableView()
     private var jobs: [Job] = []
     private var details: [String: DownloadDetailWindowController] = [:]
 
@@ -37,6 +62,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         table.target = self
         table.doubleAction = #selector(openDetail)
         table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        table.allowsMultipleSelection = true       // ⌘-click, ⇧-click ranges
+        table.onDeleteKey = { [weak self] in self?.removeSel() }
 
         for (id, title, width) in [
             ("file", "File", CGFloat(260)), ("size", "Size", 110), ("status", "Status", 90),
@@ -72,8 +99,13 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     }
 
     private func apply(_ jobs: [Job]) {
+        let selectedIDs = Set(selectedJobs.map(\.id))
         self.jobs = jobs
         table.reloadData()
+        if !selectedIDs.isEmpty {
+            let rows = IndexSet(jobs.indices.filter { selectedIDs.contains(jobs[$0].id) })
+            table.selectRowIndexes(rows, byExtendingSelection: false)
+        }
         for (id, ctl) in details {
             if let j = jobs.first(where: { $0.id == id }) { ctl.update(j) }
         }
@@ -81,6 +113,10 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     private var selectedJob: Job? {
         table.selectedRow >= 0 && table.selectedRow < jobs.count ? jobs[table.selectedRow] : nil
+    }
+
+    private var selectedJobs: [Job] {
+        table.selectedRowIndexes.compactMap { $0 < jobs.count ? jobs[$0] : nil }
     }
 
     // MARK: actions
@@ -118,9 +154,23 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         ctl.show()
     }
 
-    @objc private func pauseSel() { if let j = selectedJob { DaemonClient.shared.command(j.id, "pause") } }
-    @objc private func resumeSel() { if let j = selectedJob { DaemonClient.shared.command(j.id, "resume") } }
-    @objc private func removeSel() { if let j = selectedJob { DaemonClient.shared.remove(j.id) } }
+    @objc private func pauseSel() { selectedJobs.forEach { DaemonClient.shared.command($0.id, "pause") } }
+    @objc private func resumeSel() { selectedJobs.forEach { DaemonClient.shared.command($0.id, "resume") } }
+
+    @objc private func removeSel() {
+        let sel = selectedJobs
+        guard !sel.isEmpty else { return }
+        if sel.count > 1 {
+            let a = NSAlert()
+            a.messageText = "Remove \(sel.count) downloads from the list?"
+            a.informativeText = "Files already saved to disk are kept."
+            a.addButton(withTitle: "Remove")
+            a.addButton(withTitle: "Cancel")
+            guard a.runModal() == .alertFirstButtonReturn else { return }
+        }
+        sel.forEach { DaemonClient.shared.remove($0.id) }
+    }
+
     @objc private func openSettings() { SettingsWindowController.shared.show() }
 
     // MARK: table
