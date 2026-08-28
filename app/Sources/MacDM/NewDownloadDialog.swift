@@ -192,7 +192,7 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
         let probing = latest.probing ?? false
         qualityMenu.removeAllItems()
         if formats.isEmpty {
-            qualityMenu.addItem(withTitle: probing ? "Detecting…" : "Original")
+            qualityMenu.addItem(withTitle: probing ? "Detecting… (Download works now)" : "Original")
             qualityMenu.isEnabled = false
         } else {
             for f in formats {
