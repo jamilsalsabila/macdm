@@ -161,7 +161,7 @@ final class SettingsWindowController: NSWindowController {
 
     @objc private func updateNow() {
         updateBtn.isEnabled = false
-        updateBtn.title = "Updating…"
+        updateBtn.title = "Downloading… (~35 MB)"
         DaemonClient.shared.updateYtDlp { [weak self] _, error in
             guard let self = self else { return }
             self.updateBtn.title = "Update now"

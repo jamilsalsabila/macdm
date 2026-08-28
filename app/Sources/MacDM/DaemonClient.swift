@@ -223,7 +223,7 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     func updateYtDlp(_ done: @escaping (_ newVersion: String?, _ error: String?) -> Void) {
         var req = URLRequest(url: base.appendingPathComponent("api/tools/ytdlp/update"))
         req.httpMethod = "POST"
-        req.timeoutInterval = 180
+        req.timeoutInterval = 600 // ~35 MB download; slow links need room
         URLSession.shared.dataTask(with: req) { data, resp, err in
             DispatchQueue.main.async {
                 if let err = err { done(nil, err.localizedDescription); return }
