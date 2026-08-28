@@ -125,6 +125,10 @@ func ClassifyURL(u *url.URL) string {
 		return KindHLS
 	case strings.HasSuffix(p, ".mpd"):
 		return KindDASH
+	// Media/API endpoints on a page host are NOT pages to extract — e.g.
+	// www.tiktok.com/aweme/v1/play/?item_id=… is a direct video stream.
+	case strings.Contains(p, "/aweme/") || strings.HasPrefix(p, "/api/"):
+		return KindHTTP
 	case IsPageHost(u.Host):
 		return KindExtract
 	default:

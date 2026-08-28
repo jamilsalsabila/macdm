@@ -430,41 +430,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const referer = tab?.url || "https://www.tiktok.com/";
           const cookie = sniffed?.headers &&
             (sniffed.headers.Cookie || sniffed.headers.cookie);
-          const base = {
-            "Sec-Fetch-Dest": "video",
-            "Sec-Fetch-Mode": "no-cors",
-            "Sec-Fetch-Site": "same-site",
-            "Accept": "*/*",
-            "Referer": referer,
+          const isPermalink = (u) => {
+            try { return /\/@[\w.-]+\/(video|photo)\/\d+/.test(new URL(u).pathname); }
+            catch { return false; }
           };
-          // 1. The progressive URL tiktok-main.js read from the page's own state
-          //    (playAddr / bitrateInfo). This is what Neat DM / yt-dlp use — it
-          //    downloads with just a Referer for public videos.
-          if (msg.ttURL) {
+          // content.js's pick for the hovered video (its own src, its permalink,
+          // or the page's declared playAddr).
+          const pick = msg.ttURL ||
+            (isPermalink(referer) ? referer : null) ||
+            (isExtractableURL(msg.url) ? msg.url : null);
+
+          if (pick && isPermalink(pick)) {
+            // A video permalink → let yt-dlp resolve the right clip.
             sendResponse(await startDownload({
-              url: msg.ttURL, referer,
-              title: msg.title || tab?.title,
-              headers: Object.assign({}, cookie ? { Cookie: cookie } : {}, base),
+              url: pick, referer, title: msg.title || tab?.title,
             }));
             break;
           }
-          // 2. On a real video page, hand the permalink to yt-dlp (nightly).
-          const permalink = /\/@[\w.-]+\/(video|photo)\/\d+/.test(new URL(referer).pathname)
-            ? referer : (isExtractableURL(msg.url) ? msg.url : null);
-          if (permalink) {
+          if (pick) {
+            // A direct media / aweme-play URL → download it, replaying the
+            // fetch-metadata headers a <video> sends (+ cookies when we have
+            // them). preserveAuthHeaders in the daemon keeps the cookies across
+            // the 302 to the CDN host.
+            const headers = Object.assign({}, cookie ? { Cookie: cookie } : {}, {
+              "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors",
+              "Sec-Fetch-Site": "same-site", "Accept": "*/*", "Referer": referer,
+            });
             sendResponse(await startDownload({
-              url: permalink, referer,
-              title: msg.title || tab?.title,
+              url: pick, referer, title: msg.title || tab?.title, headers,
             }));
             break;
           }
-          // 3. Fall back to the caught <video> stream URL — needs the tiktok.com
-          //    cookies (httpOnly ttwid etc.) or it 403s.
-          if (cookie) {
+          if (sniffed && cookie) {
             sendResponse(await startDownload({
-              url: sniffed.url, referer,
-              title: msg.title || tab?.title,
-              headers: Object.assign({}, sniffed.headers, base),
+              url: sniffed.url, referer, title: msg.title || tab?.title,
+              headers: Object.assign({}, sniffed.headers, {
+                "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors",
+                "Sec-Fetch-Site": "same-site", "Referer": referer,
+              }),
             }));
             break;
           }

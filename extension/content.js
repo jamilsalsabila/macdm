@@ -149,10 +149,22 @@
   });
 
   function tiktokVideoURL(video) {
-    // Prefer a URL without the session-locked token; else the best (first).
+    // 1. THIS video's own src. On a video page it's www.tiktok.com/aweme/v1/play/
+    //    ?item_id=… which mints a fresh CDN redirect every request (no expiry)
+    //    and is unambiguously the hovered clip.
+    const src = video?.currentSrc || video?.src || "";
+    if (/^https?:/.test(src) && /aweme\/v1\/play|\/video\/tos\//.test(src)) return src;
+
+    // 2. The permalink for the hovered video — yt-dlp resolves it to the right
+    //    clip even on the feed.
+    const p = postLinkNear(video);
+    if (p && /\/@[\w.-]+\/(video|photo)\/\d+/.test(p)) return p;
+
+    // 3. Whatever tiktok-main.js read from the page state (single-video pages).
     const fromPage = tiktokURLs.find((u) => !/chain_token|[?&]tk=/.test(u)) || tiktokURLs[0];
     if (fromPage) return fromPage;
-    // Fallback: a legacy readable <script> (older TikTok layouts).
+
+    // 4. Legacy readable <script> layouts.
     for (const id of ["__UNIVERSAL_DATA_FOR_REHYDRATION__", "SIGI_STATE"]) {
       const tag = document.getElementById(id);
       if (!tag) continue;
@@ -161,10 +173,6 @@
       const u = deepFindURL(data, ["playAddr", "play_addr", "downloadAddr", "download_addr", "PlayAddr", "bitrateInfo"], 0);
       if (u) return u;
     }
-    // Last resort: the <video>'s aweme/v1/play src (mints a fresh CDN redirect).
-    const src = video?.currentSrc || video?.src ||
-                document.querySelector("video")?.currentSrc || "";
-    if (/^https?:/.test(src) && /aweme\/v1\/play/.test(src)) return src;
     return null;
   }
 
