@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let addr = UserDefaults.standard.string(forKey: "addr") ?? "127.0.0.1:7345"
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        FirstRunSetup.run()
         DaemonClient.shared.configure(addr: addr)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)

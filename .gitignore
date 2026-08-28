@@ -1,5 +1,7 @@
 /bin/
 /app/.build/
+/app/.tools/
+/dist/
 *.part
 *.macdm
 *.macdmf

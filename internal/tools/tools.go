@@ -40,10 +40,14 @@ func find(name, explicit string) string {
 			return explicit
 		}
 	}
-	// MacDM-managed copy.
+	// MacDM-managed copy (auto-updated by update.go — wins over the bundled seed).
 	managed := filepath.Join(config.SupportDir(), "bin", name)
 	if isExec(managed) {
 		return managed
+	}
+	// Bundled inside MacDM.app (Contents/Resources/bin), next to the daemon.
+	if p := nearExecutable(name); p != "" {
+		return p
 	}
 	// $PATH.
 	if p, err := exec.LookPath(name); err == nil {
@@ -61,6 +65,35 @@ func find(name, explicit string) string {
 	} {
 		if isExec(c) {
 			return c
+		}
+	}
+	return ""
+}
+
+// nearExecutable looks for name alongside the running binary and in a sibling
+// Resources/bin — i.e. the layout `app/build.sh` produces:
+//
+//	MacDM.app/Contents/MacOS/{macdmd,macdm-nmhost}
+//	MacDM.app/Contents/Resources/bin/{ffmpeg,yt-dlp}
+func nearExecutable(name string) string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return nearDir(filepath.Dir(exe), name)
+}
+
+// nearDir checks for name in dir and in dir/../Resources/bin.
+func nearDir(dir, name string) string {
+	for _, c := range []string{
+		filepath.Join(dir, name),
+		filepath.Join(dir, "..", "Resources", "bin", name),
+	} {
+		if isExec(c) {
+			return filepath.Clean(c)
 		}
 	}
 	return ""

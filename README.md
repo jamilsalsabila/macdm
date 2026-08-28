@@ -16,6 +16,34 @@ deliberately will not do, and the current rough edges.
 
 ---
 
+## Install
+
+Build the disk image (`dist/MacDM-<version>.dmg`):
+
+```bash
+scripts/make-dmg.sh
+```
+
+It contains a self-contained `MacDM.app` (daemon, engine, **ffmpeg and yt-dlp
+bundled**), the unpacked browser extension, and `INSTALL.txt`. To install:
+
+1. **Drag `MacDM.app` onto Applications.**
+2. **First launch:** right-click `MacDM.app` → **Open** → **Open** (the app is
+   ad-hoc signed, not notarised — this is a one-time Gatekeeper step). The
+   menu-bar arrow icon means it's running. The app registers the native-
+   messaging host and clears its own quarantine flag automatically.
+3. **Add the extension:** `chrome://extensions` → enable **Developer mode** →
+   **Load unpacked** → pick the **MacDM Extension** folder. Click the toolbar
+   icon; it should say *daemon connected*.
+
+The daemon keeps its bundled `yt-dlp` current (daily check, or **Settings →
+Bundled tools → Update now**); the fresh copy lands in
+`~/Library/Application Support/MacDM/bin/` and takes precedence over the one in
+the app. Because site fixes ship in `yt-dlp` itself, MacDM rarely needs a
+release to keep working.
+
+---
+
 ## Intentional limitations
 
 These are design choices, not bugs — MacDM stops where a download manager should.
@@ -95,7 +123,7 @@ web page      (:7345/)     ──HTTP + SSE──►  │  engine · sniff · hl
 
 ---
 
-## Build
+## Build from source
 
 ```bash
 # Go pieces
@@ -103,19 +131,24 @@ go build -o bin/macdmd       ./cmd/macdmd
 go build -o bin/macdm        ./cmd/macdm
 go build -o bin/macdm-nmhost ./cmd/macdm-nmhost
 
-# menu-bar app
-( cd app && swift build -c release )   # binary: app/.build/release/MacDM
+# menu-bar app (Command Line Tools are enough — no full Xcode)
+( cd app && ./build.sh bundle )        # -> app/.build/MacDM.app
 
-# external tools (bundled in a real build; here just install them)
-brew install ffmpeg yt-dlp
+# distributable disk image
+scripts/make-dmg.sh                    # -> dist/MacDM-<version>.dmg
 ```
 
-The daemon keeps its own copy of `yt-dlp` current: on first run (and daily
-after) it fetches the latest `yt-dlp_macos` release, verifies its SHA-256, and
-drops it in `~/Library/Application Support/MacDM/bin/`. Toggle this off in
-**Settings → Bundled tools**, or trigger it now with the "Update now" button.
-Because site fixes ship in `yt-dlp` itself, MacDM rarely needs a release to keep
-working.
+`app/build.sh bundle` runs `app/fetch-tools.sh`, which downloads the
+`yt-dlp_macos` standalone and a static `ffmpeg` into `app/.tools/` and copies
+them into `MacDM.app/Contents/Resources/bin/`. For a plain dev run without the
+bundle, `brew install ffmpeg yt-dlp` and `go run ./cmd/macdmd`.
+
+For local extension development (unpacked, without the app), register the
+native-messaging host manually:
+
+```bash
+scripts/install-host.sh                # points at ./bin/macdm-nmhost
+```
 
 Run the tests:
 
