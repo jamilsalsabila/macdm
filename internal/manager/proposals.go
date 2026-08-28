@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"macdm/internal/extractor"
 	"macdm/internal/sniff"
 	"macdm/internal/store"
 )
@@ -233,8 +234,51 @@ func (m *Manager) enrichProposal(id, rawurl string, headers map[string]string) {
 		p.Kind = pr.Kind
 	}
 	cp := *p
+	kind := p.Kind
 	m.hub.mu.Unlock()
 
+	m.hub.broadcast(notice("proposal", &cp))
+
+	// For extractor jobs the fast Probe returned a static quality ladder so the
+	// dialog opens instantly. Now try a real yt-dlp probe in the background — if
+	// it comes back reasonably quickly, upgrade the menu to the actual formats
+	// (with sizes) and the real title.
+	if kind == sniff.KindExtract {
+		m.enrichExtractFormats(id, rawurl)
+	}
+}
+
+func (m *Manager) enrichExtractFormats(id, rawurl string) {
+	ex, err := extractor.New(m.cfg.Tools)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	info, err := ex.Probe(ctx, rawurl)
+	if err != nil || info == nil {
+		return // slow / throttled — the static ladder stays, no harm
+	}
+	choices := info.QualityChoices()
+	if len(choices) == 0 {
+		return
+	}
+
+	m.hub.mu.Lock()
+	p, ok := m.hub.pending[id]
+	if !ok {
+		m.hub.mu.Unlock()
+		return
+	}
+	p.Formats = choices
+	if info.Title != "" {
+		p.Title = info.Title
+		if looksGeneric(p.Filename) {
+			p.Filename = sanitize(info.Title) + ".mp4"
+		}
+	}
+	cp := *p
+	m.hub.mu.Unlock()
 	m.hub.broadcast(notice("proposal", &cp))
 }
 
