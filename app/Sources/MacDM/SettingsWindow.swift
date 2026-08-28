@@ -1,8 +1,9 @@
 import AppKit
 
 /// Preferences: connection count (IDM's "Max. connections number"), default
-/// folder, and the auto-accept toggle. These are stored client-side in
-/// UserDefaults and mirrored to the daemon's config where relevant.
+/// folder, the auto-accept toggle, and the bundled-tools panel (yt-dlp version
+/// + auto-update). Client prefs live in UserDefaults; the tool settings are
+/// mirrored to the daemon's config.json via POST /api/config.
 final class SettingsWindowController: NSWindowController {
     static let shared = SettingsWindowController()
 
@@ -11,10 +12,15 @@ final class SettingsWindowController: NSWindowController {
     private let folderLabel = NSTextField(labelWithString: "")
     private let autoAccept = NSButton(checkboxWithTitle: "Skip the dialog — start caught downloads automatically", target: nil, action: nil)
 
+    private let ytdlpLabel = NSTextField(labelWithString: "yt-dlp: …")
+    private let ffmpegLabel = NSTextField(labelWithString: "ffmpeg: …")
+    private let autoUpdate = NSButton(checkboxWithTitle: "Keep yt-dlp updated automatically", target: nil, action: nil)
+    private let updateBtn = NSButton(title: "Update now", target: nil, action: nil)
+
     private var folder: String = (NSHomeDirectory() as NSString).appendingPathComponent("Downloads/MacDM")
 
     private convenience init() {
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 220),
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
         win.title = "MacDM Settings"
         win.center()
@@ -27,6 +33,7 @@ final class SettingsWindowController: NSWindowController {
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        refreshTools()
     }
 
     private func build() {
@@ -59,6 +66,26 @@ final class SettingsWindowController: NSWindowController {
         connRow.spacing = 6
         (connRow.views.last as? NSTextField)?.textColor = .secondaryLabelColor
 
+        ytdlpLabel.textColor = .secondaryLabelColor
+        ffmpegLabel.textColor = .secondaryLabelColor
+        autoUpdate.target = self
+        autoUpdate.action = #selector(autoUpdateToggled)
+        updateBtn.target = self
+        updateBtn.action = #selector(updateNow)
+        updateBtn.bezelStyle = .rounded
+
+        let sep = NSBox()
+        sep.boxType = .separator
+
+        let toolsBox = NSStackView(views: [
+            ytdlpLabel,
+            NSStackView(views: [autoUpdate, updateBtn]),
+            ffmpegLabel,
+        ])
+        toolsBox.orientation = .vertical
+        toolsBox.alignment = .leading
+        toolsBox.spacing = 8
+
         let save = NSButton(title: "Done", target: self, action: #selector(saveAndClose))
         save.keyEquivalent = "\r"
         save.bezelStyle = .rounded
@@ -67,6 +94,8 @@ final class SettingsWindowController: NSWindowController {
             labelled("Max. connections number:", connRow),
             labelled("Default download folder:", NSStackView(views: [folderLabel, change])),
             autoAccept,
+            sep,
+            labelled("Bundled tools:", toolsBox),
             NSView(),
             NSStackView(views: [NSView(), save]),
         ])
@@ -80,6 +109,7 @@ final class SettingsWindowController: NSWindowController {
             stack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20),
             stack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20),
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20),
+            sep.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         win.contentView = root
     }
@@ -94,7 +124,45 @@ final class SettingsWindowController: NSWindowController {
         autoAccept.state = d.bool(forKey: "autoAcceptHint") ? .on : .off
     }
 
+    private func refreshTools() {
+        DaemonClient.shared.fetchTools { [weak self] info in
+            guard let self = self, let info = info else { return }
+            let yt = info.ytdlp
+            var s = "yt-dlp: " + (yt.version.isEmpty ? "not installed" : yt.version)
+            if !yt.latest.isEmpty && yt.update_available {
+                s += "  (latest \(yt.latest))"
+            } else if !yt.latest.isEmpty {
+                s += "  (up to date)"
+            }
+            self.ytdlpLabel.stringValue = s
+            self.ffmpegLabel.stringValue = "ffmpeg: " + (info.ffmpeg.version.isEmpty ? "not found" : info.ffmpeg.version)
+            self.autoUpdate.state = info.auto_update ? .on : .off
+        }
+    }
+
     @objc private func connChanged() { connLabel.stringValue = "\(connStepper.integerValue)" }
+
+    @objc private func autoUpdateToggled() {
+        DaemonClient.shared.setConfig(["auto_update_ytdlp": autoUpdate.state == .on])
+    }
+
+    @objc private func updateNow() {
+        updateBtn.isEnabled = false
+        updateBtn.title = "Updating…"
+        DaemonClient.shared.updateYtDlp { [weak self] _, error in
+            guard let self = self else { return }
+            self.updateBtn.title = "Update now"
+            self.updateBtn.isEnabled = true
+            if let msg = error {
+                let a = NSAlert()
+                a.messageText = "yt-dlp update failed"
+                a.informativeText = msg
+                a.runModal()
+            } else {
+                self.refreshTools()
+            }
+        }
+    }
 
     @objc private func chooseFolder() {
         let panel = NSOpenPanel()

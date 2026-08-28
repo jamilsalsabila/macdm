@@ -1,0 +1,229 @@
+package tools
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"macdm/internal/config"
+)
+
+// yt-dlp ships a self-contained macOS build (`yt-dlp_macos`, a universal
+// PyInstaller binary, macOS 10.15+) with every release. MacDM keeps its own copy
+// of it in the managed bin dir so the extractor path never depends on a
+// pip/Homebrew install the user has to remember to update.
+
+// githubAPI / githubDL are overridable in tests.
+var (
+	githubAPI = "https://api.github.com"
+	githubDL  = "https://github.com"
+)
+
+const ytDlpAsset = "yt-dlp_macos"
+
+// managedYtDlp is where the auto-updated binary lives; tools.find() prefers it.
+func managedYtDlp() string {
+	return filepath.Join(config.SupportDir(), "bin", "yt-dlp")
+}
+
+// YtDlpStatus is the current vs available picture for the UI.
+type YtDlpStatus struct {
+	Path            string `json:"path"`
+	Version         string `json:"version"`
+	Latest          string `json:"latest"`
+	UpdateAvailable bool   `json:"update_available"`
+}
+
+// CheckYtDlp reports the installed yt-dlp version and the latest release tag.
+// A network failure is not fatal — the local fields are still filled.
+func CheckYtDlp(ctx context.Context, set Set) (YtDlpStatus, error) {
+	s := YtDlpStatus{Path: set.YtDlp}
+	if set.YtDlp != "" {
+		v := Version(ctx, set.YtDlp) // "yt-dlp 2025.08.20" or "2025.08.20"
+		s.Version = strings.TrimSpace(strings.TrimPrefix(v, "yt-dlp"))
+	}
+	latest, err := githubLatestTag(ctx)
+	if err != nil {
+		return s, err
+	}
+	s.Latest = latest
+	s.UpdateAvailable = latest != "" && latest != s.Version
+	return s, nil
+}
+
+// UpdateYtDlp downloads the latest yt-dlp_macos build into the managed bin dir,
+// verifying its SHA-256 against the release's SHA2-256SUMS before swapping it in
+// atomically. Returns the old and new version strings.
+func UpdateYtDlp(ctx context.Context) (from, to string, err error) {
+	dest := managedYtDlp()
+	if fi, e := os.Stat(dest); e == nil && !fi.IsDir() {
+		from = strings.TrimSpace(strings.TrimPrefix(Version(ctx, dest), "yt-dlp"))
+	}
+
+	tag, err := githubLatestTag(ctx)
+	if err != nil {
+		return from, "", fmt.Errorf("check latest: %w", err)
+	}
+	if tag != "" && tag == from {
+		return from, from, nil // already current
+	}
+
+	want, err := releaseSHA(ctx, tag, ytDlpAsset)
+	if err != nil {
+		return from, "", fmt.Errorf("fetch checksums: %w", err)
+	}
+
+	binURL := fmt.Sprintf("%s/yt-dlp/yt-dlp/releases/download/%s/%s", githubDL, tag, ytDlpAsset)
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return from, "", err
+	}
+	tmp := filepath.Join(filepath.Dir(dest), ".yt-dlp.tmp")
+	got, err := downloadFile(ctx, binURL, tmp)
+	if err != nil {
+		return from, "", fmt.Errorf("download: %w", err)
+	}
+	defer os.Remove(tmp)
+
+	if want != "" && !strings.EqualFold(want, got) {
+		return from, "", fmt.Errorf("checksum mismatch: got %s want %s", got, want)
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return from, "", err
+	}
+	// Confirm it executes before committing.
+	if v := Version(ctx, tmp); v == "" {
+		return from, "", fmt.Errorf("downloaded binary does not run")
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		return from, "", err
+	}
+	to = strings.TrimSpace(strings.TrimPrefix(Version(ctx, dest), "yt-dlp"))
+	return from, to, nil
+}
+
+// AutoUpdateLoop runs an initial check (if the stamp file is missing or >24h
+// old) then re-checks every 12h, until ctx is cancelled. Errors are logged, not
+// returned — a failed update must never take the daemon down.
+func AutoUpdateLoop(ctx context.Context, cfg config.Config) {
+	if !cfg.AutoUpdateYtDlpEnabled() {
+		return
+	}
+	stamp := filepath.Join(config.SupportDir(), ".ytdlp-checked")
+	run := func() {
+		if fi, err := os.Stat(stamp); err == nil && time.Since(fi.ModTime()) < 24*time.Hour {
+			return
+		}
+		from, to, err := UpdateYtDlp(ctx)
+		switch {
+		case err != nil:
+			log.Printf("yt-dlp auto-update: %v", err)
+		case from != to:
+			log.Printf("yt-dlp auto-update: %s -> %s", from, to)
+		default:
+			log.Printf("yt-dlp auto-update: already current (%s)", to)
+		}
+		_ = os.WriteFile(stamp, []byte(time.Now().Format(time.RFC3339)), 0o644)
+	}
+
+	// Small delay so it doesn't compete with startup work.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(10 * time.Second):
+	}
+	run()
+
+	t := time.NewTicker(12 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			run()
+		}
+	}
+}
+
+// --- helpers ---
+
+func githubLatestTag(ctx context.Context) (string, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		githubAPI+"/repos/yt-dlp/yt-dlp/releases/latest", nil)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("github api: %s", resp.Status)
+	}
+	var body struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(body.TagName), nil
+}
+
+// releaseSHA returns the hex SHA-256 for asset within a release's SHA2-256SUMS.
+func releaseSHA(ctx context.Context, tag, asset string) (string, error) {
+	u := fmt.Sprintf("%s/yt-dlp/yt-dlp/releases/download/%s/SHA2-256SUMS", githubDL, tag)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("checksums: %s", resp.Status)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && filepath.Base(f[1]) == asset {
+			return f[0], nil
+		}
+	}
+	return "", nil // no line — skip verification rather than block the update
+}
+
+func downloadFile(ctx context.Context, url, dest string) (sha string, err error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	client := &http.Client{Timeout: 90 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("http %s", resp.Status)
+	}
+	f, err := os.Create(dest)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(f, h), resp.Body); err != nil {
+		f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}

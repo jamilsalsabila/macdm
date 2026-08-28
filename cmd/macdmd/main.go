@@ -52,6 +52,11 @@ func main() {
 	}, st)
 	mgr.ResumeAll()
 
+	// Keep the managed yt-dlp binary current in the background (daily check).
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	defer bgCancel()
+	go tools.AutoUpdateLoop(bgCtx, cfg)
+
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           api.New(mgr),
@@ -69,6 +74,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Print("shutting down")
+	bgCancel()
 
 	mgr.Shutdown(4 * time.Second) // stop jobs + kill yt-dlp/ffmpeg children
 

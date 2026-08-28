@@ -72,6 +72,9 @@ func New(cfg Config, st *store.Store) *Manager {
 // Store exposes the underlying store for the API layer (list/get/watch).
 func (m *Manager) Store() *store.Store { return m.st }
 
+// Tools exposes the resolved external-tool paths for the API layer.
+func (m *Manager) Tools() tools.Set { return m.cfg.Tools }
+
 // AddOptions carries optional per-job settings.
 type AddOptions struct {
 	Headers   map[string]string

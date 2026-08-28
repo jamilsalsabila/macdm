@@ -110,6 +110,13 @@ go build -o bin/macdm-nmhost ./cmd/macdm-nmhost
 brew install ffmpeg yt-dlp
 ```
 
+The daemon keeps its own copy of `yt-dlp` current: on first run (and daily
+after) it fetches the latest `yt-dlp_macos` release, verifies its SHA-256, and
+drops it in `~/Library/Application Support/MacDM/bin/`. Toggle this off in
+**Settings → Bundled tools**, or trigger it now with the "Update now" button.
+Because site fixes ship in `yt-dlp` itself, MacDM rarely needs a release to keep
+working.
+
 Run the tests:
 
 ```bash

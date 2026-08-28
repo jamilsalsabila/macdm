@@ -95,6 +95,22 @@ struct ProbeResult: Codable {
     var note: String?
 }
 
+/// Result of GET /api/tools.
+struct ToolsInfo: Codable {
+    struct Tool: Codable { var path: String; var version: String }
+    struct YtDlp: Codable {
+        var path: String
+        var version: String
+        var latest: String
+        var update_available: Bool
+    }
+    var ffmpeg: Tool
+    var ytdlp: YtDlp
+    var auto_update: Bool
+}
+
+private struct UpdateResult: Codable { var ok: Bool; var from: String; var to: String }
+
 private struct JobEnvelope: Codable { let type: String; let job: Job }
 private struct ProposalEnvelope: Codable { let type: String; let proposal: Proposal }
 private struct TypeOnly: Codable { let type: String }
@@ -190,6 +206,40 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     }
 
     func reject(_ proposalID: String) { post("api/proposals/\(proposalID)/reject", [:]) }
+
+    // MARK: Tools / config
+
+    func fetchTools(_ done: @escaping (ToolsInfo?) -> Void) {
+        let req = URLRequest(url: base.appendingPathComponent("api/tools"))
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            let info = data.flatMap { try? JSONDecoder().decode(ToolsInfo.self, from: $0) }
+            DispatchQueue.main.async { done(info) }
+        }.resume()
+    }
+
+    /// Runs the yt-dlp self-update on the daemon. Completion carries the new
+    /// version string on success, or a non-nil error message on failure.
+    func updateYtDlp(_ done: @escaping (_ newVersion: String?, _ error: String?) -> Void) {
+        var req = URLRequest(url: base.appendingPathComponent("api/tools/ytdlp/update"))
+        req.httpMethod = "POST"
+        req.timeoutInterval = 180
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            DispatchQueue.main.async {
+                if let err = err { done(nil, err.localizedDescription); return }
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                guard let data = data else { done(nil, "no response"); return }
+                if code >= 300 {
+                    let msg = (try? JSONDecoder().decode([String: String].self, from: data))?["error"] ?? "HTTP \(code)"
+                    done(nil, msg)
+                    return
+                }
+                let r = try? JSONDecoder().decode(UpdateResult.self, from: data)
+                done(r?.to ?? "", nil)
+            }
+        }.resume()
+    }
+
+    func setConfig(_ body: [String: Any]) { post("api/config", body) }
 
     // MARK: SSE
 

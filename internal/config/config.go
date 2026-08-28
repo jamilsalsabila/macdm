@@ -14,7 +14,7 @@ const DefaultAddr = "127.0.0.1:7345"
 // Version is bumped whenever the daemon's wire behaviour changes. The menu-bar
 // app compares it against its own build and restarts a mismatched daemon so a
 // stale background macdmd never lingers after a rebuild.
-const Version = "0.3.2"
+const Version = "0.4.0"
 
 // Config is the on-disk settings file (config.json in the support dir). Every
 // field has a working default, so the file is optional.
@@ -37,6 +37,16 @@ type Config struct {
 	// the dialog before auto-accepting anyway.
 	AutoAccept       bool `json:"auto_accept"`
 	PromptTimeoutSec int  `json:"prompt_timeout_sec"`
+
+	// AutoUpdateYtDlp keeps the MacDM-managed yt-dlp binary current (daily
+	// check). Pointer so an absent key means "not set" — Load defaults it to
+	// true, since a stale yt-dlp is the usual reason YouTube stops working.
+	AutoUpdateYtDlp *bool `json:"auto_update_ytdlp,omitempty"`
+}
+
+// AutoUpdateYtDlpEnabled reports the effective setting (default true).
+func (c Config) AutoUpdateYtDlpEnabled() bool {
+	return c.AutoUpdateYtDlp == nil || *c.AutoUpdateYtDlp
 }
 
 // SupportDir is ~/Library/Application Support/MacDM, created on demand.
@@ -77,4 +87,19 @@ func Load() Config {
 	}
 	_ = os.MkdirAll(c.DownloadDir, 0o755)
 	return c
+}
+
+// Save writes c to ConfigPath as pretty JSON via a temp-then-rename so a crash
+// mid-write never leaves a truncated file.
+func Save(c Config) error {
+	data, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	_ = os.MkdirAll(SupportDir(), 0o755)
+	tmp := ConfigPath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, ConfigPath())
 }

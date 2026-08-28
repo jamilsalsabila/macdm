@@ -19,6 +19,7 @@ import (
 	"macdm/internal/config"
 	"macdm/internal/manager"
 	"macdm/internal/store"
+	"macdm/internal/tools"
 )
 
 // Server is an http.Handler serving the API and the bundled status page.
@@ -59,7 +60,62 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/proposals/{id}/accept", s.acceptProposal)
 	s.mux.HandleFunc("POST /api/proposals/{id}/reject", s.rejectProposal)
 	s.mux.HandleFunc("GET /api/events", s.events)
+	s.mux.HandleFunc("GET /api/tools", s.getTools)
+	s.mux.HandleFunc("POST /api/tools/ytdlp/update", s.updateYtDlp)
+	s.mux.HandleFunc("POST /api/config", s.patchConfig)
 	s.mux.HandleFunc("GET /", s.page)
+}
+
+type toolInfo struct {
+	Path    string `json:"path"`
+	Version string `json:"version"`
+}
+
+func (s *Server) getTools(w http.ResponseWriter, r *http.Request) {
+	set := s.mgr.Tools()
+	yt, _ := tools.CheckYtDlp(r.Context(), set) // best-effort; local fields still filled
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ffmpeg": toolInfo{Path: set.Ffmpeg, Version: tools.Version(r.Context(), set.Ffmpeg)},
+		"ytdlp": map[string]any{
+			"path":             yt.Path,
+			"version":          yt.Version,
+			"latest":           yt.Latest,
+			"update_available": yt.UpdateAvailable,
+		},
+		"auto_update": config.Load().AutoUpdateYtDlpEnabled(),
+	})
+}
+
+func (s *Server) updateYtDlp(w http.ResponseWriter, r *http.Request) {
+	from, to, err := tools.UpdateYtDlp(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "from": from, "to": to})
+}
+
+func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AutoUpdateYtDlp *bool   `json:"auto_update_ytdlp"`
+		CookiesFrom     *string `json:"cookies_from"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	c := config.Load()
+	if req.AutoUpdateYtDlp != nil {
+		c.AutoUpdateYtDlp = req.AutoUpdateYtDlp
+	}
+	if req.CookiesFrom != nil {
+		c.CookiesFrom = *req.CookiesFrom
+	}
+	if err := config.Save(c); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) probe(w http.ResponseWriter, r *http.Request) {

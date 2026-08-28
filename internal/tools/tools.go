@@ -3,13 +3,12 @@
 //
 // Resolution order for each: an explicit path from config, then MacDM's own
 // managed bin dir (~/Library/Application Support/MacDM/bin), then $PATH, then a
-// few well-known locations Homebrew and pipx use. Auto-download of pinned builds
-// is a TODO hook (fetchYtDlp) — wired but not yet enabled by default.
+// few well-known locations Homebrew and pipx use. The managed yt-dlp copy is
+// kept current by update.go (CheckYtDlp / UpdateYtDlp / AutoUpdateLoop).
 package tools
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -106,22 +105,22 @@ func (s Set) RequireYtDlp() (string, error) {
 	return s.YtDlp, nil
 }
 
-// Version runs `<tool> --version` and returns the first line, for the UI.
+// Version returns the tool's version line for the UI. Tries `--version` (yt-dlp)
+// then `-version` (ffmpeg exits non-zero on the double-dash form).
 func Version(ctx context.Context, path string) string {
 	if path == "" {
 		return ""
 	}
-	out, err := exec.CommandContext(ctx, path, "--version").Output()
-	if err != nil {
-		return ""
+	for _, flag := range []string{"--version", "-version"} {
+		out, err := exec.CommandContext(ctx, path, flag).Output()
+		if err != nil || len(out) == 0 {
+			continue
+		}
+		line := string(out)
+		if i := strings.IndexByte(line, '\n'); i > 0 {
+			line = line[:i]
+		}
+		return strings.TrimSpace(line)
 	}
-	if i := strings.IndexByte(string(out), '\n'); i > 0 {
-		return strings.TrimSpace(string(out[:i]))
-	}
-	return strings.TrimSpace(string(out))
+	return ""
 }
-
-// fetchYtDlp is the hook for first-run auto-install. Not enabled yet.
-var errAutoDownloadDisabled = errors.New("tool auto-download not enabled")
-
-func fetchYtDlp(context.Context) error { return errAutoDownloadDisabled }
