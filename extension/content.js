@@ -141,30 +141,28 @@
   // tiktok-main.js runs in the PAGE context and posts the real progressive URLs
   // (playAddr / downloadAddr / bitrateInfo) here — the isolated content script
   // can't reach those window globals itself.
-  let tiktokURLs = [];
+  // tiktok-main.js (page context) posts { id, urls } for the CURRENTLY open clip.
+  let ttMsg = { id: null, urls: [] };
   window.addEventListener("message", (e) => {
     if (e.source === window && e.data && e.data.__macdm_tiktok && Array.isArray(e.data.urls)) {
-      tiktokURLs = e.data.urls;
+      ttMsg = { id: e.data.id || null, urls: e.data.urls };
     }
   });
 
-  // A DIRECT media URL for the hovered clip (not the page permalink). Order:
-  // the <video>'s own src, then whatever tiktok-main.js read off the page state.
+  function currentTikTokId() {
+    const m = location.pathname.match(/\/(?:video|photo)\/(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  // A DIRECT media URL for the clip the user is on — only if we're sure it's the
+  // current one (the feed swaps clips without a full navigation).
   function tiktokVideoURL(video) {
+    const id = currentTikTokId();
+    if (ttMsg.urls.length && (!id || !ttMsg.id || ttMsg.id === id)) {
+      return ttMsg.urls.find((u) => !/chain_token|[?&]tk=/.test(u)) || ttMsg.urls[0];
+    }
     const src = video?.currentSrc || video?.src || "";
     if (/^https?:/.test(src) && /aweme\/v1\/play|\/video\/tos\//.test(src)) return src;
-
-    const fromPage = tiktokURLs.find((u) => !/chain_token|[?&]tk=/.test(u)) || tiktokURLs[0];
-    if (fromPage) return fromPage;
-
-    for (const id of ["__UNIVERSAL_DATA_FOR_REHYDRATION__", "SIGI_STATE"]) {
-      const tag = document.getElementById(id);
-      if (!tag) continue;
-      let data;
-      try { data = JSON.parse(tag.textContent); } catch { continue; }
-      const u = deepFindURL(data, ["playAddr", "play_addr", "downloadAddr", "download_addr", "PlayAddr", "bitrateInfo"], 0);
-      if (u) return u;
-    }
     return null;
   }
 

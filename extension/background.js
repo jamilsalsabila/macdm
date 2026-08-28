@@ -434,9 +434,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors",
             "Sec-Fetch-Site": "same-site", "Accept": "*/*", "Referer": referer,
           };
-          // 1. A direct media URL (the <video>'s src, or the page's declared
-          //    playAddr) — download it straight, replaying the browser's session
-          //    headers. This is the path that actually works.
+          // 1. The page's own declared URL for THIS clip (tiktok-main.js matched
+          //    it to the current video id) — direct download, session headers
+          //    replayed. Correct clip AND no yt-dlp.
           if (msg.ttURL) {
             sendResponse(await startDownload({
               url: msg.ttURL, referer, title: msg.title || tab?.title,
@@ -444,19 +444,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             }));
             break;
           }
-          // 2. The sniffed stream URL + the captured cookies (same as picking it
-          //    from the popup — the user confirmed this works).
+          // 2. The permalink → yt-dlp. Slower, but guaranteed to be the clip the
+          //    address bar is on (the sniffed stream URL can be a *previous*
+          //    video from scrolling the feed).
+          if (msg.ttPermalink) {
+            sendResponse(await startDownload({
+              url: msg.ttPermalink, referer, title: msg.title || tab?.title,
+            }));
+            break;
+          }
+          // 3. Fall back to the sniffed stream URL + captured cookies.
           if (sniffed && cookie) {
             sendResponse(await startDownload({
               url: sniffed.url, referer, title: msg.title || tab?.title,
               headers: Object.assign({}, sniffed.headers, vibe),
-            }));
-            break;
-          }
-          // 3. Last resort: hand the permalink to yt-dlp.
-          if (msg.ttPermalink) {
-            sendResponse(await startDownload({
-              url: msg.ttPermalink, referer, title: msg.title || tab?.title,
             }));
             break;
           }
