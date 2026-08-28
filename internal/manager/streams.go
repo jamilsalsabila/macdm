@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"macdm/internal/config"
 	"macdm/internal/dash"
 	"macdm/internal/extractor"
 	"macdm/internal/hls"
@@ -290,8 +291,8 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 
 	res, err := ex.Download(wdCtx, j.URL, extractor.DownloadOptions{
 		OutDir:         outDir,
-		FormatSelector: j.FormatID, // "" => extractor's 1080p-capped default
-		CookiesFrom:    m.cfg.CookiesFrom,
+		FormatSelector: j.FormatID,                // "" => extractor's 1080p-capped default
+		CookiesFrom:    config.Load().CookiesFrom, // fresh — Settings can change it without a restart
 		MergeFormat:    "mp4",
 	}, func(p extractor.Progress) {
 		select {

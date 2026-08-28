@@ -108,6 +108,7 @@ struct ToolsInfo: Codable {
     var ffmpeg: Tool
     var ytdlp: YtDlp
     var auto_update: Bool
+    var cookies_from: String?
 }
 
 private struct UpdateResult: Codable { var ok: Bool; var from: String; var to: String }

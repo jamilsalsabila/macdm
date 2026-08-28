@@ -84,7 +84,8 @@ func (s *Server) getTools(w http.ResponseWriter, r *http.Request) {
 			"channel":          yt.Channel,
 			"update_available": yt.UpdateAvailable,
 		},
-		"auto_update": cfg.AutoUpdateYtDlpEnabled(),
+		"auto_update":  cfg.AutoUpdateYtDlpEnabled(),
+		"cookies_from": cfg.CookiesFrom,
 	})
 }
 

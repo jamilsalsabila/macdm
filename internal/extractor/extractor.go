@@ -157,7 +157,7 @@ func New(t tools.Set) (*Extractor, error) {
 }
 
 // Probe resolves formats for a page URL without downloading.
-func (e *Extractor) Probe(ctx context.Context, pageURL string) (*Info, error) {
+func (e *Extractor) Probe(ctx context.Context, pageURL, cookiesFrom string) (*Info, error) {
 	// --retries 1: a probe must be quick — don't let yt-dlp's default
 	// retry-with-backoff hold up the New Download dialog. (Keep the socket
 	// timeout at yt-dlp's default; YouTube's player-JS fetch can be slow.)
@@ -166,6 +166,9 @@ func (e *Extractor) Probe(ctx context.Context, pageURL string) (*Info, error) {
 	}
 	if e.ffmpeg != "" {
 		args = append(args, "--ffmpeg-location", e.ffmpeg)
+	}
+	if cookiesFrom != "" {
+		args = append(args, "--cookies-from-browser", cookiesFrom)
 	}
 	args = append(args, pageURL)
 

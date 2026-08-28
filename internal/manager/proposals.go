@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"macdm/internal/config"
 	"macdm/internal/extractor"
 	"macdm/internal/sniff"
 	"macdm/internal/store"
@@ -253,11 +254,31 @@ func (m *Manager) enrichExtractFormats(id, rawurl string) {
 	if err != nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	info, err := ex.Probe(ctx, rawurl)
+	// Abort the moment the user acts on the dialog — no point running (and
+	// double-hammering the site with) a second yt-dlp once a job is starting.
+	go func() {
+		t := time.NewTicker(500 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				m.hub.mu.Lock()
+				_, still := m.hub.pending[id]
+				m.hub.mu.Unlock()
+				if !still {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	info, err := ex.Probe(ctx, rawurl, config.Load().CookiesFrom)
 	if err != nil || info == nil {
-		return // slow / throttled — the static ladder stays, no harm
+		return // slow / throttled / user already moved on — static ladder stays
 	}
 	choices := info.QualityChoices()
 	if len(choices) == 0 {
