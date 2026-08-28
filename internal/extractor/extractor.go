@@ -158,7 +158,12 @@ func New(t tools.Set) (*Extractor, error) {
 
 // Probe resolves formats for a page URL without downloading.
 func (e *Extractor) Probe(ctx context.Context, pageURL string) (*Info, error) {
-	args := []string{"-J", "--no-warnings", "--no-playlist"}
+	// --retries 1 / --socket-timeout 8: a probe must be quick — don't let
+	// yt-dlp's default retry-with-backoff hold up the New Download dialog.
+	args := []string{
+		"-J", "--no-warnings", "--no-playlist",
+		"--retries", "1", "--socket-timeout", "8",
+	}
 	if e.ffmpeg != "" {
 		args = append(args, "--ffmpeg-location", e.ffmpeg)
 	}

@@ -49,7 +49,12 @@ func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]s
 			res.Note = err.Error()
 			return res
 		}
-		info, err := ex.Probe(ctx, rawurl)
+		// The dialog only needs the quality list; if yt-dlp is slow/struggling
+		// (rate-limited, retrying) don't hold "Detecting…" — the user can hit
+		// Download and the real extraction runs then.
+		ectx, ecancel := context.WithTimeout(ctx, 7*time.Second)
+		defer ecancel()
+		info, err := ex.Probe(ectx, rawurl)
 		if err != nil {
 			res.Note = err.Error()
 			if strings.Contains(strings.ToLower(err.Error()), "drm") {
