@@ -147,6 +147,21 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
 
     @objc private func openDetail() {
         guard let j = selectedJob ?? (table.clickedRow >= 0 ? jobs[table.clickedRow] : nil) else { return }
+        presentDetail(for: j)
+    }
+
+    /// Opens (or focuses) the IDM-style detail window for a job. Used by the
+    /// menu-bar "Downloading" list so a click there jumps straight to the
+    /// per-download view without going via the main window.
+    func showDetail(jobID: String) {
+        if let j = jobs.first(where: { $0.id == jobID }) {
+            presentDetail(for: j)
+        } else if let existing = details[jobID] {
+            existing.show()
+        }
+    }
+
+    private func presentDetail(for j: Job) {
         if let existing = details[j.id] { existing.show(); return }
         let ctl = DownloadDetailWindowController(job: j)
         ctl.onClose = { [weak self] in self?.details[j.id] = nil }

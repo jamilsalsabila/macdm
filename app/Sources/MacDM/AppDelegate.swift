@@ -75,9 +75,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     ? j.filename.prefix(31) + "…" : Substring(j.filename)
                 let it = NSMenuItem(
                     title: "   \(name) — \(Int(j.percent))%  \(Fmt.speed(j.speed_bps))",
-                    action: #selector(openMain), keyEquivalent: "")
+                    action: #selector(openJobDetail(_:)), keyEquivalent: "")
                 it.toolTip = j.filename
                 it.target = self
+                it.representedObject = j.id
                 m.addItem(it)
             }
         }
@@ -87,6 +88,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openMain() { mainWindow.show() }
+    @objc private func openJobDetail(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        mainWindow.showDetail(jobID: id)
+    }
     @objc private func openSettings() { SettingsWindowController.shared.show() }
     @objc private func addURL() {
         mainWindow.show()

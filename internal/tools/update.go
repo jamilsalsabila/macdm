@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"macdm/internal/config"
@@ -71,10 +72,17 @@ func CheckYtDlp(ctx context.Context, set Set, channel string) (YtDlpStatus, erro
 	return s, nil
 }
 
+// updateMu serialises UpdateYtDlp so a manual "Update now" and the background
+// loop can't both download into the same dir at once.
+var updateMu sync.Mutex
+
 // UpdateYtDlp downloads the latest yt-dlp_macos build for the channel into the
 // managed bin dir, verifying its SHA-256 against the release's SHA2-256SUMS
 // before swapping it in atomically. Returns the old and new version strings.
 func UpdateYtDlp(ctx context.Context, channel string) (from, to string, err error) {
+	updateMu.Lock()
+	defer updateMu.Unlock()
+
 	repo := ytDlpRepo(channel)
 	dest := managedYtDlp()
 	if fi, e := os.Stat(dest); e == nil && !fi.IsDir() {
@@ -98,13 +106,18 @@ func UpdateYtDlp(ctx context.Context, channel string) (from, to string, err erro
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return from, "", err
 	}
-	tmp := filepath.Join(filepath.Dir(dest), ".yt-dlp.tmp")
+	f, err := os.CreateTemp(filepath.Dir(dest), "yt-dlp-*.download")
+	if err != nil {
+		return from, "", err
+	}
+	tmp := f.Name()
+	f.Close()
+	defer os.Remove(tmp) // always clean up, success or failure
+
 	got, err := downloadFile(ctx, binURL, tmp)
 	if err != nil {
 		return from, "", fmt.Errorf("download: %w", err)
 	}
-	defer os.Remove(tmp)
-
 	if want != "" && !strings.EqualFold(want, got) {
 		return from, "", fmt.Errorf("checksum mismatch: got %s want %s", got, want)
 	}
@@ -215,8 +228,14 @@ func releaseSHA(ctx context.Context, repo, tag, asset string) (string, error) {
 }
 
 func downloadFile(ctx context.Context, url, dest string) (sha string, err error) {
+	// No overall Timeout — the file is ~35 MB and connections vary wildly.
+	// ResponseHeaderTimeout catches a dead server; the caller's ctx cancels a
+	// user-abandoned update. A stall mid-body will hang until ctx expires.
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	client := &http.Client{Timeout: 90 * time.Second}
+	client := &http.Client{Transport: &http.Transport{
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err

@@ -79,18 +79,12 @@ type Engine struct {
 	client *http.Client
 }
 
-// New builds an Engine. A nil client gets a default with generous connection limits.
+// New builds an Engine. The HTTP client uses a Chrome-disguised TLS handshake
+// (see utls.go) and preserves auth headers across same-site redirects.
 func New(cfg Config) *Engine {
-	tr := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConns:        64,
-		MaxIdleConnsPerHost: 32,
-		MaxConnsPerHost:     0,
-		ForceAttemptHTTP2:   true,
-	}
 	return &Engine{
 		cfg:    cfg,
-		client: &http.Client{Transport: tr},
+		client: newHTTPClient(),
 	}
 }
 
