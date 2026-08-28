@@ -138,7 +138,8 @@
     return null;
   }
 
-  function tiktokVideoURL() {
+  function tiktokVideoURL(video) {
+    // 1. The page JSON, when TikTok still ships it as a <script> we can read.
     for (const id of ["__UNIVERSAL_DATA_FOR_REHYDRATION__", "SIGI_STATE"]) {
       const tag = document.getElementById(id);
       if (!tag) continue;
@@ -147,6 +148,13 @@
       const u = deepFindURL(data, ["playAddr", "play_addr", "downloadAddr", "download_addr", "PlayAddr", "bitrateInfo"], 0);
       if (u) return u;
     }
+    // 2. The <video> element's own src — on a video page this is
+    //    www.tiktok.com/aweme/v1/play/?... which mints a fresh CDN redirect on
+    //    every request (no expiry) and, with Sec-Fetch-Dest: video, downloads.
+    const src = video?.currentSrc || video?.src ||
+                document.querySelector("video")?.currentSrc ||
+                document.querySelector("video")?.src || "";
+    if (/^https?:/.test(src) && /aweme\/v1\/play|\/video\/(tos|tobs)\//.test(src)) return src;
     return null;
   }
 
@@ -224,7 +232,7 @@
     busy = true;
     btn.textContent = "sending…";
     const url = bestURL(currentVideo);
-    const ttURL = /(^|\.)tiktok\.com$/i.test(location.hostname) ? tiktokVideoURL() : null;
+    const ttURL = /(^|\.)tiktok\.com$/i.test(location.hostname) ? tiktokVideoURL(currentVideo) : null;
 
     const done = (txt, ok) => {
       btn.textContent = txt;

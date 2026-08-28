@@ -427,12 +427,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // captured session headers (Cookie / ttwid / UA) with it.
         const sniffed = bestCaughtMedia(tab?.id);
         if (YTDLP_UNRELIABLE.test(tabHost)) {
-          const direct = msg.ttURL || sniffed?.url;
-          if (direct) {
-            // TikTok's CDN 403s anything that doesn't look like a <video>
-            // element request — even a fetch() from the page itself. Force the
-            // fetch-metadata headers a media element sends.
-            const headers = Object.assign({}, sniffed?.headers, {
+          // TikTok's CDN needs the tiktok.com cookies (httpOnly ttwid etc.) —
+          // a request without them 403s even from the page itself. We can only
+          // get those from a request the sniffer actually saw, so require it.
+          if (sniffed?.headers && (sniffed.headers.Cookie || sniffed.headers.cookie)) {
+            // Prefer the non-expiring www.tiktok.com/aweme/v1/play URL the
+            // content script read off the <video>; fall back to the caught CDN
+            // URL. Force the fetch-metadata headers a <video> element sends.
+            const url = msg.ttURL || sniffed.url;
+            const headers = Object.assign({}, sniffed.headers, {
               "Sec-Fetch-Dest": "video",
               "Sec-Fetch-Mode": "no-cors",
               "Sec-Fetch-Site": "same-site",
@@ -440,11 +443,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               "Referer": "https://www.tiktok.com/",
             });
             sendResponse(await startDownload({
-              url: direct, headers, referer: "https://www.tiktok.com/",
+              url, headers, referer: "https://www.tiktok.com/",
               title: msg.title || tab?.title,
             }));
             break;
           }
+          // Nothing sniffed yet — the video probably hasn't started.
+          sendResponse({ ok: false, error: "let the video play for a second, then try again" });
+          break;
         }
 
         const pageURL = isExtractableURL(msg.url) ? msg.url

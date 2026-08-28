@@ -285,11 +285,32 @@ func (m *Manager) start(id string) {
 func (m *Manager) execHTTP(ctx context.Context, id string, j *store.Job) error {
 	dest := j.Dest
 
+	// TikTok / ByteDance CDNs reject any request that doesn't look like a media
+	// element load — force the fetch-metadata headers a <video> sends. Harmless
+	// elsewhere, so only gate on the host. Work on a copy; j.Headers is shared.
+	headers := map[string]string{}
+	for k, v := range j.Headers {
+		headers[k] = v
+	}
+	if isTikTokMedia(j.URL) {
+		def := map[string]string{
+			"Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors",
+			"Sec-Fetch-Site": "same-site", "Accept": "*/*",
+			"Referer":    "https://www.tiktok.com/",
+			"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+		}
+		for k, v := range def {
+			if !headerSet(headers, k) {
+				headers[k] = v
+			}
+		}
+	}
+
 	// Probe first: learn the real filename, and — crucially — bail out of the
 	// raw engine if the URL is actually a web page (text/html). Many "video"
 	// links a user clicks are embed pages; hand those to the extractor instead
 	// of saving the HTML as a file.
-	if pr, e := m.eng.ProbeURL(ctx, j.URL, j.Headers); e == nil {
+	if pr, e := m.eng.ProbeURL(ctx, j.URL, headers); e == nil {
 		ct := strings.ToLower(pr.ContentType)
 		isHTML := strings.HasPrefix(ct, "text/html") || strings.HasPrefix(ct, "application/xhtml")
 		// An HTML response the server did not mark as a download is a web page,
@@ -320,7 +341,7 @@ func (m *Manager) execHTTP(ctx context.Context, id string, j *store.Job) error {
 	spec := engine.DownloadSpec{
 		URL:     j.URL,
 		Dest:    dest,
-		Headers: j.Headers,
+		Headers: headers,
 		Conns:   j.Connections,
 	}
 	probe, err := m.eng.Run(ctx, spec, func(p engine.Progress) {
@@ -403,6 +424,27 @@ func (m *Manager) execFragments(ctx context.Context, id string, j *store.Job) er
 		return err
 	}
 	return finalize(m, id, dest)
+}
+
+func headerSet(h map[string]string, key string) bool {
+	for k := range h {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTikTokMedia matches tiktok.com hosts and the ByteDance video CDNs.
+func isTikTokMedia(rawurl string) bool {
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return strings.HasSuffix(h, ".tiktok.com") || h == "tiktok.com" ||
+		strings.Contains(h, "tiktokcdn") || strings.HasSuffix(h, ".tiktokv.com") ||
+		strings.HasSuffix(h, ".muscdn.com") || strings.HasSuffix(h, ".byteoversea.com")
 }
 
 func headerVal(h map[string]string, key string) string {
