@@ -196,7 +196,15 @@ function parseFragment(rawUrl, ct, status, contentRange, reqRange) {
 // requestId -> { headers } captured at send time, consumed at response time
 const pendingHeaders = new Map();
 
-const RELEVANT_HEADERS = ["referer", "origin", "user-agent", "cookie", "authorization"];
+// Headers forwarded to the daemon so it can replay the request the way the
+// browser made it. TikTok / ByteDance CDNs 403 a request that is missing the
+// fetch-metadata + client-hint headers, so mirror those too.
+const RELEVANT_HEADERS = [
+  "referer", "origin", "user-agent", "cookie", "authorization",
+  "accept", "accept-language",
+  "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+  "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+];
 // Range is captured for fragment detection but NOT forwarded as a job header
 // (the daemon sets its own ranges).
 const CAPTURE_HEADERS = [...RELEVANT_HEADERS, "range"];
@@ -301,6 +309,28 @@ function updateBadge(tabId) {
   chrome.action.setBadgeText({ tabId, text: n ? String(n) : "" });
 }
 
+// bestCaughtMedia returns the most useful sniffed media item for a tab: prefer a
+// progressive video by size, then any video, then audio. Used when there is no
+// page URL yt-dlp can resolve (or the site's yt-dlp extractor is unreliable).
+function bestCaughtMedia(tabId) {
+  const items = [...(caught.get(tabId)?.values() || [])];
+  const rank = (it) => (it.category === "video" ? 2 : it.category === "audio" ? 1 : 0);
+  let best = null;
+  for (const it of items) {
+    if (rank(it) === 0) continue;
+    if (!best ||
+        rank(it) > rank(best) ||
+        (rank(it) === rank(best) && (it.size || 0) > (best.size || 0))) {
+      best = it;
+    }
+  }
+  return best;
+}
+
+// yt-dlp's extractors for these hosts are frequently broken between releases —
+// a directly sniffed progressive URL is more reliable there.
+const YTDLP_UNRELIABLE = /(^|\.)(tiktok\.com)$/i;
+
 // Collapse a fragment group into a caught-item-like record for the popup.
 function groupToItem(grp) {
   const frags = [...grp.frags.values()].sort((a, b) => a.start - b.start);
@@ -387,14 +417,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case "downloadPage": {
         const tab = sender.tab;
-        // Prefer a real permalink (…/reel/<id>/, …/p/<id>/, …/watch?v=…): yt-dlp
-        // resolves those to the FULL muxed video+audio at best quality. The
-        // byte-range fragment groups we collect on Instagram/Facebook are per
-        // *track* (video and audio arrive as separate progressive files), so
-        // assembling one group alone gives a silent clip or audio only — use
-        // that path only when there is no usable page URL.
-        // The content script's best guess, else the tab's own URL (often the
-        // permalink when the user opened the video directly).
+        const tabHost = (() => { try { return new URL(tab?.url || "").hostname; } catch { return ""; } })();
+
+        // yt-dlp resolves a real permalink to the FULL muxed video+audio at best
+        // quality — prefer it, EXCEPT on hosts whose yt-dlp extractor is
+        // currently flaky (TikTok), where a directly sniffed progressive URL
+        // (headers replayed) is what actually works, like Neat DM.
+        const sniffed = bestCaughtMedia(tab?.id);
+        if (YTDLP_UNRELIABLE.test(tabHost) && sniffed) {
+          sendResponse(await startDownload({
+            url: sniffed.url,
+            headers: sniffed.headers,
+            referer: tab?.url,
+            title: msg.title || tab?.title,
+          }));
+          break;
+        }
+
         const pageURL = isExtractableURL(msg.url) ? msg.url
                       : isExtractableURL(tab?.url) ? tab.url
                       : null;
@@ -406,6 +445,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }));
           break;
         }
+
+        // No page URL — a directly sniffed media stream is the next best thing.
+        if (sniffed) {
+          sendResponse(await startDownload({
+            url: sniffed.url,
+            headers: sniffed.headers,
+            referer: tab?.url,
+            title: msg.title || tab?.title,
+          }));
+          break;
+        }
+
         const g = fragGroups.get(tab?.id);
         if (g && g.size) {
           // Pick the biggest group by total bytes — that is the video track.

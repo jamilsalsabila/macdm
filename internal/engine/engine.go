@@ -125,6 +125,20 @@ func (e *Engine) ProbeURL(ctx context.Context, rawurl string, headers map[string
 	if err != nil {
 		return nil, err
 	}
+
+	// Some CDNs (TikTok/ByteDance) 403 a 1-byte range probe but serve the full
+	// GET fine — retry once without the Range header before giving up.
+	if resp.StatusCode == http.StatusForbidden {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		r2, e2 := e.req(ctx, http.MethodGet, rawurl, headers)
+		if e2 != nil {
+			return nil, e2
+		}
+		if resp, err = e.client.Do(r2); err != nil {
+			return nil, err
+		}
+	}
 	defer func() { _, _ = io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
