@@ -7,6 +7,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -74,7 +75,9 @@ type toolInfo struct {
 func (s *Server) getTools(w http.ResponseWriter, r *http.Request) {
 	set := s.mgr.Tools()
 	cfg := config.Load()
-	yt, _ := tools.CheckYtDlp(r.Context(), set, cfg.YtDlpChannelName()) // best-effort
+	tctx, tcancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer tcancel()
+	yt, _ := tools.CheckYtDlp(tctx, set, cfg.YtDlpChannelName()) // best-effort; local fields always filled
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ffmpeg": toolInfo{Path: set.Ffmpeg, Version: tools.Version(r.Context(), set.Ffmpeg)},
 		"ytdlp": map[string]any{

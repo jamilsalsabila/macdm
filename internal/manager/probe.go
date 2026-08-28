@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"macdm/internal/config"
 	"macdm/internal/dash"
+	"macdm/internal/extractor"
 	"macdm/internal/hls"
 	"macdm/internal/sniff"
 	"macdm/internal/store"
@@ -33,7 +35,7 @@ type ProbeResult struct {
 // Probe inspects a URL without downloading. It is best-effort: network hiccups
 // return a minimal result rather than an error so the dialog still opens.
 func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]string) *ProbeResult {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	u, err := url.Parse(strings.TrimSpace(rawurl))
@@ -44,13 +46,34 @@ func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]s
 
 	switch res.Kind {
 	case sniff.KindExtract:
-		// Don't run yt-dlp just to fill the quality menu — on a throttled
-		// connection `yt-dlp -J` can take 30-60s and the dialog hangs on
-		// "Detecting…". Offer a static ladder instead; the -f selectors below
-		// resolve against whatever the site actually has, and the real title is
-		// picked up during the download (MACDM_TITLE) and applied at finalize.
+		// Ask yt-dlp for the real format list (resolutions + sizes, matching what
+		// YouTube itself offers). If the connection is throttled and it doesn't
+		// answer within the budget, fall back to a static ladder so the dialog
+		// still opens with a usable quality menu.
 		res.Formats = staticQualityLadder()
-		res.Resumable = false
+		ex, e := extractor.New(m.cfg.Tools)
+		if e != nil {
+			res.Note = e.Error()
+			break
+		}
+		ectx, ecancel := context.WithTimeout(ctx, 25*time.Second)
+		info, e := ex.Probe(ectx, rawurl, config.Load().CookiesFrom)
+		ecancel()
+		if e != nil {
+			res.Note = e.Error()
+			if strings.Contains(strings.ToLower(e.Error()), "drm") {
+				res.DRM = true
+			}
+			break
+		}
+		res.Title = info.Title
+		res.Live = info.IsLive
+		if fs := info.QualityChoices(); len(fs) > 0 {
+			res.Formats = fs
+		}
+		if info.Title != "" {
+			res.Filename = sanitize(info.Title) + ".mp4"
+		}
 
 	case sniff.KindHLS:
 		c := hls.NewClient(streamClient(headers), headers)

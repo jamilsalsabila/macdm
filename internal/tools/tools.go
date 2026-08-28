@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"macdm/internal/config"
 )
@@ -144,6 +145,8 @@ func Version(ctx context.Context, path string) string {
 	if path == "" {
 		return ""
 	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	for _, flag := range []string{"--version", "-version"} {
 		out, err := exec.CommandContext(ctx, path, flag).Output()
 		if err != nil || len(out) == 0 {
