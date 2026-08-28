@@ -430,48 +430,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const referer = tab?.url || "https://www.tiktok.com/";
           const cookie = sniffed?.headers &&
             (sniffed.headers.Cookie || sniffed.headers.cookie);
-          const isPermalink = (u) => {
-            try { return /\/@[\w.-]+\/(video|photo)\/\d+/.test(new URL(u).pathname); }
-            catch { return false; }
+          const vibe = {
+            "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-site", "Accept": "*/*", "Referer": referer,
           };
-          // content.js's pick for the hovered video (its own src, its permalink,
-          // or the page's declared playAddr).
-          const pick = msg.ttURL ||
-            (isPermalink(referer) ? referer : null) ||
-            (isExtractableURL(msg.url) ? msg.url : null);
-
-          if (pick && isPermalink(pick)) {
-            // A video permalink → let yt-dlp resolve the right clip.
+          // 1. A direct media URL (the <video>'s src, or the page's declared
+          //    playAddr) — download it straight, replaying the browser's session
+          //    headers. This is the path that actually works.
+          if (msg.ttURL) {
             sendResponse(await startDownload({
-              url: pick, referer, title: msg.title || tab?.title,
+              url: msg.ttURL, referer, title: msg.title || tab?.title,
+              headers: Object.assign({}, cookie ? { Cookie: cookie } : {}, vibe),
             }));
             break;
           }
-          if (pick) {
-            // A direct media / aweme-play URL → download it, replaying the
-            // fetch-metadata headers a <video> sends (+ cookies when we have
-            // them). preserveAuthHeaders in the daemon keeps the cookies across
-            // the 302 to the CDN host.
-            const headers = Object.assign({}, cookie ? { Cookie: cookie } : {}, {
-              "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors",
-              "Sec-Fetch-Site": "same-site", "Accept": "*/*", "Referer": referer,
-            });
-            sendResponse(await startDownload({
-              url: pick, referer, title: msg.title || tab?.title, headers,
-            }));
-            break;
-          }
+          // 2. The sniffed stream URL + the captured cookies (same as picking it
+          //    from the popup — the user confirmed this works).
           if (sniffed && cookie) {
             sendResponse(await startDownload({
               url: sniffed.url, referer, title: msg.title || tab?.title,
-              headers: Object.assign({}, sniffed.headers, {
-                "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors",
-                "Sec-Fetch-Site": "same-site", "Referer": referer,
-              }),
+              headers: Object.assign({}, sniffed.headers, vibe),
             }));
             break;
           }
-          sendResponse({ ok: false, error: "open the video on its own page, then try again" });
+          // 3. Last resort: hand the permalink to yt-dlp.
+          if (msg.ttPermalink) {
+            sendResponse(await startDownload({
+              url: msg.ttPermalink, referer, title: msg.title || tab?.title,
+            }));
+            break;
+          }
+          sendResponse({ ok: false, error: "let the video play for a second, then try again" });
           break;
         }
 

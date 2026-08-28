@@ -148,23 +148,15 @@
     }
   });
 
+  // A DIRECT media URL for the hovered clip (not the page permalink). Order:
+  // the <video>'s own src, then whatever tiktok-main.js read off the page state.
   function tiktokVideoURL(video) {
-    // 1. THIS video's own src. On a video page it's www.tiktok.com/aweme/v1/play/
-    //    ?item_id=… which mints a fresh CDN redirect every request (no expiry)
-    //    and is unambiguously the hovered clip.
     const src = video?.currentSrc || video?.src || "";
     if (/^https?:/.test(src) && /aweme\/v1\/play|\/video\/tos\//.test(src)) return src;
 
-    // 2. The permalink for the hovered video — yt-dlp resolves it to the right
-    //    clip even on the feed.
-    const p = postLinkNear(video);
-    if (p && /\/@[\w.-]+\/(video|photo)\/\d+/.test(p)) return p;
-
-    // 3. Whatever tiktok-main.js read from the page state (single-video pages).
     const fromPage = tiktokURLs.find((u) => !/chain_token|[?&]tk=/.test(u)) || tiktokURLs[0];
     if (fromPage) return fromPage;
 
-    // 4. Legacy readable <script> layouts.
     for (const id of ["__UNIVERSAL_DATA_FOR_REHYDRATION__", "SIGI_STATE"]) {
       const tag = document.getElementById(id);
       if (!tag) continue;
@@ -174,6 +166,12 @@
       if (u) return u;
     }
     return null;
+  }
+
+  function tiktokPermalink(video) {
+    if (/\/@[\w.-]+\/(video|photo)\/\d+/.test(location.pathname)) return location.href;
+    const p = postLinkNear(video);
+    return p && /\/@[\w.-]+\/(video|photo)\/\d+/.test(p) ? p : null;
   }
 
   function place(video) {
@@ -250,7 +248,9 @@
     busy = true;
     btn.textContent = "sending…";
     const url = bestURL(currentVideo);
-    const ttURL = /(^|\.)tiktok\.com$/i.test(location.hostname) ? tiktokVideoURL(currentVideo) : null;
+    const onTikTok = /(^|\.)tiktok\.com$/i.test(location.hostname);
+    const ttURL = onTikTok ? tiktokVideoURL(currentVideo) : null;
+    const ttPermalink = onTikTok ? tiktokPermalink(currentVideo) : null;
 
     const done = (txt, ok) => {
       btn.textContent = txt;
@@ -260,12 +260,12 @@
       setTimeout(() => { busy = false; btn.textContent = "⬇ MacDM"; }, cool);
     };
 
-    if (!url && !ttURL) { done("✗ open the video first", false); return; }
+    if (!url && !ttURL && !ttPermalink) { done("✗ open the video first", false); return; }
 
     const timeout = setTimeout(() => done("✗ no daemon", false), 12000);
     try {
       chrome.runtime.sendMessage(
-        { type: "downloadPage", url: url || location.href, ttURL, title: document.title },
+        { type: "downloadPage", url: url || location.href, ttURL, ttPermalink, title: document.title },
         (resp) => {
           clearTimeout(timeout);
           if (chrome.runtime.lastError) { done("✗ " + chrome.runtime.lastError.message, false); return; }
