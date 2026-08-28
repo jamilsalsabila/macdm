@@ -18,7 +18,7 @@ OUT="build/firefox-extension"
 rm -rf "$OUT"
 mkdir -p "$OUT" dist
 
-cp extension/background.js extension/content.js \
+cp extension/background.js extension/content.js extension/tiktok-main.js \
    extension/popup.html extension/popup.js "$OUT/"
 cp extension/firefox/manifest.json "$OUT/manifest.json"
 

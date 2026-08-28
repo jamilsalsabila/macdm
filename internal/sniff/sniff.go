@@ -229,10 +229,40 @@ func categorize(lowerURL, ct string) string {
 
 // IsPageHost reports whether host is a site whose page URLs should go to the
 // extractor rather than the raw engine.
+// mediaCDNSuffixes are hosts that only ever serve raw media bytes. A URL here is
+// a signed stream chunk — useless to the extractor (yt-dlp just 403s and retries
+// for a minute). They must NOT classify as KindExtract even though the CDN
+// domain often ends in a page-host's name (…​.tiktok.com).
+var mediaCDNSuffixes = []string{
+	"tiktokcdn.com", "tiktokcdn-us.com", "tiktokv.com", "muscdn.com",
+	"byteoversea.com", "ibytedtos.com", "akamaized.net", "fbcdn.net",
+	"cdninstagram.com", "googlevideo.com",
+}
+
+// isMediaCDNHost matches the suffixes above plus TikTok's numbered stream hosts
+// (v16-webapp-prime.tiktok.com, v19-…-useast.tiktok.com, …).
+func isMediaCDNHost(host string) bool {
+	for _, s := range mediaCDNSuffixes {
+		if host == s || strings.HasSuffix(host, "."+s) {
+			return true
+		}
+	}
+	if strings.HasSuffix(host, ".tiktok.com") {
+		first := host[:strings.IndexByte(host, '.')]
+		if len(first) >= 2 && first[0] == 'v' && first[1] >= '0' && first[1] <= '9' {
+			return true
+		}
+	}
+	return false
+}
+
 func IsPageHost(host string) bool {
 	host = strings.ToLower(host)
 	if i := strings.IndexByte(host, ':'); i >= 0 {
 		host = host[:i]
+	}
+	if isMediaCDNHost(host) {
+		return false
 	}
 	for _, h := range pageHosts {
 		if host == h || strings.HasSuffix(host, "."+h) {

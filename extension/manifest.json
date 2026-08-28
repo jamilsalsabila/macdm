@@ -32,6 +32,16 @@
       ],
       "run_at": "document_idle",
       "all_frames": true
+    },
+    {
+      "matches": [
+        "*://*.tiktok.com/*"
+      ],
+      "js": [
+        "tiktok-main.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ]
 }

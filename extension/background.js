@@ -427,28 +427,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // captured session headers (Cookie / ttwid / UA) with it.
         const sniffed = bestCaughtMedia(tab?.id);
         if (YTDLP_UNRELIABLE.test(tabHost)) {
-          // TikTok's CDN needs the tiktok.com cookies (httpOnly ttwid etc.) —
-          // a request without them 403s even from the page itself. We can only
-          // get those from a request the sniffer actually saw, so require it.
-          if (sniffed?.headers && (sniffed.headers.Cookie || sniffed.headers.cookie)) {
-            // Prefer the non-expiring www.tiktok.com/aweme/v1/play URL the
-            // content script read off the <video>; fall back to the caught CDN
-            // URL. Force the fetch-metadata headers a <video> element sends.
-            const url = msg.ttURL || sniffed.url;
-            const headers = Object.assign({}, sniffed.headers, {
-              "Sec-Fetch-Dest": "video",
-              "Sec-Fetch-Mode": "no-cors",
-              "Sec-Fetch-Site": "same-site",
-              "Accept": "*/*",
-              "Referer": "https://www.tiktok.com/",
-            });
+          const referer = tab?.url || "https://www.tiktok.com/";
+          const cookie = sniffed?.headers &&
+            (sniffed.headers.Cookie || sniffed.headers.cookie);
+          const base = {
+            "Sec-Fetch-Dest": "video",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-site",
+            "Accept": "*/*",
+            "Referer": referer,
+          };
+          // 1. The progressive URL tiktok-main.js read from the page's own state
+          //    (playAddr / bitrateInfo). This is what Neat DM / yt-dlp use — it
+          //    downloads with just a Referer for public videos.
+          if (msg.ttURL) {
             sendResponse(await startDownload({
-              url, headers, referer: "https://www.tiktok.com/",
+              url: msg.ttURL, referer,
               title: msg.title || tab?.title,
+              headers: Object.assign({}, cookie ? { Cookie: cookie } : {}, base),
             }));
             break;
           }
-          // Nothing sniffed yet — the video probably hasn't started.
+          // 2. Fall back to the caught <video> stream URL — needs the tiktok.com
+          //    cookies (httpOnly ttwid etc.) or it 403s.
+          if (cookie) {
+            sendResponse(await startDownload({
+              url: sniffed.url, referer,
+              title: msg.title || tab?.title,
+              headers: Object.assign({}, sniffed.headers, base),
+            }));
+            break;
+          }
           sendResponse({ ok: false, error: "let the video play for a second, then try again" });
           break;
         }

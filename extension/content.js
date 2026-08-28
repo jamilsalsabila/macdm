@@ -138,8 +138,21 @@
     return null;
   }
 
+  // tiktok-main.js runs in the PAGE context and posts the real progressive URLs
+  // (playAddr / downloadAddr / bitrateInfo) here — the isolated content script
+  // can't reach those window globals itself.
+  let tiktokURLs = [];
+  window.addEventListener("message", (e) => {
+    if (e.source === window && e.data && e.data.__macdm_tiktok && Array.isArray(e.data.urls)) {
+      tiktokURLs = e.data.urls;
+    }
+  });
+
   function tiktokVideoURL(video) {
-    // 1. The page JSON, when TikTok still ships it as a <script> we can read.
+    // Prefer a URL without the session-locked token; else the best (first).
+    const fromPage = tiktokURLs.find((u) => !/chain_token|[?&]tk=/.test(u)) || tiktokURLs[0];
+    if (fromPage) return fromPage;
+    // Fallback: a legacy readable <script> (older TikTok layouts).
     for (const id of ["__UNIVERSAL_DATA_FOR_REHYDRATION__", "SIGI_STATE"]) {
       const tag = document.getElementById(id);
       if (!tag) continue;
@@ -148,13 +161,10 @@
       const u = deepFindURL(data, ["playAddr", "play_addr", "downloadAddr", "download_addr", "PlayAddr", "bitrateInfo"], 0);
       if (u) return u;
     }
-    // 2. The <video> element's own src — on a video page this is
-    //    www.tiktok.com/aweme/v1/play/?... which mints a fresh CDN redirect on
-    //    every request (no expiry) and, with Sec-Fetch-Dest: video, downloads.
+    // Last resort: the <video>'s aweme/v1/play src (mints a fresh CDN redirect).
     const src = video?.currentSrc || video?.src ||
-                document.querySelector("video")?.currentSrc ||
-                document.querySelector("video")?.src || "";
-    if (/^https?:/.test(src) && /aweme\/v1\/play|\/video\/(tos|tobs)\//.test(src)) return src;
+                document.querySelector("video")?.currentSrc || "";
+    if (/^https?:/.test(src) && /aweme\/v1\/play/.test(src)) return src;
     return null;
   }
 
