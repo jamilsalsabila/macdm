@@ -181,11 +181,15 @@ func AutoUpdateLoop(ctx context.Context, cfg config.Config) {
 
 // --- helpers ---
 
+// ghClient has a short timeout so a slow/blocked GitHub never hangs the caller
+// (the Settings window's tool-status fetch, most importantly).
+var ghClient = &http.Client{Timeout: 6 * time.Second}
+
 func githubLatestTag(ctx context.Context, repo string) (string, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
 		githubAPI+"/repos/"+repo+"/releases/latest", nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := ghClient.Do(req)
 	if err != nil {
 		return "", err
 	}

@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"path"
@@ -9,7 +10,6 @@ import (
 	"time"
 
 	"macdm/internal/dash"
-	"macdm/internal/extractor"
 	"macdm/internal/hls"
 	"macdm/internal/sniff"
 	"macdm/internal/store"
@@ -44,25 +44,13 @@ func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]s
 
 	switch res.Kind {
 	case sniff.KindExtract:
-		ex, err := extractor.New(m.cfg.Tools)
-		if err != nil {
-			res.Note = err.Error()
-			return res
-		}
-		info, err := ex.Probe(ctx, rawurl) // ctx already capped at 10s
-		if err != nil {
-			res.Note = err.Error()
-			if strings.Contains(strings.ToLower(err.Error()), "drm") {
-				res.DRM = true
-			}
-			return res
-		}
-		res.Title = info.Title
-		res.Live = info.IsLive
-		res.Formats = info.QualityChoices()
-		if info.Title != "" {
-			res.Filename = sanitize(info.Title) + ".mp4"
-		}
+		// Don't run yt-dlp just to fill the quality menu — on a throttled
+		// connection `yt-dlp -J` can take 30-60s and the dialog hangs on
+		// "Detecting…". Offer a static ladder instead; the -f selectors below
+		// resolve against whatever the site actually has, and the real title is
+		// picked up during the download (MACDM_TITLE) and applied at finalize.
+		res.Formats = staticQualityLadder()
+		res.Resumable = false
 
 	case sniff.KindHLS:
 		c := hls.NewClient(streamClient(headers), headers)
@@ -123,6 +111,31 @@ var sharedTransport = &http.Transport{
 
 func streamClient(headers map[string]string) *http.Client {
 	return &http.Client{Timeout: 20 * time.Second, Transport: sharedTransport}
+}
+
+// staticQualityLadder is the quality menu shown for extractor jobs without
+// probing. Each ID is a yt-dlp -f expression that degrades gracefully.
+func staticQualityLadder() []store.FormatChoice {
+	mk := func(label string, h, fps int) store.FormatChoice {
+		var sel string
+		if fps > 30 {
+			sel = fmt.Sprintf("bv*[height<=?%d][fps<=?%d]+ba/b[height<=?%d]/bv*+ba/b", h, fps+5, h)
+		} else if h > 0 {
+			sel = fmt.Sprintf("bv*[height<=?%d]+ba/b[height<=?%d]/bv*+ba/b", h, h)
+		} else {
+			sel = "bv*+ba/b"
+		}
+		return store.FormatChoice{ID: sel, Label: label, Height: h, FPS: fps, Ext: "mp4", Kind: "video+audio"}
+	}
+	return []store.FormatChoice{
+		mk("Best available", 0, 0),
+		mk("1080p60", 1080, 60),
+		mk("1080p", 1080, 30),
+		mk("720p", 720, 30),
+		mk("480p", 480, 30),
+		mk("360p", 360, 30),
+		{ID: "ba/b", Label: "Audio only", Kind: "audio", Ext: "m4a"},
+	}
 }
 
 func baseName(u *url.URL) string {

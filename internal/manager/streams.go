@@ -282,7 +282,7 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		select {
 		case <-started:
 		case <-wdCtx.Done():
-		case <-time.After(75 * time.Second):
+		case <-time.After(150 * time.Second):
 			close(stalled)
 			wdCancel() // kills the yt-dlp subprocess via ctx
 		}
@@ -327,7 +327,7 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 	if err != nil {
 		select {
 		case <-stalled:
-			return fmt.Errorf("yt-dlp couldn't resolve this video within 75s — it may be throttled or need a newer yt-dlp (Settings → Update now)")
+			return fmt.Errorf("yt-dlp couldn't resolve this video within 150s — it may be throttled or need a newer yt-dlp (Settings → Update now)")
 		default:
 		}
 		if strings.Contains(strings.ToLower(err.Error()), "drm") {

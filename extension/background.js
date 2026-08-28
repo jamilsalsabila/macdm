@@ -468,6 +468,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const pageURL = isExtractableURL(msg.url) ? msg.url
                       : isExtractableURL(tab?.url) ? tab.url
                       : null;
+
+        // YouTube genuinely needs yt-dlp (signature descrambling). Everywhere
+        // else, a directly sniffed media stream (Neat DM style) is faster and
+        // dodges yt-dlp being slow/throttled — try it first, fall back to the
+        // page URL.
+        const isYouTube = /(^|\.)(youtube\.com|youtu\.be)$/i.test(tabHost);
+        if (!isYouTube && sniffed) {
+          sendResponse(await startDownload({
+            url: sniffed.url,
+            headers: sniffed.headers,
+            referer: tab?.url,
+            title: msg.title || tab?.title,
+          }));
+          break;
+        }
+
         if (pageURL) {
           sendResponse(await startDownload({
             url: pageURL,
@@ -477,7 +493,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
 
-        // No page URL — a directly sniffed media stream is the next best thing.
         if (sniffed) {
           sendResponse(await startDownload({
             url: sniffed.url,
