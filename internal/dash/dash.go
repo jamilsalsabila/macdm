@@ -9,7 +9,6 @@
 package dash
 
 import (
-	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
@@ -112,14 +111,9 @@ func NewClient(h *http.Client, headers map[string]string) *Client {
 	return &Client{http: h, headers: headers}
 }
 
+// get fetches a small resource (the MPD, an init segment) fully into memory.
+// Media segments never go through here — see fetchToFile.
 func (c *Client) get(ctx context.Context, u string) ([]byte, error) {
-	return c.getStreamed(ctx, u, nil)
-}
-
-// getStreamed fetches u, calling onBytes(n) per chunk so the caller can report
-// smooth progress instead of one jump per whole segment (a DASH "segment" can be
-// a whole on-demand track file).
-func (c *Client) getStreamed(ctx context.Context, u string, onBytes func(int)) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -135,24 +129,52 @@ func (c *Client) getStreamed(ctx context.Context, u string, onBytes func(int)) (
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: %s", u, resp.Status)
 	}
-	var buf bytes.Buffer
-	rdr := io.LimitReader(resp.Body, 4<<30)
+	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+}
+
+// fetchToFile streams u straight into dst (reporting each chunk via onBytes) so
+// assembly never holds a whole segment in memory — a DASH on-demand "segment"
+// can be an entire multi-GB track file.
+func (c *Client) fetchToFile(ctx context.Context, u, dst string, onBytes func(int)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return err
+	}
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s: %s", u, resp.Status)
+	}
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 	tmp := make([]byte, 64*1024)
 	for {
-		n, rerr := rdr.Read(tmp)
+		n, rerr := resp.Body.Read(tmp)
 		if n > 0 {
-			buf.Write(tmp[:n])
+			if _, werr := f.Write(tmp[:n]); werr != nil {
+				return werr
+			}
 			if onBytes != nil {
 				onBytes(n)
 			}
 		}
 		if rerr == io.EOF {
-			return buf.Bytes(), nil
+			break
 		}
 		if rerr != nil {
-			return buf.Bytes(), rerr
+			return rerr
 		}
 	}
+	return f.Close()
 }
 
 // Parse fetches the MPD at rawurl and resolves the best video+audio tracks.
@@ -517,7 +539,8 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 				mu.Unlock()
 				emit()
 				var lastEmit time.Time
-				data, err := c.getStreamed(ctx, t.Segments[i], func(n int) {
+				fn := filepath.Join(opt.Dir, fmt.Sprintf("%s-%06d", t.Kind, i))
+				err := c.fetchToFile(ctx, t.Segments[i], fn, func(n int) {
 					doneBytes.Add(int64(n))
 					mu.Lock()
 					states[w].Bytes += int64(n)
@@ -529,11 +552,6 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 				})
 				if err != nil {
 					setErr(fmt.Errorf("segment %d: %w", i, err))
-					return
-				}
-				fn := filepath.Join(opt.Dir, fmt.Sprintf("%s-%06d", t.Kind, i))
-				if err := os.WriteFile(fn, data, 0o644); err != nil {
-					setErr(err)
 					return
 				}
 				parts[i] = fn

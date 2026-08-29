@@ -113,6 +113,61 @@ func TestAssembleAES128(t *testing.T) {
 	}
 }
 
+// TestAssembleAES128LargeSegment exercises the streaming CBC decrypt across the
+// 1 MiB chunk boundary (segments now decrypt file->file, not in memory).
+func TestAssembleAES128LargeSegment(t *testing.T) {
+	key := []byte("0123456789abcdef")
+	iv := []byte("aaaaaaaaaaaaaaaa")
+	// 2.5 MiB of pseudo-random plaintext — spans three decrypt chunks.
+	plain := make([]byte, 2_621_440+123)
+	for i := range plain {
+		plain[i] = byte((i*7 + 13) % 251)
+	}
+	block, _ := aes.NewCipher(key)
+	padded := append([]byte(nil), plain...)
+	pad := 16 - len(padded)%16
+	for i := 0; i < pad; i++ {
+		padded = append(padded, byte(pad))
+	}
+	ct := make([]byte, len(padded))
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ct, padded)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/key", func(w http.ResponseWriter, r *http.Request) { w.Write(key) })
+	mux.HandleFunc("/seg0.ts", func(w http.ResponseWriter, r *http.Request) { w.Write(ct) })
+	var playlist string
+	mux.HandleFunc("/index.m3u8", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, playlist) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	playlist = fmt.Sprintf(`#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-KEY:METHOD=AES-128,URI="%s/key",IV=0x%x
+#EXTINF:6.0,
+%s/seg0.ts
+#EXT-X-ENDLIST
+`, srv.URL, iv, srv.URL)
+
+	c := NewClient(srv.Client(), nil)
+	p, err := c.Parse(context.Background(), srv.URL+"/index.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "out.ts")
+	if err := c.Assemble(context.Background(), p, AssembleOptions{Dir: t.TempDir(), OutFile: out, Conns: 1}, nil); err != nil {
+		t.Fatalf("assemble: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if len(got) != len(plain) {
+		t.Fatalf("size: got %d want %d", len(got), len(plain))
+	}
+	for i := range got {
+		if got[i] != plain[i] {
+			t.Fatalf("byte %d: got %d want %d", i, got[i], plain[i])
+		}
+	}
+}
+
 func TestParseAttrs(t *testing.T) {
 	a := parseAttrs(`BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2",NAME="Low, quality"`)
 	if a["BANDWIDTH"] != "800000" || a["RESOLUTION"] != "640x360" {

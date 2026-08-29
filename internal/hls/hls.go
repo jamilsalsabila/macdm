@@ -8,7 +8,6 @@
 package hls
 
 import (
-	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -133,13 +132,9 @@ func NewClient(h *http.Client, headers map[string]string) *Client {
 	return &Client{http: h, headers: headers}
 }
 
+// get fetches a small resource (a playlist or a 16-byte key) fully into memory.
+// Media segments never go through here — see fetchToFile.
 func (c *Client) get(ctx context.Context, rawurl string) ([]byte, error) {
-	return c.getStreamed(ctx, rawurl, nil)
-}
-
-// getStreamed fetches rawurl, calling onBytes(n) as each chunk arrives so a
-// caller can report smooth progress instead of one jump per whole segment.
-func (c *Client) getStreamed(ctx context.Context, rawurl string, onBytes func(int)) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
 	if err != nil {
 		return nil, err
@@ -155,24 +150,7 @@ func (c *Client) getStreamed(ctx context.Context, rawurl string, onBytes func(in
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: %s", rawurl, resp.Status)
 	}
-	var buf bytes.Buffer
-	rdr := io.LimitReader(resp.Body, 64<<20)
-	tmp := make([]byte, 64*1024)
-	for {
-		n, rerr := rdr.Read(tmp)
-		if n > 0 {
-			buf.Write(tmp[:n])
-			if onBytes != nil {
-				onBytes(n)
-			}
-		}
-		if rerr == io.EOF {
-			return buf.Bytes(), nil
-		}
-		if rerr != nil {
-			return buf.Bytes(), rerr
-		}
-	}
+	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }
 
 // Parse fetches rawurl and returns the playlist it describes.
@@ -378,7 +356,8 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 				mu.Unlock()
 				emit()
 				var lastEmit time.Time
-				data, err := c.getStreamed(ctx, seg.URL, func(n int) {
+				fn := filepath.Join(opt.Dir, fmt.Sprintf("seg-%06d", i))
+				err := c.fetchSegment(ctx, seg, fn, keyCache, func(n int) {
 					doneBytes.Add(int64(n))
 					mu.Lock()
 					states[w].Bytes += int64(n)
@@ -388,16 +367,8 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 						emit()
 					}
 				})
-				if err == nil && seg.Key != nil && strings.ToUpper(seg.Key.Method) == "AES-128" {
-					data, err = c.decryptAES128(ctx, seg, keyCache)
-				}
 				if err != nil {
 					setErr(fmt.Errorf("segment %d: %w", i, err))
-					return
-				}
-				fn := filepath.Join(opt.Dir, fmt.Sprintf("seg-%06d", i))
-				if err := os.WriteFile(fn, data, 0o644); err != nil {
-					setErr(err)
 					return
 				}
 				parts[i] = fn
@@ -458,23 +429,85 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 	return out.Close()
 }
 
-func (c *Client) decryptAES128(ctx context.Context, seg Segment, cache *sync.Map) ([]byte, error) {
-	ct, err := c.get(ctx, seg.URL)
-	if err != nil {
-		return nil, err
+// fetchSegment downloads one segment to dst, streaming straight to disk so the
+// assembler never holds a whole segment (let alone conns×segments) in memory.
+// AES-128 segments are fetched to a scratch file and decrypted into dst.
+func (c *Client) fetchSegment(ctx context.Context, seg Segment, dst string, cache *sync.Map, onBytes func(int)) error {
+	if seg.Key == nil || strings.ToUpper(seg.Key.Method) != "AES-128" {
+		return c.fetchToFile(ctx, seg.URL, dst, onBytes)
 	}
-	var key []byte
+	enc := dst + ".enc"
+	if err := c.fetchToFile(ctx, seg.URL, enc, onBytes); err != nil {
+		return err
+	}
+	defer os.Remove(enc)
+	return c.decryptFileAES128(ctx, seg, enc, dst, cache)
+}
+
+// fetchToFile streams rawurl into dst, reporting each chunk via onBytes.
+func (c *Client) fetchToFile(ctx context.Context, rawurl, dst string, onBytes func(int)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
+	if err != nil {
+		return err
+	}
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s: %s", rawurl, resp.Status)
+	}
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	tmp := make([]byte, 64*1024)
+	for {
+		n, rerr := resp.Body.Read(tmp)
+		if n > 0 {
+			if _, werr := f.Write(tmp[:n]); werr != nil {
+				return werr
+			}
+			if onBytes != nil {
+				onBytes(n)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+	return f.Close()
+}
+
+func (c *Client) segKey(ctx context.Context, seg Segment, cache *sync.Map) ([]byte, error) {
 	if v, ok := cache.Load(seg.Key.URI); ok {
-		key = v.([]byte)
-	} else {
-		key, err = c.get(ctx, seg.Key.URI)
-		if err != nil {
-			return nil, fmt.Errorf("fetch key: %w", err)
-		}
-		if len(key) != 16 {
-			return nil, fmt.Errorf("key is %d bytes, want 16", len(key))
-		}
-		cache.Store(seg.Key.URI, key)
+		return v.([]byte), nil
+	}
+	key, err := c.get(ctx, seg.Key.URI)
+	if err != nil {
+		return nil, fmt.Errorf("fetch key: %w", err)
+	}
+	if len(key) != 16 {
+		return nil, fmt.Errorf("key is %d bytes, want 16", len(key))
+	}
+	cache.Store(seg.Key.URI, key)
+	return key, nil
+}
+
+// decryptFileAES128 CBC-decrypts src into dst in 1 MiB block-aligned chunks and
+// strips PKCS#7 padding from the last block.
+func (c *Client) decryptFileAES128(ctx context.Context, seg Segment, src, dst string, cache *sync.Map) error {
+	key, err := c.segKey(ctx, seg, cache)
+	if err != nil {
+		return err
 	}
 	iv := seg.Key.IV
 	if len(iv) != 16 {
@@ -483,21 +516,51 @@ func (c *Client) decryptAES128(ctx context.Context, seg Segment, cache *sync.Map
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if len(ct)%16 != 0 {
-		return nil, fmt.Errorf("ciphertext not a multiple of block size")
+	in, err := os.Open(src)
+	if err != nil {
+		return err
 	}
-	pt := make([]byte, len(ct))
-	cipher.NewCBCDecrypter(block, iv).CryptBlocks(pt, ct)
-	// strip PKCS#7 padding
-	if n := len(pt); n > 0 {
-		pad := int(pt[n-1])
-		if pad > 0 && pad <= 16 && pad <= n {
-			pt = pt[:n-pad]
+	defer in.Close()
+	st, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	size := st.Size()
+	if size == 0 || size%16 != 0 {
+		return fmt.Errorf("ciphertext not a multiple of block size")
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	mode := cipher.NewCBCDecrypter(block, iv)
+	const chunk = 1 << 20 // block-aligned
+	buf := make([]byte, chunk)
+	var read int64
+	for read < size {
+		want := chunk
+		if rem := size - read; rem < int64(chunk) {
+			want = int(rem)
+		}
+		if _, err := io.ReadFull(in, buf[:want]); err != nil {
+			return err
+		}
+		mode.CryptBlocks(buf[:want], buf[:want])
+		read += int64(want)
+		plain := buf[:want]
+		if read == size { // final block: drop PKCS#7 padding
+			if pad := int(plain[want-1]); pad > 0 && pad <= 16 && pad <= want {
+				plain = plain[:want-pad]
+			}
+		}
+		if _, err := out.Write(plain); err != nil {
+			return err
 		}
 	}
-	return pt, nil
+	return out.Close()
 }
 
 // --- tiny attribute-list parser for #EXT-X-* lines ---
