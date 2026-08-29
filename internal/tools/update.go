@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -29,7 +30,27 @@ var (
 	githubDL  = "https://github.com"
 )
 
-const ytDlpAsset = "yt-dlp_macos"
+// ytDlpAsset picks the release asset. The `yt-dlp_macos` PyInstaller binary is
+// self-contained but pathologically slow on some Macs (Intel + older macOS
+// re-extract + Gatekeeper-assess ~40 MB every invocation — 50s+ per run). When a
+// real python3 is on PATH, the tiny `yt-dlp` zipapp is 10-30x faster.
+func ytDlpAsset() string {
+	if hasPython3() {
+		return "yt-dlp"
+	}
+	return "yt-dlp_macos"
+}
+
+func hasPython3() bool {
+	p, err := exec.LookPath("python3")
+	if err != nil {
+		return false
+	}
+	// The macOS /usr/bin/python3 shim (no CLT installed) exits non-zero and
+	// pops a dialog — treat only a real interpreter as usable.
+	out, err := exec.Command(p, "-c", "import sys").CombinedOutput()
+	return err == nil && len(out) == 0
+}
 
 // ytDlpRepo maps a channel name to its GitHub repo. Nightly builds live in a
 // separate repo but use the same asset + SHA2-256SUMS layout.
@@ -97,12 +118,12 @@ func UpdateYtDlp(ctx context.Context, channel string) (from, to string, err erro
 		return from, from, nil // already current
 	}
 
-	want, err := releaseSHA(ctx, repo, tag, ytDlpAsset)
+	want, err := releaseSHA(ctx, repo, tag, ytDlpAsset())
 	if err != nil {
 		return from, "", fmt.Errorf("fetch checksums: %w", err)
 	}
 
-	binURL := fmt.Sprintf("%s/%s/releases/download/%s/%s", githubDL, repo, tag, ytDlpAsset)
+	binURL := fmt.Sprintf("%s/%s/releases/download/%s/%s", githubDL, repo, tag, ytDlpAsset())
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return from, "", err
 	}
