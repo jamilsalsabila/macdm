@@ -175,7 +175,7 @@ func (e *Extractor) Probe(ctx context.Context, pageURL, cookiesFrom string) (*In
 	if cookiesFrom != "" {
 		args = append(args, "--cookies-from-browser", cookiesFrom)
 	}
-	args = append(args, pageURL)
+	args = append(args, "--", pageURL) // stop option parsing — a URL can start with "-"
 
 	out, err := e.cmd(ctx, args...).Output()
 	if err != nil {
@@ -253,7 +253,7 @@ func (e *Extractor) Download(ctx context.Context, pageURL string, opt DownloadOp
 	if opt.CookiesFrom != "" {
 		args = append(args, "--cookies-from-browser", opt.CookiesFrom)
 	}
-	args = append(args, pageURL)
+	args = append(args, "--", pageURL) // stop option parsing — a URL can start with "-"
 
 	cmd := e.cmd(ctx, args...)
 	// yt-dlp is Python; when its stdout is a pipe (not a TTY) Python block-
