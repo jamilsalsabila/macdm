@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -66,6 +67,10 @@ func New(cfg Config, st *store.Store) *Manager {
 		running: map[string]context.CancelFunc{},
 		hub:     newProposalHub(),
 	}
+	// Stream/extract jobs write into per-job scratch dirs under WorkDir. Nothing
+	// resumes from those (HLS/DASH/extract restart), so a crash-leftover pile is
+	// pure waste — clear it on startup.
+	_ = os.RemoveAll(cfg.WorkDir)
 	return m
 }
 
@@ -95,16 +100,24 @@ func (m *Manager) Add(rawurl string, opt AddOptions) (*store.Job, error) {
 	}
 
 	kind := sniff.ClassifyURL(u)
-	name := opt.Filename
+	name := safeName(opt.Filename)
 	if name == "" {
-		name = guessName(u)
+		name = safeName(guessName(u))
 	}
+	if name == "" {
+		name = "download"
+	}
+	// opt.Dest is either empty (use the default dir) or a folder the user picked
+	// in the dialog; the filename component is always the sanitised `name`, so an
+	// untrusted document.title can't traverse out with "../".
 	dest := opt.Dest
 	switch {
 	case dest == "":
 		dest = filepath.Join(m.cfg.DownloadDir, name)
 	case isDir(dest):
 		dest = filepath.Join(dest, name)
+	default:
+		dest = filepath.Join(filepath.Dir(dest), safeName(filepath.Base(dest)))
 	}
 
 	// De-dupe: don't start a second job for the same URL+destination that is
@@ -346,7 +359,7 @@ func (m *Manager) execHTTP(ctx context.Context, id string, j *store.Job) error {
 	}
 	probe, err := m.eng.Run(ctx, spec, func(p engine.Progress) {
 		now := time.Now()
-		if now.Sub(lastPersist) < 450*time.Millisecond && p.DoneBytes < p.TotalBytes {
+		if now.Sub(lastPersist) < 200*time.Millisecond && p.DoneBytes < p.TotalBytes {
 			return
 		}
 		lastPersist = now
@@ -406,7 +419,7 @@ func (m *Manager) execFragments(ctx context.Context, id string, j *store.Job) er
 	var lastPersist time.Time
 	err := m.eng.RunFragments(ctx, dest, j.Headers, frags, j.Connections, func(p engine.Progress) {
 		now := time.Now()
-		if now.Sub(lastPersist) < 400*time.Millisecond && p.DoneBytes < p.TotalBytes {
+		if now.Sub(lastPersist) < 200*time.Millisecond && p.DoneBytes < p.TotalBytes {
 			return
 		}
 		lastPersist = now
@@ -540,6 +553,24 @@ func guessName(u *url.URL) string {
 		return "download"
 	}
 	return base
+}
+
+// safeName reduces an arbitrary string to a single path-safe filename component:
+// no directory separators, no "..", no leading/trailing dots, bounded length.
+func safeName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.NewReplacer("/", "_", "\\", "_", "\x00", "").Replace(s)
+	for strings.Contains(s, "..") {
+		s = strings.ReplaceAll(s, "..", "_")
+	}
+	s = strings.Trim(s, ". ")
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	if s == "" || s == "_" {
+		return ""
+	}
+	return s
 }
 
 func newID() string {

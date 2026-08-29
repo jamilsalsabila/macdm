@@ -47,7 +47,7 @@ func main() {
 		Engine: engine.Config{
 			MaxConns:  cfg.MaxConns,
 			MinChunk:  1 << 20,
-			UserAgent: "MacDM/0.1",
+			UserAgent: engine.DefaultUserAgent,
 			Timeout:   30 * time.Second,
 		},
 	}, st)

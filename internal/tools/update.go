@@ -175,14 +175,16 @@ func UpdateYtDlp(ctx context.Context, channel string) (from, to string, err erro
 }
 
 // AutoUpdateLoop runs an initial check (if the stamp file is missing or >24h
-// old) then re-checks every 12h, until ctx is cancelled. Errors are logged, not
-// returned — a failed update must never take the daemon down.
-func AutoUpdateLoop(ctx context.Context, cfg config.Config) {
-	if !cfg.AutoUpdateYtDlpEnabled() {
-		return
-	}
+// old) then re-checks every 12h, until ctx is cancelled. Config is re-read each
+// run so a Settings change (enable/disable, channel) takes effect without a
+// daemon restart. Errors are logged, not returned.
+func AutoUpdateLoop(ctx context.Context, _ config.Config) {
 	stamp := filepath.Join(config.SupportDir(), ".ytdlp-checked")
 	run := func() {
+		cfg := config.Load()
+		if !cfg.AutoUpdateYtDlpEnabled() {
+			return
+		}
 		if fi, err := os.Stat(stamp); err == nil && time.Since(fi.ModTime()) < 24*time.Hour {
 			return
 		}

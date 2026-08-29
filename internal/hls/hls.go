@@ -8,6 +8,7 @@
 package hls
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -24,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"macdm/internal/store"
 )
@@ -132,6 +134,12 @@ func NewClient(h *http.Client, headers map[string]string) *Client {
 }
 
 func (c *Client) get(ctx context.Context, rawurl string) ([]byte, error) {
+	return c.getStreamed(ctx, rawurl, nil)
+}
+
+// getStreamed fetches rawurl, calling onBytes(n) as each chunk arrives so a
+// caller can report smooth progress instead of one jump per whole segment.
+func (c *Client) getStreamed(ctx context.Context, rawurl string, onBytes func(int)) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
 	if err != nil {
 		return nil, err
@@ -147,7 +155,24 @@ func (c *Client) get(ctx context.Context, rawurl string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: %s", rawurl, resp.Status)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	var buf bytes.Buffer
+	rdr := io.LimitReader(resp.Body, 64<<20)
+	tmp := make([]byte, 64*1024)
+	for {
+		n, rerr := rdr.Read(tmp)
+		if n > 0 {
+			buf.Write(tmp[:n])
+			if onBytes != nil {
+				onBytes(n)
+			}
+		}
+		if rerr == io.EOF {
+			return buf.Bytes(), nil
+		}
+		if rerr != nil {
+			return buf.Bytes(), rerr
+		}
+	}
 }
 
 // Parse fetches rawurl and returns the playlist it describes.
@@ -348,15 +373,23 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 				emit()
 
 				seg := p.Segments[i]
-				data, err := c.get(ctx, seg.URL)
-				if err == nil {
+				mu.Lock()
+				states[w].Status = "receiving"
+				mu.Unlock()
+				emit()
+				var lastEmit time.Time
+				data, err := c.getStreamed(ctx, seg.URL, func(n int) {
+					doneBytes.Add(int64(n))
 					mu.Lock()
-					states[w].Status = "receiving"
+					states[w].Bytes += int64(n)
 					mu.Unlock()
-					emit()
-					if seg.Key != nil && strings.ToUpper(seg.Key.Method) == "AES-128" {
-						data, err = c.decryptAES128(ctx, seg, keyCache)
+					if now := time.Now(); now.Sub(lastEmit) > 200*time.Millisecond {
+						lastEmit = now
+						emit()
 					}
+				})
+				if err == nil && seg.Key != nil && strings.ToUpper(seg.Key.Method) == "AES-128" {
+					data, err = c.decryptAES128(ctx, seg, keyCache)
 				}
 				if err != nil {
 					setErr(fmt.Errorf("segment %d: %w", i, err))
@@ -368,10 +401,8 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 					return
 				}
 				parts[i] = fn
-				doneBytes.Add(int64(len(data)))
 				done.Add(1)
 				mu.Lock()
-				states[w].Bytes += int64(len(data))
 				states[w].Segment, states[w].Status = -1, "idle"
 				mu.Unlock()
 				emit()

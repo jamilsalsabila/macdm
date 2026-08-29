@@ -9,6 +9,7 @@
 package dash
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"macdm/internal/store"
 )
@@ -111,6 +113,13 @@ func NewClient(h *http.Client, headers map[string]string) *Client {
 }
 
 func (c *Client) get(ctx context.Context, u string) ([]byte, error) {
+	return c.getStreamed(ctx, u, nil)
+}
+
+// getStreamed fetches u, calling onBytes(n) per chunk so the caller can report
+// smooth progress instead of one jump per whole segment (a DASH "segment" can be
+// a whole on-demand track file).
+func (c *Client) getStreamed(ctx context.Context, u string, onBytes func(int)) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -126,8 +135,24 @@ func (c *Client) get(ctx context.Context, u string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: %s", u, resp.Status)
 	}
-	// Generous cap: a "segment" may be a whole isoff-on-demand track file.
-	return io.ReadAll(io.LimitReader(resp.Body, 4<<30))
+	var buf bytes.Buffer
+	rdr := io.LimitReader(resp.Body, 4<<30)
+	tmp := make([]byte, 64*1024)
+	for {
+		n, rerr := rdr.Read(tmp)
+		if n > 0 {
+			buf.Write(tmp[:n])
+			if onBytes != nil {
+				onBytes(n)
+			}
+		}
+		if rerr == io.EOF {
+			return buf.Bytes(), nil
+		}
+		if rerr != nil {
+			return buf.Bytes(), rerr
+		}
+	}
 }
 
 // Parse fetches the MPD at rawurl and resolves the best video+audio tracks.
@@ -491,7 +516,17 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 				states[w].Segment, states[w].Status = i, "receiving"
 				mu.Unlock()
 				emit()
-				data, err := c.get(ctx, t.Segments[i])
+				var lastEmit time.Time
+				data, err := c.getStreamed(ctx, t.Segments[i], func(n int) {
+					doneBytes.Add(int64(n))
+					mu.Lock()
+					states[w].Bytes += int64(n)
+					mu.Unlock()
+					if now := time.Now(); now.Sub(lastEmit) > 200*time.Millisecond {
+						lastEmit = now
+						emit()
+					}
+				})
 				if err != nil {
 					setErr(fmt.Errorf("segment %d: %w", i, err))
 					return
@@ -503,9 +538,7 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 				}
 				parts[i] = fn
 				done.Add(1)
-				doneBytes.Add(int64(len(data)))
 				mu.Lock()
-				states[w].Bytes += int64(len(data))
 				states[w].Segment, states[w].Status = -1, "idle"
 				mu.Unlock()
 				emit()

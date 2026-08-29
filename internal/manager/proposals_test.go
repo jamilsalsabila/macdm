@@ -15,6 +15,7 @@ func testMgr(t *testing.T) *Manager {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(st.Close)
 	return New(Config{
 		DownloadDir: t.TempDir(), MaxActive: 2,
 		PromptTimeoutSec: 300,

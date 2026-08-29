@@ -7,6 +7,7 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/publicsuffix"
 )
 
 // newHTTPClient builds the Engine's HTTP client. Its TLS handshake is disguised
@@ -34,11 +35,11 @@ func newHTTPClient() *http.Client {
 			}
 			uconn := utls.UClient(raw, &utls.Config{ServerName: host}, utls.HelloCustom)
 			if err := uconn.ApplyPreset(chromeH1Spec()); err != nil {
-				raw.Close()
+				_ = raw.Close()
 				return nil, err
 			}
 			if err := uconn.HandshakeContext(ctx); err != nil {
-				raw.Close()
+				_ = raw.Close()
 				return nil, err
 			}
 			return uconn, nil
@@ -91,27 +92,11 @@ func preserveAuthHeaders(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// sameSite is a cheap eTLD+1 comparison: the last two dot-labels match.
+// sameSite reports whether a and b share a registrable domain (eTLD+1), using
+// the public suffix list so bbc.co.uk / news.co.uk are correctly seen as
+// different orgs rather than both "co.uk".
 func sameSite(a, b string) bool {
-	return registrable(a) != "" && registrable(a) == registrable(b)
-}
-
-func registrable(host string) string {
-	parts := splitDots(host)
-	if len(parts) < 2 {
-		return ""
-	}
-	return parts[len(parts)-2] + "." + parts[len(parts)-1]
-}
-
-func splitDots(s string) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == '.' {
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	return append(out, s[start:])
+	ra, erra := publicsuffix.EffectiveTLDPlusOne(a)
+	rb, errb := publicsuffix.EffectiveTLDPlusOne(b)
+	return erra == nil && errb == nil && ra == rb
 }

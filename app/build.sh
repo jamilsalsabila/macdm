@@ -54,6 +54,12 @@ if [[ "$MODE" == "bundle" ]]; then
   <key>LSUIElement</key><true/>
   <key>NSAppTransportSecurity</key>
   <dict><key>NSAllowsLocalNetworking</key><true/></dict>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>MacDM saves your downloads here.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>MacDM saves downloads to the folder you choose.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>MacDM saves downloads to the folder you choose.</string>
 </dict>
 </plist>
 PLIST

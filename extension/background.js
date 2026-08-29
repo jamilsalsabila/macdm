@@ -140,6 +140,49 @@ const FRAGMENT_HOSTS = /(^|\.)(fbcdn\.net|cdninstagram\.com|fbsbx\.com|akamaized
 const caught = new Map();
 // tabId -> Map(baseUrlKey -> {frags: Map(start -> {url,start,end}), ...})
 const fragGroups = new Map();
+// tabId -> "origin+pathname" of the last real page load (SPA-nav guard)
+const tabPath = new Map();
+
+// MV3 kills the service worker after ~30s idle, wiping the maps above. Mirror
+// them to chrome.storage.session (in-memory, per-browser-session, survives the
+// SW restart) so a catch is still there when the user clicks a minute later.
+let saveTimer = null;
+function persistState() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    const c = {};
+    for (const [tab, m] of caught) c[tab] = [...m.values()];
+    const g = {};
+    for (const [tab, m] of fragGroups) {
+      g[tab] = [...m.values()].map((grp) => ({
+        key: grp.key, category: grp.category, headers: grp.headers,
+        title: grp.title, total: grp.total, ts: grp.ts,
+        frags: [...grp.frags.values()],
+      }));
+    }
+    try { chrome.storage.session.set({ macdm_caught: c, macdm_frags: g }); } catch {}
+  }, 400);
+}
+async function restoreState() {
+  try {
+    const { macdm_caught, macdm_frags } = await chrome.storage.session.get(["macdm_caught", "macdm_frags"]);
+    for (const tab in macdm_caught || {}) {
+      const m = new Map();
+      for (const it of macdm_caught[tab]) m.set(it.url, it);
+      caught.set(Number(tab), m);
+    }
+    for (const tab in macdm_frags || {}) {
+      const m = new Map();
+      for (const grp of macdm_frags[tab]) {
+        const frags = new Map();
+        for (const f of grp.frags) frags.set(f.start, f);
+        m.set(grp.key, { ...grp, frags });
+      }
+      fragGroups.set(Number(tab), m);
+    }
+  } catch {}
+}
+const stateReady = restoreState();
 
 const RANGEY_MEDIA_CT = /^(video|audio)\//i;
 
@@ -267,6 +310,7 @@ chrome.webRequest.onHeadersReceived.addListener(
       g.set(frag.key, grp);
       fragGroups.set(details.tabId, g);
       updateBadge(details.tabId);
+      persistState();
       return;
     }
 
@@ -288,19 +332,32 @@ chrome.webRequest.onHeadersReceived.addListener(
       });
       caught.set(details.tabId, tabMap);
       updateBadge(details.tabId);
+      persistState();
     }
   },
   { urls: ["<all_urls>"] },
   respSpec
 );
 
-chrome.tabs.onRemoved.addListener((tabId) => { caught.delete(tabId); fragGroups.delete(tabId); });
+chrome.tabs.onRemoved.addListener((tabId) => {
+  caught.delete(tabId);
+  fragGroups.delete(tabId);
+  tabPath.delete(tabId);
+  persistState();
+});
+// Clear a tab's catch list only on a real page load — not on every SPA history
+// change (YouTube/TikTok fire onUpdated with a new url on each in-app nav, which
+// would wipe the media we just caught for the current clip).
 chrome.tabs.onUpdated.addListener((tabId, info) => {
-  if (info.status === "loading" && info.url) {
-    caught.delete(tabId);
-    fragGroups.delete(tabId);
-    updateBadge(tabId);
-  }
+  if (info.status !== "loading" || !info.url) return;
+  let key = info.url;
+  try { const u = new URL(info.url); key = u.origin + u.pathname; } catch {}
+  if (tabPath.get(tabId) === key) return; // same document, SPA nav — keep the catches
+  tabPath.set(tabId, key);
+  caught.delete(tabId);
+  fragGroups.delete(tabId);
+  updateBadge(tabId);
+  persistState();
 });
 
 function updateBadge(tabId) {
@@ -388,6 +445,7 @@ async function startDownload({ url, headers, referer, title, conns, fragments })
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
+    await stateReady; // the SW may have just restarted — wait for the maps
     switch (msg.type) {
       case "getCaught": {
         const tabId = msg.tabId ?? sender.tab?.id;

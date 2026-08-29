@@ -33,12 +33,17 @@ type Config struct {
 	Timeout   time.Duration // per-request timeout (not whole-download)
 }
 
+// DefaultUserAgent is a current Chrome UA. Many CDNs 403 a non-browser
+// User-Agent, and the sniffer often can't capture the real one (MV3 hides it on
+// some requests), so this is the fallback for a job that carries none.
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
 // Default returns sensible values matching IDM-class defaults.
 func Default() Config {
 	return Config{
 		MaxConns:  8,
 		MinChunk:  1 << 20, // 1 MiB
-		UserAgent: "MacDM/0.1 (+https://example.invalid/macdm)",
+		UserAgent: DefaultUserAgent,
 		Timeout:   30 * time.Second,
 	}
 }
@@ -264,7 +269,7 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 	defer progStop()
 	if onProgress != nil {
 		go func() {
-			t := time.NewTicker(500 * time.Millisecond)
+			t := time.NewTicker(250 * time.Millisecond)
 			defer t.Stop()
 			last := done.Load()
 			lastT := time.Now()

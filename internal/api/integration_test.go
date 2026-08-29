@@ -57,6 +57,7 @@ func TestAPINoDeadlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer st.Close()
 	mgr := manager.New(manager.Config{
 		DownloadDir: dlDir, MaxActive: 3, PromptTimeoutSec: 300,
 		Engine: engine.Config{MaxConns: 4, MinChunk: 64 << 10, Timeout: 5 * time.Second},

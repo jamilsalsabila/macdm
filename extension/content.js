@@ -144,9 +144,13 @@
   // tiktok-main.js (page context) posts { id, urls } for the CURRENTLY open clip.
   let ttMsg = { id: null, urls: [] };
   window.addEventListener("message", (e) => {
-    if (e.source === window && e.data && e.data.__macdm_tiktok && Array.isArray(e.data.urls)) {
-      ttMsg = { id: e.data.id || null, urls: e.data.urls };
-    }
+    if (e.source !== window) return;
+    if (!/(^|\.)tiktok\.com$/i.test(location.hostname)) return;
+    const d = e.data;
+    if (!d || !d.__macdm_tiktok || !Array.isArray(d.urls)) return;
+    // Only accept real media URLs from the page's own state.
+    const urls = d.urls.filter((u) => typeof u === "string" && /^https:\/\/[^ ]+\/video\//.test(u));
+    if (urls.length) ttMsg = { id: d.id || null, urls };
   });
 
   function currentTikTokId() {
