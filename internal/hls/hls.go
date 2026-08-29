@@ -453,7 +453,9 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 			return err
 		}
 	}
-	return nil
+	// Flush and surface a write error (disk full) instead of returning a
+	// truncated file that the muxer would then choke on.
+	return out.Close()
 }
 
 func (c *Client) decryptAES128(ctx context.Context, seg Segment, cache *sync.Map) ([]byte, error) {

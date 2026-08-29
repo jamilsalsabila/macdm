@@ -588,7 +588,7 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 			return err
 		}
 	}
-	return nil
+	return out.Close()
 }
 
 // SetManifestDuration is called by Parse to publish mediaPresentationDuration.

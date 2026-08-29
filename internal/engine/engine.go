@@ -391,9 +391,16 @@ func (e *Engine) fetchChunk(ctx context.Context, spec DownloadSpec, f *os.File, 
 			setChunkStatus(scMu, c, "done")
 			return nil
 		}
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, errStalled) {
+			// A dead/stalled connection — retryable, and c.Done kept the bytes
+			// we did get, so the retry resumes from there.
+			lastErr = err
+			setChunkStatus(scMu, c, "error")
+			continue
+		}
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 			setChunkStatus(scMu, c, "idle")
-			return err
+			return context.Canceled
 		}
 		if errors.Is(err, errRangeIgnored) {
 			// Not retryable: the server does not honour Range. Propagate so Run
@@ -413,10 +420,50 @@ func setChunkStatus(scMu *sync.Mutex, c *chunk, s string) {
 	scMu.Unlock()
 }
 
+// stallTimeout aborts a chunk read that has gone this long without a byte — a
+// half-open connection would otherwise hang until the whole job is cancelled.
+// A var (not const) so tests can shorten it.
+var stallTimeout = 30 * time.Second
+
+// errStalled marks a chunk that timed out mid-transfer (retryable).
+var errStalled = errors.New("connection stalled")
+
 func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.File, c *chunk, scMu *sync.Mutex, done *atomic.Int64) (int64, error) {
+	// A watchdog context: cancelled by the parent (pause/shutdown) OR by us when
+	// no data has arrived for stallTimeout.
+	rctx, rcancel := context.WithCancel(ctx)
+	defer rcancel()
+	var lastRead atomic.Int64
+	lastRead.Store(time.Now().UnixNano())
+	stalled := make(chan struct{})
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-rctx.Done():
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, lastRead.Load())) > stallTimeout {
+					close(stalled)
+					rcancel()
+					return
+				}
+			}
+		}
+	}()
+	wasStalled := func() bool {
+		select {
+		case <-stalled:
+			return true
+		default:
+			return false
+		}
+	}
+
 	start := c.Start + c.Done
 	setChunkStatus(scMu, c, "connecting")
-	r, err := e.req(ctx, http.MethodGet, spec.URL, spec.Headers)
+	r, err := e.req(rctx, http.MethodGet, spec.URL, spec.Headers)
 	if err != nil {
 		return 0, err
 	}
@@ -427,6 +474,9 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 
 	resp, err := e.client.Do(r)
 	if err != nil {
+		if wasStalled() {
+			return 0, errStalled
+		}
 		return 0, err
 	}
 	defer resp.Body.Close()
@@ -451,12 +501,24 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 	var written int64
 	off := start
 	limit := int64(-1)
+	maxAttempt := int64(-1) // bytes this ranged attempt may still write
 	if !single && !fullBody {
 		limit = c.length()
+		maxAttempt = c.End - start + 1
 	}
 	for {
 		nr, er := resp.Body.Read(buf)
 		if nr > 0 {
+			// A compliant 206 never over-delivers, but clamp anyway: one wrong
+			// byte past c.End would corrupt the neighbouring chunk's region
+			// (fatal for archives/disk images, not just video).
+			if maxAttempt >= 0 && written+int64(nr) > maxAttempt {
+				nr = int(maxAttempt - written)
+			}
+			if nr <= 0 {
+				return written, nil
+			}
+			lastRead.Store(time.Now().UnixNano())
 			if _, ew := f.WriteAt(buf[:nr], off); ew != nil {
 				return written, ew
 			}
@@ -471,9 +533,19 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 			if fullBody {
 				return written, errRangeIgnored // Run: mark siblings done, we have it all
 			}
+			// A ranged chunk that hit EOF before its last byte is a truncated
+			// response (server dropped the connection cleanly). Marking it "done"
+			// here would rename a corrupt .part to the final file. Treat it as a
+			// stall so fetchChunk retries and resumes from c.Done.
+			if limit >= 0 && c.Done < limit {
+				return written, errStalled
+			}
 			return written, nil
 		}
 		if er != nil {
+			if wasStalled() {
+				return written, errStalled
+			}
 			return written, er
 		}
 		if limit >= 0 && c.Done >= limit {

@@ -3,6 +3,7 @@
   "name": "MacDM Integration",
   "version": "0.1.0",
   "description": "Catch media streams the browser loads and send them (or any link) to the MacDM download manager.",
+  "minimum_chrome_version": "111",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArZNR49CZipRWeZJ/G7VseYsKXEaBvKKG4V+ym10TDnfWUSARb84YpGj5346uA+qgqMUT88VwewLwiRzdYe0Hj1x9Gu3b8UafNzWaZWrZUzBPS/LnTxisr7kvsM6eWOMue7+AkqdRJeJj/mikwrc5l590nOaDEEzHsVyrcs/wH3P5H51ryKcdx4nP2zI9tWRqmMhhx0i+dYvXX9nQvwCVH+T5blNP4goxh3Z7vRwrPPN2QXNB57yCzpxDiKZpCITx0aG3ni9fNqAsIrE4pQ7r/ik95HLq9gJ2KBaswv/flJOoHyhX5lu5nos3meAnZO+HgapDk5ghr/sOx5mzzu4KwQIDAQAB",
   "permissions": [
     "webRequest",
