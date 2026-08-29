@@ -230,6 +230,12 @@ func (e *Extractor) Download(ctx context.Context, pageURL string, opt DownloadOp
 		// --progress forces progress output even though our stdout is a pipe,
 		// not a TTY; without it yt-dlp emits nothing until the file is done.
 		"--no-warnings", "--no-playlist", "--newline", "--progress",
+		// Pull DASH/HLS fragments in parallel — otherwise the download stalls
+		// between each fragment ("download a bit, pause, download a bit"), and it
+		// is slower. Also cap the HTTP chunk so a single-file stream reports
+		// progress smoothly instead of in big silent gulps.
+		"--concurrent-fragments", "5",
+		"--http-chunk-size", "10M",
 		"-f", sel,
 		"--merge-output-format", merge,
 		"-o", outTmpl,

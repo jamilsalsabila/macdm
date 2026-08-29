@@ -57,6 +57,11 @@ func (m *Manager) execStream(ctx context.Context, id string, j *store.Job) error
 			name = sanitize(t)
 		}
 		dest = filepath.Join(filepath.Dir(dest), name+".mp4")
+	}
+	if j.Status == store.StatusQueued {
+		dest = m.uniqueDest(id, dest)
+	}
+	if dest != j.Dest {
 		_, _ = m.st.Update(id, func(jj *store.Job) {
 			jj.Dest = dest
 			jj.Filename = filepath.Base(dest)
@@ -67,6 +72,7 @@ func (m *Manager) execStream(ctx context.Context, id string, j *store.Job) error
 	// but done/total track segments so the % bar works; finalize() sets bytes.
 	var lastBytes int64
 	var lastT = time.Now()
+	var estTotal int64
 	segProgress := func(sp streamProg) {
 		now := time.Now()
 		var bps int64
@@ -74,10 +80,20 @@ func (m *Manager) execStream(ctx context.Context, id string, j *store.Job) error
 			bps = int64(float64(sp.bytes-lastBytes) / dt)
 			lastBytes, lastT = sp.bytes, now
 		}
+		// Estimate the whole size from bytes-so-far vs segments-so-far so the %
+		// bar advances continuously instead of jumping one segment at a time.
+		if sp.doneSeg > 0 && sp.totalSeg > 0 {
+			e := sp.bytes * int64(sp.totalSeg) / int64(sp.doneSeg)
+			if e > estTotal {
+				estTotal = e // monotonic — never let the bar slide backwards
+			}
+		}
 		_, _ = m.st.Update(id, func(jj *store.Job) {
 			jj.Status = store.StatusDownloading
-			jj.DoneBytes = int64(sp.doneSeg)
-			jj.TotalBytes = int64(sp.totalSeg)
+			jj.DoneBytes = sp.bytes
+			jj.TotalBytes = estTotal
+			jj.Segments = sp.totalSeg
+			jj.SegmentsDone = sp.doneSeg
 			jj.Connections = len(sp.conns)
 			if bps > 0 {
 				jj.SpeedBps = bps
@@ -267,10 +283,18 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		return err
 	}
 
-	outDir := m.cfg.DownloadDir
+	finalDir := m.cfg.DownloadDir
 	if d := filepath.Dir(j.Dest); d != "." && d != "" {
-		outDir = d
+		finalDir = d
 	}
+	// yt-dlp downloads into a per-job scratch dir; we then move the result to a
+	// non-clobbering path (yt-dlp itself would silently skip a name that already
+	// exists, leaving the job with no file).
+	outDir := m.workDir(id)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	defer os.RemoveAll(outDir)
 
 	// Watchdog: if yt-dlp never starts downloading (stuck in extraction —
 	// throttled, broken extractor, dead network) fail with a clear message
@@ -336,7 +360,38 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		}
 		return err
 	}
-	return finalize(m, id, res.Path)
+	if res.Path == "" {
+		return fmt.Errorf("yt-dlp produced no file")
+	}
+	final := m.uniqueDest(id, filepath.Join(finalDir, filepath.Base(res.Path)))
+	if err := moveFile(res.Path, final); err != nil {
+		return err
+	}
+	return finalize(m, id, final)
+}
+
+// moveFile renames, falling back to copy+remove across filesystems.
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Remove(src)
 }
 
 func finalize(m *Manager, id, path string) error {

@@ -154,7 +154,7 @@ final class DownloadDetailWindowController: NSWindowController, NSTableViewDataS
         statusField.stringValue = statusText(j)
         statusField.toolTip = j.status == "error" ? j.error : nil
 
-        sizeField.stringValue = j.streamingSegments ? "adaptive stream (\(j.total_bytes) segments)" : j.sizeText
+        sizeField.stringValue = j.streamingSegments ? "adaptive stream (\(j.segments ?? 0) segments)" : j.sizeText
         doneField.stringValue = j.doneText
         rateField.stringValue = j.status == "downloading" ? Fmt.speed(j.speed_bps) : "—"
         etaField.stringValue = j.etaText

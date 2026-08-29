@@ -32,6 +32,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
+	defer st.Close() // final flush of any pending progress write
 
 	toolset := tools.Resolve(cfg)
 	log.Printf("tools: ffmpeg=%q yt-dlp=%q", toolset.Ffmpeg, toolset.YtDlp)

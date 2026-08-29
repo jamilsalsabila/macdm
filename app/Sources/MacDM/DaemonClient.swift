@@ -37,28 +37,30 @@ struct Job: Codable, Identifiable {
     var resumable: Bool?
     var quality: String?
     var conns: [ConnStat]?
+    var segments: Int?
+    var segments_done: Int?
 
     var percent: Double {
         total_bytes > 0 ? min(100, Double(done_bytes) / Double(total_bytes) * 100) : 0
     }
     var isRunning: Bool { status == "downloading" || status == "probing" || status == "queued" }
 
-    /// While an adaptive stream downloads, total/done are SEGMENT counts, not
-    /// bytes — finalize() swaps them for the real file size on completion.
+    /// An adaptive stream in flight: total/done bytes are estimates and the real
+    /// segment counts are in `segments` / `segments_done`.
     var streamingSegments: Bool {
-        (kind == "hls" || kind == "dash") && status != "completed"
+        (kind == "hls" || kind == "dash") && status != "completed" && (segments ?? 0) > 0
     }
     var sizeText: String {
-        if streamingSegments { return "\(total_bytes) segments" }
+        if streamingSegments { return "\(segments ?? 0) segments" }
         return total_bytes > 0 ? Fmt.bytes(total_bytes) : "—"
     }
     var etaText: String {
-        guard status == "downloading", !streamingSegments else { return "—" }
+        guard status == "downloading", total_bytes > 0, speed_bps > 0 else { return "—" }
         return Fmt.eta(done: done_bytes, total: total_bytes, bps: speed_bps)
     }
     var doneText: String {
         if streamingSegments {
-            return "\(done_bytes) / \(total_bytes) segments  (\(String(format: "%.1f", percent))%)"
+            return "\(segments_done ?? 0) / \(segments ?? 0) segments  (\(String(format: "%.1f", percent))%)"
         }
         return total_bytes > 0
             ? "\(Fmt.bytes(done_bytes))  (\(String(format: "%.1f", percent))%)"
