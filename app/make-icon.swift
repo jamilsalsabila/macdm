@@ -1,6 +1,6 @@
 // make-icon.swift — generates AppIcon.iconset (all sizes) + AppIcon.icns.
 // Run from app/:  swift make-icon.swift
-// Draws a macOS-style rounded-rect icon with a download glyph (arrow into tray).
+// Draws a macOS-grid rounded-rect icon with a download glyph (arrow into tray).
 import AppKit
 
 let sizes: [(name: String, px: Int)] = [
@@ -26,13 +26,16 @@ func draw(_ px: Int) -> Data {
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
     let ctx = NSGraphicsContext.current!.cgContext
 
-    // --- rounded-rect (squircle-ish) background with a diagonal gradient ---
-    let margin = s * 0.06
+    // --- rounded-rect body on the macOS icon grid ---
+    // The body is ~824/1024 of the canvas, centred, rest transparent. Filling
+    // edge-to-edge makes the Dock icon look oversized next to every other app.
+    let margin = s * 0.0977
     let rect = CGRect(x: margin, y: margin, width: s - 2*margin, height: s - 2*margin)
-    let radius = rect.width * 0.2237
-    let path = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+    let radius = rect.width * 0.225
+    let body = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+
     ctx.saveGState()
-    ctx.addPath(path); ctx.clip()
+    ctx.addPath(body); ctx.clip()
     let cs = CGColorSpaceCreateDeviceRGB()
     let grad = CGGradient(colorsSpace: cs, colors: [
         CGColor(red: 0.29, green: 0.44, blue: 0.96, alpha: 1),   // top  #4A70F5
@@ -40,7 +43,6 @@ func draw(_ px: Int) -> Data {
     ] as CFArray, locations: [0, 1])!
     ctx.drawLinearGradient(grad, start: CGPoint(x: rect.minX, y: rect.maxY),
                            end: CGPoint(x: rect.maxX, y: rect.minY), options: [])
-    // soft top-down sheen (no hard edge)
     let sheen = CGGradient(colorsSpace: cs, colors: [
         CGColor(red: 1, green: 1, blue: 1, alpha: 0.16),
         CGColor(red: 1, green: 1, blue: 1, alpha: 0.0),
@@ -49,40 +51,36 @@ func draw(_ px: Int) -> Data {
                            end: CGPoint(x: rect.minX, y: rect.minY), options: [])
     ctx.restoreGState()
 
-    // --- download glyph: arrow shaft + head, over a tray line ---
-    let cx = s / 2
-    let white = CGColor(red: 1, green: 1, blue: 1, alpha: 1)
-    ctx.setFillColor(white)
-    ctx.setStrokeColor(white)
-    ctx.setLineCap(.round)
-    ctx.setLineJoin(.round)
+    // --- download glyph: arrow (shaft + head) pointing into a tray line ---
+    // Measured in fractions of the body so the inset holds as the body shrinks.
+    let u = rect.width
+    let cx = rect.midX
+    ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
 
-    let shaftW = s * 0.115
-    let arrowTop = s * 0.72          // y grows upward in this context
-    let arrowMidY = s * 0.44         // where the head starts
-    let headHalf = s * 0.185
-    let headTipY = s * 0.275
-
-    // shaft (rounded)
-    let shaft = CGPath(roundedRect: CGRect(x: cx - shaftW/2, y: arrowMidY,
-        width: shaftW, height: arrowTop - arrowMidY),
-        cornerWidth: shaftW*0.35, cornerHeight: shaftW*0.35, transform: nil)
-    ctx.addPath(shaft); ctx.fillPath()
-    // head (triangle pointing down)
-    ctx.beginPath()
-    ctx.move(to: CGPoint(x: cx - headHalf, y: arrowMidY + s*0.03))
-    ctx.addLine(to: CGPoint(x: cx + headHalf, y: arrowMidY + s*0.03))
-    ctx.addLine(to: CGPoint(x: cx, y: headTipY))
-    ctx.closePath()
-    ctx.fillPath()
-
-    // tray / baseline (rounded)
-    let trayW = s * 0.42
-    let trayH = max(s * 0.05, 2)
-    let trayY = s * 0.21
+    let trayW = u * 0.44
+    let trayH = max(u * 0.055, 2)
+    let trayY = rect.minY + u * 0.24
     let tray = CGPath(roundedRect: CGRect(x: cx - trayW/2, y: trayY, width: trayW, height: trayH),
         cornerWidth: trayH/2, cornerHeight: trayH/2, transform: nil)
     ctx.addPath(tray); ctx.fillPath()
+
+    let tipY = trayY + trayH + u * 0.055     // arrow tip, just above the tray
+    let headHalf = u * 0.155
+    let headBaseY = tipY + u * 0.16
+    let shaftW = u * 0.12
+    let shaftTopY = rect.minY + u * 0.74
+
+    let shaft = CGPath(roundedRect: CGRect(x: cx - shaftW/2, y: headBaseY - u*0.02,
+        width: shaftW, height: shaftTopY - (headBaseY - u*0.02)),
+        cornerWidth: shaftW*0.4, cornerHeight: shaftW*0.4, transform: nil)
+    ctx.addPath(shaft); ctx.fillPath()
+
+    ctx.beginPath()
+    ctx.move(to: CGPoint(x: cx - headHalf, y: headBaseY))
+    ctx.addLine(to: CGPoint(x: cx + headHalf, y: headBaseY))
+    ctx.addLine(to: CGPoint(x: cx, y: tipY))
+    ctx.closePath()
+    ctx.fillPath()
 
     NSGraphicsContext.restoreGraphicsState()
     return rep.representation(using: .png, properties: [:])!
@@ -93,8 +91,7 @@ let iconset = "AppIcon.iconset"
 try? fm.removeItem(atPath: iconset)
 try! fm.createDirectory(atPath: iconset, withIntermediateDirectories: true)
 for (name, px) in sizes {
-    let data = draw(px)
-    try! data.write(to: URL(fileURLWithPath: "\(iconset)/\(name).png"))
+    try! draw(px).write(to: URL(fileURLWithPath: "\(iconset)/\(name).png"))
 }
 
 let p = Process()
