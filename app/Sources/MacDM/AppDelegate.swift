@@ -13,6 +13,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         FirstRunSetup.run()
         DaemonClient.shared.configure(addr: addr)
 
+        NSApp.mainMenu = MainMenu.build(target: self,
+                                        settingsAction: #selector(openSettings),
+                                        openAction: #selector(addURL))
+        mainWindow.show()
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let b = statusItem.button {
             b.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "MacDM")
@@ -40,6 +45,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ note: Notification) {
         DaemonClient.shared.stopStream()
         // leave the daemon running so downloads survive the UI quitting
+    }
+
+    // Keep running (Dock + status item) when the last window closes — downloads
+    // continue in the background and the user reopens from either entry point.
+    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
+
+    // Clicking the Dock icon with no window open brings the main window back.
+    func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { mainWindow.show() }
+        return true
     }
 
     // MARK: menu

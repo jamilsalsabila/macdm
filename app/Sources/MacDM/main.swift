@@ -1,9 +1,9 @@
 import AppKit
 
-// MacDM menu-bar app entry point. Runs as an accessory (no Dock icon, no menu
-// bar name) so it lives purely in the status bar like a typical utility.
+// MacDM entry point. A regular app: Dock icon + menu bar, and it also keeps a
+// status-bar item for quick access while downloads run in the background.
 let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
 
 let delegate = AppDelegate()
 app.delegate = delegate
