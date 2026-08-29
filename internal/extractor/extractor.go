@@ -143,7 +143,7 @@ func heightFromResolution(res string) int {
 
 // Extractor wraps a yt-dlp binary.
 type Extractor struct {
-	bin    string
+	argv   []string // yt-dlp invocation prefix ([bin] or [python3, zipapp])
 	ffmpeg string
 }
 
@@ -153,7 +153,12 @@ func New(t tools.Set) (*Extractor, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Extractor{bin: bin, ffmpeg: t.Ffmpeg}, nil
+	return &Extractor{argv: tools.YtDlpInvocation(bin), ffmpeg: t.Ffmpeg}, nil
+}
+
+func (e *Extractor) cmd(ctx context.Context, args ...string) *exec.Cmd {
+	full := append(append([]string{}, e.argv[1:]...), args...)
+	return exec.CommandContext(ctx, e.argv[0], full...)
 }
 
 // Probe resolves formats for a page URL without downloading.
@@ -172,7 +177,7 @@ func (e *Extractor) Probe(ctx context.Context, pageURL, cookiesFrom string) (*In
 	}
 	args = append(args, pageURL)
 
-	out, err := exec.CommandContext(ctx, e.bin, args...).Output()
+	out, err := e.cmd(ctx, args...).Output()
 	if err != nil {
 		return nil, wrapYtErr(err)
 	}
@@ -244,7 +249,7 @@ func (e *Extractor) Download(ctx context.Context, pageURL string, opt DownloadOp
 	}
 	args = append(args, pageURL)
 
-	cmd := exec.CommandContext(ctx, e.bin, args...)
+	cmd := e.cmd(ctx, args...)
 	// yt-dlp is Python; when its stdout is a pipe (not a TTY) Python block-
 	// buffers it and we'd get every progress line at once on exit. Force
 	// line/unbuffered output so progress streams live.

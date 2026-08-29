@@ -41,6 +41,25 @@ func ytDlpAsset() string {
 	return "yt-dlp_macos"
 }
 
+// ytDlpVersion runs `--version` through the right interpreter (zipapp vs binary).
+func ytDlpVersion(ctx context.Context, path string) string {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	argv := YtDlpInvocation(path)
+	if len(argv) == 0 {
+		return ""
+	}
+	out, err := exec.CommandContext(ctx, argv[0], append(argv[1:], "--version")...).Output()
+	if err != nil {
+		return ""
+	}
+	line := string(out)
+	if i := strings.IndexByte(line, '\n'); i > 0 {
+		line = line[:i]
+	}
+	return strings.TrimSpace(line)
+}
+
 func hasPython3() bool {
 	p, err := exec.LookPath("python3")
 	if err != nil {
@@ -81,8 +100,7 @@ type YtDlpStatus struct {
 func CheckYtDlp(ctx context.Context, set Set, channel string) (YtDlpStatus, error) {
 	s := YtDlpStatus{Path: set.YtDlp, Channel: channel}
 	if set.YtDlp != "" {
-		v := Version(ctx, set.YtDlp) // "yt-dlp 2025.08.20" or "2025.08.20"
-		s.Version = strings.TrimSpace(strings.TrimPrefix(v, "yt-dlp"))
+		s.Version = strings.TrimSpace(strings.TrimPrefix(ytDlpVersion(ctx, set.YtDlp), "yt-dlp"))
 	}
 	latest, err := githubLatestTag(ctx, ytDlpRepo(channel))
 	if err != nil {
@@ -146,13 +164,13 @@ func UpdateYtDlp(ctx context.Context, channel string) (from, to string, err erro
 		return from, "", err
 	}
 	// Confirm it executes before committing.
-	if v := Version(ctx, tmp); v == "" {
-		return from, "", fmt.Errorf("downloaded binary does not run")
+	if v := ytDlpVersion(ctx, tmp); v == "" {
+		return from, "", fmt.Errorf("downloaded yt-dlp does not run")
 	}
 	if err := os.Rename(tmp, dest); err != nil {
 		return from, "", err
 	}
-	to = strings.TrimSpace(strings.TrimPrefix(Version(ctx, dest), "yt-dlp"))
+	to = strings.TrimSpace(strings.TrimPrefix(ytDlpVersion(ctx, dest), "yt-dlp"))
 	return from, to, nil
 }
 
