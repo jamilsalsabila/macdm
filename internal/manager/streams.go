@@ -178,34 +178,82 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 		startURL = j.FormatID
 	}
 
-	pl, err := c.Parse(ctx, startURL)
+	master, err := c.Parse(ctx, startURL)
 	if err != nil {
 		return err
 	}
-	if pl.IsMaster {
-		v, ok := pl.BestVariant()
+	pl := master
+	// A variant with AUDIO="grp" is normally video-only; its audio is a separate
+	// #EXT-X-MEDIA rendition. Downloading only the variant gave a silent file.
+	var audioPl *hls.Playlist
+	if master.IsMaster {
+		v, ok := master.BestVariant()
 		if !ok {
 			return fmt.Errorf("master playlist has no variants")
 		}
 		if pl, err = c.Parse(ctx, v.URL); err != nil {
 			return err
 		}
+		if r := master.AudioFor(v); r != nil {
+			if audioPl, err = c.Parse(ctx, r.URI); err != nil {
+				return fmt.Errorf("audio rendition %q: %w", r.Name, err)
+			}
+		}
 	}
-	if pl.HasDRM() {
-		return drm("HLS stream uses SAMPLE-AES")
+	for _, p := range []*hls.Playlist{pl, audioPl} {
+		if p == nil {
+			continue
+		}
+		if p.HasDRM() {
+			return drm("HLS stream uses SAMPLE-AES")
+		}
+		if p.Live {
+			return fmt.Errorf("this is a live stream (no #EXT-X-ENDLIST) — MacDM only downloads finished VOD")
+		}
 	}
-	if pl.Live {
-		return fmt.Errorf("this is a live stream (no #EXT-X-ENDLIST) — MacDM only downloads finished VOD")
+
+	// Segment counts and bytes from both tracks feed one progress bar, the way
+	// execDASH already reports its video+audio pair.
+	totalSeg := len(pl.Segments)
+	if audioPl != nil {
+		totalSeg += len(audioPl.Segments)
+	}
+	var doneSegBase int
+	var doneBytesBase int64
+	track := func(p hls.Progress) {
+		prog(streamProg{
+			doneSeg:  doneSegBase + p.Segment,
+			totalSeg: totalSeg,
+			bytes:    doneBytesBase + p.DoneBytes,
+			conns:    hlsConns(p.Workers),
+		})
 	}
 
 	assembled := filepath.Join(wd, "assembled.ts")
-	err = c.Assemble(ctx, pl, hls.AssembleOptions{
+	if err := c.Assemble(ctx, pl, hls.AssembleOptions{
 		Dir: wd, OutFile: assembled, Conns: m.cfg.Engine.MaxConns,
-	}, func(p hls.Progress) {
-		prog(streamProg{p.Segment, p.Total, p.DoneBytes, hlsConns(p.Workers)})
-	})
-	if err != nil {
+	}, track); err != nil {
 		return err
+	}
+
+	var audioFile string
+	if audioPl != nil {
+		doneSegBase = len(pl.Segments)
+		if fi, e := os.Stat(assembled); e == nil {
+			doneBytesBase = fi.Size()
+		}
+		audioFile = filepath.Join(wd, "assembled-audio.ts")
+		// Its own scratch subdir: both tracks name segments seg-NNNNNN, so
+		// sharing one directory would have them overwrite each other.
+		audioDir := filepath.Join(wd, "audio")
+		if err := os.MkdirAll(audioDir, 0o755); err != nil {
+			return err
+		}
+		if err := c.Assemble(ctx, audioPl, hls.AssembleOptions{
+			Dir: audioDir, OutFile: audioFile, Conns: m.cfg.Engine.MaxConns,
+		}, track); err != nil {
+			return err
+		}
 	}
 
 	// Mux into the scratch dir and move the finished file into place, rather
@@ -214,7 +262,11 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 	// name, indistinguishable from a completed download. Same guarantee the
 	// HTTP engine gets from .part + rename.
 	muxed := filepath.Join(wd, "muxed"+extOr(dest, ".mp4"))
-	if err := mx.Remux(ctx, assembled, muxed, muxProg("Finalising")); err != nil {
+	if audioFile != "" {
+		if err := mx.Combine(ctx, assembled, audioFile, muxed, muxProg("Merging video + audio")); err != nil {
+			return err
+		}
+	} else if err := mx.Remux(ctx, assembled, muxed, muxProg("Finalising")); err != nil {
 		return err
 	}
 	if err := moveFile(muxed, dest); err != nil {

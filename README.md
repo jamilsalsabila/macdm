@@ -82,15 +82,15 @@ These are design choices, not bugs — MacDM stops where a download manager shou
 
 - **Live streams** are refused: DASH `type="dynamic"`, live/event HLS, and
   low-latency HLS. No DVR-window assembly.
-- **HLS** `#EXT-X-MEDIA` alternate audio/subtitle renditions are not merged —
-  you get the variant's own muxed program only. `#EXT-X-BYTERANGE` and
+- **HLS** alternate *audio* renditions (`#EXT-X-MEDIA:TYPE=AUDIO`) are fetched
+  and muxed in, so a video-only variant no longer downloads silent. Alternate
+  *subtitle* renditions are still not merged, and `#EXT-X-BYTERANGE` and
   re-timing across `#EXT-X-DISCONTINUITY` are not handled.
 - **DASH** supports only `SegmentTemplate` (with `SegmentTimeline`) and
   single-file `BaseURL`. `SegmentList`, `SegmentBase`-index-only multi-segment,
   and multi-`Period` concatenation are not supported. Embedded subtitles are
   not fetched.
-- **Segment assembly buffers each segment fully in RAM.** Fine for normal
-  videos; a multi-GB single-file DASH track will spike memory.
+- **Subtitle tracks are never downloaded**, for either HLS or DASH.
 - **MV3 header visibility.** Chrome does not reliably expose `Cookie`,
   `User-Agent`, or `Authorization` on caught requests, so a *direct* media
   catch from a login-walled site may 403. Use the extractor + cookies path

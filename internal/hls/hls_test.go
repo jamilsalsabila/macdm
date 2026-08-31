@@ -324,3 +324,141 @@ func TestAssembleIgnoresPartialSegmentFile(t *testing.T) {
 		t.Fatalf("partial scratch file corrupted the output: %d bytes", len(got))
 	}
 }
+
+// --- #EXT-X-MEDIA alternative audio renditions ---
+
+const masterWithAltAudio = `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="audio_en.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Spanish",LANGUAGE="es",DEFAULT=NO,AUTOSELECT=YES,URI="audio_es.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",URI="subs_en.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2",AUDIO="aud"
+v360.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720,CODECS="avc1.4d401f",AUDIO="aud"
+v720.m3u8
+`
+
+func TestParseAltAudioRenditions(t *testing.T) {
+	p, err := parse(masterWithAltAudio, mustURL("https://cdn.example/hls/master.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.IsMaster || len(p.Variants) != 2 {
+		t.Fatalf("expected a master with 2 variants, got master=%v n=%d", p.IsMaster, len(p.Variants))
+	}
+	if len(p.Media) != 3 {
+		t.Fatalf("expected 3 EXT-X-MEDIA entries, got %d", len(p.Media))
+	}
+	en := p.Media[0]
+	if en.Type != "AUDIO" || en.GroupID != "aud" || en.Name != "English" ||
+		en.Language != "en" || !en.Default || !en.Autoselect {
+		t.Fatalf("English rendition parsed wrong: %+v", en)
+	}
+	if en.URI != "https://cdn.example/hls/audio_en.m3u8" {
+		t.Fatalf("rendition URI not resolved against the master: %q", en.URI)
+	}
+	for _, v := range p.Variants {
+		if v.AudioGroup != "aud" {
+			t.Errorf("variant %s lost its AUDIO group: %+v", v.Resolution, v)
+		}
+	}
+}
+
+func TestAudioForPicksDefault(t *testing.T) {
+	p, err := parse(masterWithAltAudio, mustURL("https://cdn.example/hls/master.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, _ := p.BestVariant()
+	r := p.AudioFor(v)
+	if r == nil {
+		t.Fatal("no audio rendition chosen — the download would be silent")
+	}
+	if r.Name != "English" {
+		t.Fatalf("picked %q, want the DEFAULT=YES rendition", r.Name)
+	}
+	// A subtitle group must never be returned as audio.
+	if r.Type != "AUDIO" {
+		t.Fatalf("picked a %s rendition", r.Type)
+	}
+}
+
+func TestAudioForFallsBackToAutoselectThenFirst(t *testing.T) {
+	noDefault := `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Commentary",DEFAULT=NO,AUTOSELECT=NO,URI="c.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Main",DEFAULT=NO,AUTOSELECT=YES,URI="m.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO="a"
+v.m3u8
+`
+	p, err := parse(noDefault, mustURL("https://x/y/master.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, _ := p.BestVariant()
+	r := p.AudioFor(v)
+	if r == nil || r.Name != "Main" {
+		t.Fatalf("want the AUTOSELECT=YES rendition, got %+v", r)
+	}
+}
+
+// A rendition with no URI means that audio is already muxed into the variant.
+// Fetching "nothing" is the correct answer; returning it would break the mux.
+func TestAudioForIgnoresMuxedGroup(t *testing.T) {
+	muxedIn := `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="English",DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="avc1,mp4a",AUDIO="a"
+v.m3u8
+`
+	p, err := parse(muxedIn, mustURL("https://x/y/master.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, _ := p.BestVariant()
+	if r := p.AudioFor(v); r != nil {
+		t.Fatalf("URI-less rendition should be treated as muxed, got %+v", r)
+	}
+}
+
+func TestAudioForNoGroupOrNoMatch(t *testing.T) {
+	plain := `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=1,CODECS="avc1,mp4a"
+v.m3u8
+`
+	p, _ := parse(plain, mustURL("https://x/y/m.m3u8"))
+	v, _ := p.BestVariant()
+	if r := p.AudioFor(v); r != nil {
+		t.Fatalf("variant without AUDIO= should need no rendition, got %+v", r)
+	}
+
+	// Group named but absent from the master: nothing to fetch, must not panic.
+	dangling := `#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="other",NAME="X",URI="x.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO="missing"
+v.m3u8
+`
+	p2, _ := parse(dangling, mustURL("https://x/y/m.m3u8"))
+	v2, _ := p2.BestVariant()
+	if r := p2.AudioFor(v2); r != nil {
+		t.Fatalf("dangling group should yield nil, got %+v", r)
+	}
+}
+
+// EXT-X-MEDIA must not make a media playlist look like a master.
+func TestExtXMediaDoesNotForceMaster(t *testing.T) {
+	odd := `#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="X",URI="x.m3u8"
+#EXTINF:6.0,
+seg0.ts
+#EXT-X-ENDLIST
+`
+	p, err := parse(odd, mustURL("https://x/y/index.m3u8"))
+	if err != nil {
+		t.Fatalf("a media playlist carrying EXT-X-MEDIA should still parse: %v", err)
+	}
+	if p.IsMaster {
+		t.Fatal("misclassified as a master — its segments would never be downloaded")
+	}
+	if len(p.Segments) != 1 {
+		t.Fatalf("segments lost: %d", len(p.Segments))
+	}
+}

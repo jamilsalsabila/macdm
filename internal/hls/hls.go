@@ -35,6 +35,22 @@ type Variant struct {
 	Bandwidth  int
 	Resolution string
 	Codecs     string
+	// AudioGroup is the AUDIO="..." attribute. When set, the variant's own
+	// stream is usually video-only and the audio lives in a separate
+	// #EXT-X-MEDIA rendition carrying the same GROUP-ID.
+	AudioGroup string
+}
+
+// Rendition is one #EXT-X-MEDIA entry — an alternative audio (or subtitle)
+// track offered alongside the variants.
+type Rendition struct {
+	Type       string // AUDIO, SUBTITLES, VIDEO, CLOSED-CAPTIONS
+	GroupID    string
+	Name       string
+	Language   string
+	URI        string // empty => this rendition is muxed into the variant itself
+	Default    bool
+	Autoselect bool
 }
 
 // Key describes segment encryption.
@@ -66,9 +82,47 @@ type Playlist struct {
 	IsMaster bool
 	Live     bool // media playlist with no #EXT-X-ENDLIST
 	Variants []Variant
+	Media    []Rendition // #EXT-X-MEDIA entries (master playlists)
 	Segments []Segment
 	InitURL  string // EXT-X-MAP:URI, if any
 	Key      *Key   // playlist-level key (may be overridden per segment)
+}
+
+// AudioFor returns the alternative audio rendition that must be downloaded and
+// muxed alongside v, or nil when v already carries its own audio.
+//
+// A variant with AUDIO="grp" is normally video-only. The catch: a rendition in
+// that group with NO URI means the audio for it *is* embedded in the variant,
+// so fetching nothing is correct — only a rendition with a URI is a separate
+// stream. Picks DEFAULT=YES, else AUTOSELECT=YES, else the first with a URI.
+func (p *Playlist) AudioFor(v Variant) *Rendition {
+	if v.AudioGroup == "" {
+		return nil
+	}
+	var first, autoselect *Rendition
+	for i := range p.Media {
+		r := &p.Media[i]
+		if !strings.EqualFold(r.Type, "AUDIO") || r.GroupID != v.AudioGroup {
+			continue
+		}
+		if r.URI == "" {
+			// The group is muxed into the variant — nothing separate to fetch.
+			return nil
+		}
+		if r.Default {
+			return r
+		}
+		if autoselect == nil && r.Autoselect {
+			autoselect = r
+		}
+		if first == nil {
+			first = r
+		}
+	}
+	if autoselect != nil {
+		return autoselect
+	}
+	return first
 }
 
 // HasDRM reports whether any key in the playlist is a DRM scheme.
@@ -195,12 +249,32 @@ func parse(text string, base *url.URL) (*Playlist, error) {
 			seq = atoiSafe(after(ln, ":"))
 			startSeqSet = true
 
+		case strings.HasPrefix(ln, "#EXT-X-MEDIA:"):
+			attrs := parseAttrs(after(ln, ":"))
+			r := Rendition{
+				Type:       strings.ToUpper(attrs["TYPE"]),
+				GroupID:    attrs["GROUP-ID"],
+				Name:       attrs["NAME"],
+				Language:   attrs["LANGUAGE"],
+				URI:        attrs["URI"],
+				Default:    strings.EqualFold(attrs["DEFAULT"], "YES"),
+				Autoselect: strings.EqualFold(attrs["AUTOSELECT"], "YES"),
+			}
+			if r.URI != "" {
+				r.URI = resolve(r.URI)
+			}
+			// Deliberately does not set IsMaster: the variant URI lines already
+			// do, and trusting a stray tag would misclassify a non-compliant
+			// media playlist as a master and refuse to download it.
+			p.Media = append(p.Media, r)
+
 		case strings.HasPrefix(ln, "#EXT-X-STREAM-INF:"):
 			attrs := parseAttrs(after(ln, ":"))
 			pendingVar = &Variant{
 				Bandwidth:  atoiSafe(attrs["BANDWIDTH"]),
 				Resolution: attrs["RESOLUTION"],
 				Codecs:     strings.Trim(attrs["CODECS"], `"`),
+				AudioGroup: attrs["AUDIO"],
 			}
 
 		case strings.HasPrefix(ln, "#EXT-X-KEY:"):
