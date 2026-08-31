@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"macdm/internal/store"
+	"macdm/internal/subs"
 )
 
 // Variant is one entry of a master playlist.
@@ -39,6 +40,9 @@ type Variant struct {
 	// stream is usually video-only and the audio lives in a separate
 	// #EXT-X-MEDIA rendition carrying the same GROUP-ID.
 	AudioGroup string
+	// SubtitleGroup is the SUBTITLES="..." attribute, naming the group of
+	// #EXT-X-MEDIA subtitle renditions offered with this variant.
+	SubtitleGroup string
 }
 
 // Rendition is one #EXT-X-MEDIA entry — an alternative audio (or subtitle)
@@ -86,6 +90,36 @@ type Playlist struct {
 	Segments []Segment
 	InitURL  string // EXT-X-MAP:URI, if any
 	Key      *Key   // playlist-level key (may be overridden per segment)
+}
+
+// SubtitlesFor returns the subtitle rendition to download for v, or nil when
+// the variant offers none. Same preference order as AudioFor: DEFAULT, then
+// AUTOSELECT, then the first with a URI. A rendition without a URI carries no
+// separate file (it is in-band CEA-608/708) and is skipped.
+func (p *Playlist) SubtitlesFor(v Variant) *Rendition {
+	if v.SubtitleGroup == "" {
+		return nil
+	}
+	var first, autoselect *Rendition
+	for i := range p.Media {
+		r := &p.Media[i]
+		if !strings.EqualFold(r.Type, "SUBTITLES") || r.GroupID != v.SubtitleGroup || r.URI == "" {
+			continue
+		}
+		if r.Default {
+			return r
+		}
+		if autoselect == nil && r.Autoselect {
+			autoselect = r
+		}
+		if first == nil {
+			first = r
+		}
+	}
+	if autoselect != nil {
+		return autoselect
+	}
+	return first
 }
 
 // AudioFor returns the alternative audio rendition that must be downloaded and
@@ -207,6 +241,28 @@ func (c *Client) get(ctx context.Context, rawurl string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }
 
+// FetchSubtitles downloads every segment of a WebVTT subtitle playlist and
+// merges them into one file. Subtitle tracks are tiny (kilobytes), so they are
+// fetched sequentially and merged in memory rather than going through the
+// worker-pool assembler.
+func (c *Client) FetchSubtitles(ctx context.Context, p *Playlist) ([]byte, error) {
+	if len(p.Segments) == 0 {
+		return nil, fmt.Errorf("subtitle playlist has no segments")
+	}
+	parts := make([][]byte, 0, len(p.Segments))
+	for _, seg := range p.Segments {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		b, err := c.get(ctx, seg.URL)
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, b)
+	}
+	return subs.MergeVTT(parts), nil
+}
+
 // Parse fetches rawurl and returns the playlist it describes.
 func (c *Client) Parse(ctx context.Context, rawurl string) (*Playlist, error) {
 	body, err := c.get(ctx, rawurl)
@@ -271,10 +327,11 @@ func parse(text string, base *url.URL) (*Playlist, error) {
 		case strings.HasPrefix(ln, "#EXT-X-STREAM-INF:"):
 			attrs := parseAttrs(after(ln, ":"))
 			pendingVar = &Variant{
-				Bandwidth:  atoiSafe(attrs["BANDWIDTH"]),
-				Resolution: attrs["RESOLUTION"],
-				Codecs:     strings.Trim(attrs["CODECS"], `"`),
-				AudioGroup: attrs["AUDIO"],
+				Bandwidth:     atoiSafe(attrs["BANDWIDTH"]),
+				Resolution:    attrs["RESOLUTION"],
+				Codecs:        strings.Trim(attrs["CODECS"], `"`),
+				AudioGroup:    attrs["AUDIO"],
+				SubtitleGroup: attrs["SUBTITLES"],
 			}
 
 		case strings.HasPrefix(ln, "#EXT-X-KEY:"):

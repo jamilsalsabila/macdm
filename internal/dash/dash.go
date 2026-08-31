@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"macdm/internal/store"
+	"macdm/internal/subs"
 )
 
 type mpd struct {
@@ -44,6 +45,7 @@ type period struct {
 type adaptationSet struct {
 	MimeType          string           `xml:"mimeType,attr"`
 	ContentType       string           `xml:"contentType,attr"`
+	Lang              string           `xml:"lang,attr"`
 	BaseURL           string           `xml:"BaseURL"`
 	SegmentTemplate   *segmentTemplate `xml:"SegmentTemplate"`
 	SegmentList       *segmentList     `xml:"SegmentList"`
@@ -102,18 +104,23 @@ type segmentList struct {
 
 // Track is one resolved, downloadable stream (video or audio).
 type Track struct {
-	Kind      string // "video" or "audio"
+	Kind      string // "video", "audio" or "text"
 	InitURL   string
 	Segments  []string
 	Codecs    string
 	Height    int
 	Bandwidth int
+	MimeType  string // set for text tracks, to pick the sidecar extension
+	Language  string // BCP-47 tag from AdaptationSet@lang, for naming a sidecar
 }
 
 // Manifest is the useful result of parsing an MPD.
 type Manifest struct {
 	Video *Track
 	Audio *Track
+	// Subtitle is a text track (WebVTT or TTML), when the MPD offers one.
+	// Optional: its absence never fails a download.
+	Subtitle *Track
 }
 
 // Client fetches and parses.
@@ -210,6 +217,53 @@ func (c *Client) fetchToFile(ctx context.Context, u, dst string, onBytes func(in
 		}
 	}
 	return f.Close()
+}
+
+// FetchSubtitles downloads a text track and returns its contents plus the file
+// extension to save it under. Subtitle tracks are kilobytes, so they are
+// fetched sequentially into memory.
+//
+// Segmented WebVTT is merged properly (see internal/subs); a single-file track
+// is returned verbatim. Segmented TTML is refused rather than concatenated —
+// gluing XML documents end to end produces a file nothing can parse.
+func (c *Client) FetchSubtitles(ctx context.Context, t *Track) ([]byte, string, error) {
+	if t == nil || len(t.Segments) == 0 {
+		return nil, "", fmt.Errorf("no subtitle segments")
+	}
+	ext := subtitleExt(t)
+
+	// One file, no init segment: whatever it is, save it as-is.
+	if len(t.Segments) == 1 && t.InitURL == "" {
+		b, err := c.get(ctx, t.Segments[0])
+		return b, ext, err
+	}
+
+	if ext != ".vtt" {
+		return nil, "", fmt.Errorf("segmented %s subtitles are not supported", strings.TrimPrefix(ext, "."))
+	}
+	parts := make([][]byte, 0, len(t.Segments))
+	for _, u := range t.Segments {
+		if ctx.Err() != nil {
+			return nil, "", ctx.Err()
+		}
+		b, err := c.get(ctx, u)
+		if err != nil {
+			return nil, "", err
+		}
+		parts = append(parts, b)
+	}
+	return subs.MergeVTT(parts), ext, nil
+}
+
+// subtitleExt picks the sidecar extension from the track's mime/codecs.
+func subtitleExt(t *Track) string {
+	s := strings.ToLower(t.MimeType + " " + t.Codecs)
+	switch {
+	case strings.Contains(s, "ttml"), strings.Contains(s, "stpp"):
+		return ".ttml"
+	default:
+		return ".vtt" // text/vtt, codecs=wvtt, and the common unlabelled case
+	}
 }
 
 // Parse fetches the MPD at rawurl and resolves the best video+audio tracks.
@@ -360,6 +414,12 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 				if out.Audio == nil {
 					out.Audio = t
 				}
+			case "text":
+				if out.Subtitle == nil {
+					t.MimeType = firstNonEmpty(rep.MimeType, as.MimeType)
+					t.Language = as.Lang
+					out.Subtitle = t
+				}
 			}
 			break
 		}
@@ -499,6 +559,11 @@ func trackKind(mime, ctype string) string {
 		return "video"
 	case strings.Contains(s, "audio"):
 		return "audio"
+	// text/vtt, application/ttml+xml, contentType="text", and the
+	// application/mp4 + codecs=wvtt segmented form all land here.
+	case strings.Contains(s, "text") || strings.Contains(s, "ttml") ||
+		strings.Contains(s, "vtt") || strings.Contains(s, "subtitle"):
+		return "text"
 	default:
 		return "other"
 	}

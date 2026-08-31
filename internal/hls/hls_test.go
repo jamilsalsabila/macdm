@@ -462,3 +462,55 @@ seg0.ts
 		t.Fatalf("segments lost: %d", len(p.Segments))
 	}
 }
+
+func TestSubtitlesForPicksDefault(t *testing.T) {
+	master := `#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="Spanish",LANGUAGE="es",AUTOSELECT=YES,URI="es.m3u8"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",LANGUAGE="en",DEFAULT=YES,URI="en.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="aud.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO="aud",SUBTITLES="subs"
+v.m3u8
+`
+	p, err := parse(master, mustURL("https://x/y/master.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, _ := p.BestVariant()
+	if v.SubtitleGroup != "subs" {
+		t.Fatalf("SUBTITLES attribute lost: %+v", v)
+	}
+	r := p.SubtitlesFor(v)
+	if r == nil || r.Name != "English" {
+		t.Fatalf("want the DEFAULT=YES subtitle rendition, got %+v", r)
+	}
+	if r.Type != "SUBTITLES" {
+		t.Fatalf("returned a %s rendition", r.Type)
+	}
+	// The audio group must not leak into the subtitle choice, or vice versa.
+	if a := p.AudioFor(v); a == nil || a.Type != "AUDIO" {
+		t.Fatalf("audio selection disturbed: %+v", a)
+	}
+}
+
+// A URI-less subtitle rendition is in-band CEA-608/708 — there is no file to
+// fetch, so it must be skipped rather than returned.
+func TestSubtitlesForSkipsURILess(t *testing.T) {
+	master := `#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="CC1",DEFAULT=YES
+#EXT-X-STREAM-INF:BANDWIDTH=1,SUBTITLES="subs"
+v.m3u8
+`
+	p, _ := parse(master, mustURL("https://x/y/master.m3u8"))
+	v, _ := p.BestVariant()
+	if r := p.SubtitlesFor(v); r != nil {
+		t.Fatalf("URI-less rendition should be skipped, got %+v", r)
+	}
+}
+
+func TestSubtitlesForNoGroup(t *testing.T) {
+	p, _ := parse("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nv.m3u8\n", mustURL("https://x/y/m.m3u8"))
+	v, _ := p.BestVariant()
+	if r := p.SubtitlesFor(v); r != nil {
+		t.Fatalf("no SUBTITLES attribute should mean no rendition, got %+v", r)
+	}
+}

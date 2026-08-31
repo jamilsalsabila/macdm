@@ -90,7 +90,12 @@ These are design choices, not bugs — MacDM stops where a download manager shou
   addressed by `media` URLs, and single-file `BaseURL`. Byte-range addressing
   (`SegmentURL@mediaRange`, `SegmentBase`-index-only) is refused rather than
   mis-assembled, and multi-`Period` concatenation is not supported.
-- **Subtitle tracks are never downloaded**, for either HLS or DASH.
+- **Subtitles** are saved as a sidecar `.vtt` next to the video (named
+  `<video>.<lang>.vtt`), not muxed into the container. HLS `TYPE=SUBTITLES`
+  renditions are merged across segments with their `X-TIMESTAMP-MAP` applied;
+  DASH text AdaptationSets are fetched as one file or merged when segmented.
+  In-band CEA-608/708 captions and segmented TTML are not handled, and a
+  subtitle failure never fails the video download.
 - **MV3 header visibility.** Chrome does not reliably expose `Cookie`,
   `User-Agent`, or `Authorization` on caught requests, so a *direct* media
   catch from a login-walled site may 403. Use the extractor + cookies path

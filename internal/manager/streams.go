@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -186,6 +187,7 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 	// A variant with AUDIO="grp" is normally video-only; its audio is a separate
 	// #EXT-X-MEDIA rendition. Downloading only the variant gave a silent file.
 	var audioPl *hls.Playlist
+	var subRend *hls.Rendition
 	if master.IsMaster {
 		v, ok := master.BestVariant()
 		if !ok {
@@ -199,6 +201,7 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 				return fmt.Errorf("audio rendition %q: %w", r.Name, err)
 			}
 		}
+		subRend = master.SubtitlesFor(v)
 	}
 	for _, p := range []*hls.Playlist{pl, audioPl} {
 		if p == nil {
@@ -272,8 +275,52 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 	if err := moveFile(muxed, dest); err != nil {
 		return err
 	}
+	m.fetchHLSSubtitles(ctx, c, id, dest, subRend)
 	_ = os.RemoveAll(wd) // assembled successfully — scratch segments no longer needed
 	return finalize(m, id, dest)
+}
+
+// fetchHLSSubtitles saves the chosen subtitle rendition beside the video.
+// Entirely best-effort: the video is already on disk by this point.
+func (m *Manager) fetchHLSSubtitles(ctx context.Context, c *hls.Client, id, dest string, r *hls.Rendition) {
+	if r == nil {
+		return
+	}
+	sp, err := c.Parse(ctx, r.URI)
+	if err != nil {
+		log.Printf("macdm: subtitle playlist %q: %v", r.Name, err)
+		return
+	}
+	data, err := c.FetchSubtitles(ctx, sp)
+	if err != nil {
+		log.Printf("macdm: subtitles %q: %v", r.Name, err)
+		return
+	}
+	lang := strings.TrimSpace(r.Language)
+	if lang == "" {
+		lang = r.Name
+	}
+	m.writeSubtitles(id, dest, lang, ".vtt", data)
+}
+
+// writeSubtitles saves a subtitle track next to the video as
+// "<name>.<lang>.vtt". Subtitles are a bonus: every failure here is logged into
+// the job note and swallowed, because losing them must never fail a download
+// that otherwise succeeded.
+func (m *Manager) writeSubtitles(id, dest, lang, ext string, data []byte) {
+	if len(data) == 0 {
+		return
+	}
+	stem := strings.TrimSuffix(dest, filepath.Ext(dest))
+	// Only sanitise a language we actually have: sanitize("") returns the
+	// "download" placeholder, which would name the file "<video>.download.vtt".
+	if lang = strings.TrimSpace(lang); lang != "" {
+		stem += "." + sanitize(lang)
+	}
+	path := m.uniqueDest(id, stem+ext)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		log.Printf("macdm: subtitles for %s: %v", id, err)
+	}
 }
 
 // extOr returns path's extension, or fallback when it has none.
@@ -358,6 +405,13 @@ func (m *Manager) execDASH(ctx context.Context, id string, j *store.Job, wd, des
 	}
 	if err := moveFile(muxed, dest); err != nil {
 		return err
+	}
+	if man.Subtitle != nil {
+		if data, ext, err := c.FetchSubtitles(ctx, man.Subtitle); err != nil {
+			log.Printf("macdm: subtitles: %v", err) // best-effort, never fatal
+		} else {
+			m.writeSubtitles(id, dest, man.Subtitle.Language, ext, data)
+		}
 	}
 	_ = os.RemoveAll(wd) // assembled successfully — scratch segments no longer needed
 	return finalize(m, id, dest)
