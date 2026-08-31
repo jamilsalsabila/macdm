@@ -41,11 +41,18 @@ type fragment struct {
 
 // outbound is what we send back to the extension.
 type outbound struct {
-	Type  string          `json:"type"`
-	OK    bool            `json:"ok"`
-	JobID string          `json:"job_id,omitempty"`
-	Error string          `json:"error,omitempty"`
-	Raw   json.RawMessage `json:"result,omitempty"`
+	Type string `json:"type"`
+	OK   bool   `json:"ok"`
+	// JobID is set only when a job really was created (the fragment path).
+	// The proposal path cannot fill it in: the daemon may still be waiting for
+	// the user to answer the dialog, and if it auto-accepts the job it creates
+	// gets an id of its own. Reporting the proposal's id as a job id was a
+	// misnomer — nothing consumed it, but the next reader would have believed
+	// it.
+	JobID      string          `json:"job_id,omitempty"`
+	ProposalID string          `json:"proposal_id,omitempty"`
+	Error      string          `json:"error,omitempty"`
+	Raw        json.RawMessage `json:"result,omitempty"`
 }
 
 func main() {
@@ -135,7 +142,7 @@ func doProposal(hc *http.Client, base string, in inbound) outbound {
 		ID string `json:"id"`
 	}
 	_ = json.Unmarshal(data, &p)
-	return outbound{Type: "downloadResult", OK: true, JobID: p.ID}
+	return outbound{Type: "downloadResult", OK: true, ProposalID: p.ID}
 }
 
 // doFragmentJob creates a fragment-assembly job on the daemon directly. There is

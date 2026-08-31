@@ -8,7 +8,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -186,7 +186,24 @@ func Open(path string) (*Store, error) {
 	}
 	var list []*Job
 	if err := json.Unmarshal(data, &list); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
+		// A corrupt job list must not take the whole app down with it. Writes
+		// are atomic, so this should not happen — but a full disk, a hand-edit
+		// or filesystem damage can still produce it, and refusing to start
+		// leaves the menu-bar app unable to connect with nothing on screen to
+		// say why, and nothing a person could reasonably do about it.
+		//
+		// Keep the bad file so it can still be recovered by hand, and carry on
+		// with an empty list: losing the download history is bad, a download
+		// manager that will not launch at all is worse.
+		bad := path + ".corrupt-" + time.Now().Format("20060102-150405")
+		if renameErr := os.Rename(path, bad); renameErr != nil {
+			bad = "(could not be kept: " + renameErr.Error() + ")"
+			_ = os.Remove(path)
+		}
+		log.Printf("macdm: %s could not be read (%v) — starting with an empty job list; the old file is at %s",
+			path, err, bad)
+		go s.flushLoop()
+		return s, nil
 	}
 	for _, j := range list {
 		// A job caught mid-download at shutdown is resumed, not abandoned.
