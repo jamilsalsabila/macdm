@@ -146,7 +146,12 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
     }
 
     @objc private func openDetail() {
-        guard let j = selectedJob ?? (table.clickedRow >= 0 ? jobs[table.clickedRow] : nil) else { return }
+        // clickedRow is whatever the table saw at click time; an SSE update can
+        // shrink `jobs` before this action runs, and a Swift array traps on an
+        // out-of-range subscript — so bound it, don't just check for -1.
+        let clicked = table.clickedRow
+        let fallback = (clicked >= 0 && clicked < jobs.count) ? jobs[clicked] : nil
+        guard let j = selectedJob ?? fallback else { return }
         presentDetail(for: j)
     }
 

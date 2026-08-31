@@ -259,8 +259,11 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
         let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let f = chosenFormat()
         if isManual {
+            // The File Name field is editable in this dialog too — it used to be
+            // collected here and then dropped, so a rename silently did nothing.
             DaemonClient.shared.add(url: latest.url, dest: folder, conns: connStepper.integerValue,
-                                    formatID: f?.id, quality: f?.label)
+                                    formatID: f?.id, quality: f?.label,
+                                    filename: name.isEmpty ? nil : name)
         } else {
             DaemonClient.shared.accept(latest.id, dest: folder,
                                        filename: name.isEmpty ? nil : name,
