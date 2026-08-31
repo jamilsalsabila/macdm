@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -66,6 +67,10 @@ func New(cfg Config, st *store.Store) *Manager {
 		running: map[string]context.CancelFunc{},
 		hub:     newProposalHub(),
 	}
+	// Stream/extract jobs write into per-job scratch dirs under WorkDir. Nothing
+	// resumes from those (HLS/DASH/extract restart), so a crash-leftover pile is
+	// pure waste — clear it on startup.
+	_ = os.RemoveAll(cfg.WorkDir)
 	return m
 }
 
@@ -95,16 +100,24 @@ func (m *Manager) Add(rawurl string, opt AddOptions) (*store.Job, error) {
 	}
 
 	kind := sniff.ClassifyURL(u)
-	name := opt.Filename
+	name := safeName(opt.Filename)
 	if name == "" {
-		name = guessName(u)
+		name = safeName(guessName(u))
 	}
+	if name == "" {
+		name = "download"
+	}
+	// opt.Dest is either empty (use the default dir) or a folder the user picked
+	// in the dialog; the filename component is always the sanitised `name`, so an
+	// untrusted document.title can't traverse out with "../".
 	dest := opt.Dest
 	switch {
 	case dest == "":
 		dest = filepath.Join(m.cfg.DownloadDir, name)
 	case isDir(dest):
 		dest = filepath.Join(dest, name)
+	default:
+		dest = filepath.Join(filepath.Dir(dest), safeName(filepath.Base(dest)))
 	}
 
 	// De-dupe: don't start a second job for the same URL+destination that is
@@ -250,17 +263,45 @@ func (m *Manager) start(id string) {
 		if j.Status == store.StatusCompleted {
 			return // e.g. a SetConns bounce that raced with completion
 		}
-		m.setStatus(id, store.StatusProbing, "")
 
-		switch {
-		case len(j.Fragments) > 0:
-			err = m.execFragments(ctx, id, j)
-		case j.Kind == store.KindHLS, j.Kind == store.KindDASH:
-			err = m.execStream(ctx, id, j)
-		case j.Kind == store.KindExtract:
-			err = m.execExtract(ctx, id, j)
-		default:
-			err = m.execHTTP(ctx, id, j)
+		runOnce := func() error {
+			jj, e := m.st.Get(id)
+			if e != nil {
+				return e
+			}
+			m.setStatus(id, store.StatusProbing, "")
+			switch {
+			case len(jj.Fragments) > 0:
+				return m.execFragments(ctx, id, jj)
+			case jj.Kind == store.KindHLS, jj.Kind == store.KindDASH:
+				return m.execStream(ctx, id, jj)
+			case jj.Kind == store.KindExtract:
+				return m.execExtract(ctx, id, jj)
+			default:
+				return m.execHTTP(ctx, id, jj)
+			}
+		}
+
+		// A dropped connection or a flaky host shouldn't need a manual Resume
+		// click. Retry the whole job a few times — every exec path re-probes and
+		// resumes from the .part / sidecar, so completed bytes are kept.
+		const maxAutoResumes = 4
+		for attempt := 0; ; attempt++ {
+			err = runOnce()
+			if err == nil || attempt >= maxAutoResumes || !transientErr(err) {
+				break
+			}
+			wait := time.Duration(attempt+1) * autoResumeBackoff
+			m.setStatus(id, store.StatusProbing,
+				fmt.Sprintf("connection lost — retrying (%d/%d)", attempt+1, maxAutoResumes))
+			select {
+			case <-ctx.Done():
+				err = context.Canceled
+			case <-time.After(wait):
+			}
+			if errors.Is(err, context.Canceled) {
+				break
+			}
 		}
 
 		switch {
@@ -285,11 +326,32 @@ func (m *Manager) start(id string) {
 func (m *Manager) execHTTP(ctx context.Context, id string, j *store.Job) error {
 	dest := j.Dest
 
+	// TikTok / ByteDance CDNs reject any request that doesn't look like a media
+	// element load — force the fetch-metadata headers a <video> sends. Harmless
+	// elsewhere, so only gate on the host. Work on a copy; j.Headers is shared.
+	headers := map[string]string{}
+	for k, v := range j.Headers {
+		headers[k] = v
+	}
+	if isTikTokMedia(j.URL) {
+		def := map[string]string{
+			"Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors",
+			"Sec-Fetch-Site": "same-site", "Accept": "*/*",
+			"Referer":    "https://www.tiktok.com/",
+			"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+		}
+		for k, v := range def {
+			if !headerSet(headers, k) {
+				headers[k] = v
+			}
+		}
+	}
+
 	// Probe first: learn the real filename, and — crucially — bail out of the
 	// raw engine if the URL is actually a web page (text/html). Many "video"
 	// links a user clicks are embed pages; hand those to the extractor instead
 	// of saving the HTML as a file.
-	if pr, e := m.eng.ProbeURL(ctx, j.URL, j.Headers); e == nil {
+	if pr, e := m.eng.ProbeURL(ctx, j.URL, headers); e == nil {
 		ct := strings.ToLower(pr.ContentType)
 		isHTML := strings.HasPrefix(ct, "text/html") || strings.HasPrefix(ct, "application/xhtml")
 		// An HTML response the server did not mark as a download is a web page,
@@ -320,12 +382,12 @@ func (m *Manager) execHTTP(ctx context.Context, id string, j *store.Job) error {
 	spec := engine.DownloadSpec{
 		URL:     j.URL,
 		Dest:    dest,
-		Headers: j.Headers,
+		Headers: headers,
 		Conns:   j.Connections,
 	}
 	probe, err := m.eng.Run(ctx, spec, func(p engine.Progress) {
 		now := time.Now()
-		if now.Sub(lastPersist) < 450*time.Millisecond && p.DoneBytes < p.TotalBytes {
+		if now.Sub(lastPersist) < 200*time.Millisecond && p.DoneBytes < p.TotalBytes {
 			return
 		}
 		lastPersist = now
@@ -385,7 +447,7 @@ func (m *Manager) execFragments(ctx context.Context, id string, j *store.Job) er
 	var lastPersist time.Time
 	err := m.eng.RunFragments(ctx, dest, j.Headers, frags, j.Connections, func(p engine.Progress) {
 		now := time.Now()
-		if now.Sub(lastPersist) < 400*time.Millisecond && p.DoneBytes < p.TotalBytes {
+		if now.Sub(lastPersist) < 200*time.Millisecond && p.DoneBytes < p.TotalBytes {
 			return
 		}
 		lastPersist = now
@@ -403,6 +465,27 @@ func (m *Manager) execFragments(ctx context.Context, id string, j *store.Job) er
 		return err
 	}
 	return finalize(m, id, dest)
+}
+
+func headerSet(h map[string]string, key string) bool {
+	for k := range h {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// isTikTokMedia matches tiktok.com hosts and the ByteDance video CDNs.
+func isTikTokMedia(rawurl string) bool {
+	u, err := url.Parse(rawurl)
+	if err != nil {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	return strings.HasSuffix(h, ".tiktok.com") || h == "tiktok.com" ||
+		strings.Contains(h, "tiktokcdn") || strings.HasSuffix(h, ".tiktokv.com") ||
+		strings.HasSuffix(h, ".muscdn.com") || strings.HasSuffix(h, ".byteoversea.com")
 }
 
 func headerVal(h map[string]string, key string) string {
@@ -441,6 +524,35 @@ func engineConns(cs []engine.ConnProgress) []store.ConnStat {
 		}
 	}
 	return out
+}
+
+// autoResumeBackoff is the base wait between automatic job retries (grows
+// linearly per attempt). A var so tests can shorten it.
+var autoResumeBackoff = 3 * time.Second
+
+// transientErr reports whether an exec failure is worth an automatic retry.
+// It's a denylist: retry anything that isn't obviously permanent (bad URL,
+// DRM, auth/not-found, or a user cancel).
+func transientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, errDRM) {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	permanent := []string{
+		"drm", "unsupported url", "byte-range fragment", "not a downloadable",
+		"http 400", "http 401", "http 403", "http 404", "http 410",
+		" 400 ", " 401 ", " 403 ", " 404 ", " 410 ",
+		"no fragments", "playlist has no segments", "no downloadable tracks",
+	}
+	for _, p := range permanent {
+		if strings.Contains(s, p) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) setStatus(id, status, msg string) {
@@ -498,6 +610,24 @@ func guessName(u *url.URL) string {
 		return "download"
 	}
 	return base
+}
+
+// safeName reduces an arbitrary string to a single path-safe filename component:
+// no directory separators, no "..", no leading/trailing dots, bounded length.
+func safeName(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.NewReplacer("/", "_", "\\", "_", "\x00", "").Replace(s)
+	for strings.Contains(s, "..") {
+		s = strings.ReplaceAll(s, "..", "_")
+	}
+	s = strings.Trim(s, ". ")
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	if s == "" || s == "_" {
+		return ""
+	}
+	return s
 }
 
 func newID() string {

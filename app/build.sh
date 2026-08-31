@@ -39,6 +39,12 @@ if [[ "$MODE" == "bundle" ]]; then
   cp ../bin/macdm-nmhost  "$APP/Contents/MacOS/macdm-nmhost"
   cp .tools/ffmpeg .tools/yt-dlp "$APP/Contents/Resources/bin/"
 
+  # App icon (Dock + Finder). Regenerate if the generator is newer.
+  if [[ ! -f AppIcon.icns || make-icon.swift -nt AppIcon.icns ]]; then
+    swift make-icon.swift
+  fi
+  cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+
   cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -47,13 +53,19 @@ if [[ "$MODE" == "bundle" ]]; then
   <key>CFBundleName</key><string>MacDM</string>
   <key>CFBundleIdentifier</key><string>com.macdm.app</string>
   <key>CFBundleExecutable</key><string>MacDM</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VER}</string>
   <key>CFBundleVersion</key><string>${VER}</string>
   <key>LSMinimumSystemVersion</key><string>12.0</string>
-  <key>LSUIElement</key><true/>
   <key>NSAppTransportSecurity</key>
   <dict><key>NSAllowsLocalNetworking</key><true/></dict>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>MacDM saves your downloads here.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>MacDM saves downloads to the folder you choose.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>MacDM saves downloads to the folder you choose.</string>
 </dict>
 </plist>
 PLIST

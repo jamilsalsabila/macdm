@@ -21,6 +21,7 @@ func fakeBin(tag string) []byte {
 
 func newReleaseServer(t *testing.T, tag string, bin []byte, tamperSum bool) *httptest.Server {
 	t.Helper()
+	asset := ytDlpAsset()
 	sum := sha256.Sum256(bin)
 	hexsum := hex.EncodeToString(sum[:])
 	if tamperSum {
@@ -31,9 +32,9 @@ func newReleaseServer(t *testing.T, tag string, bin []byte, tamperSum bool) *htt
 		fmt.Fprintf(w, `{"tag_name":%q}`, tag)
 	})
 	mux.HandleFunc("/yt-dlp/yt-dlp/releases/download/"+tag+"/SHA2-256SUMS", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "%s  %s\n", hexsum, ytDlpAsset)
+		fmt.Fprintf(w, "%s  %s\n", hexsum, asset)
 	})
-	mux.HandleFunc("/yt-dlp/yt-dlp/releases/download/"+tag+"/"+ytDlpAsset, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/yt-dlp/yt-dlp/releases/download/"+tag+"/"+asset, func(w http.ResponseWriter, r *http.Request) {
 		w.Write(bin)
 	})
 	return httptest.NewServer(mux)
@@ -51,7 +52,7 @@ func TestCheckYtDlp(t *testing.T) {
 	defer srv.Close()
 	withServer(t, srv)
 
-	st, err := CheckYtDlp(context.Background(), Set{})
+	st, err := CheckYtDlp(context.Background(), Set{}, "stable")
 	if err != nil {
 		t.Fatalf("CheckYtDlp: %v", err)
 	}
@@ -72,7 +73,7 @@ func TestUpdateYtDlpInstallsAndVerifies(t *testing.T) {
 	defer srv.Close()
 	withServer(t, srv)
 
-	from, to, err := UpdateYtDlp(context.Background())
+	from, to, err := UpdateYtDlp(context.Background(), "stable")
 	if err != nil {
 		t.Fatalf("UpdateYtDlp: %v", err)
 	}
@@ -100,7 +101,7 @@ func TestUpdateYtDlpRejectsBadChecksum(t *testing.T) {
 	defer srv.Close()
 	withServer(t, srv)
 
-	if _, _, err := UpdateYtDlp(context.Background()); err == nil ||
+	if _, _, err := UpdateYtDlp(context.Background(), "stable"); err == nil ||
 		!strings.Contains(err.Error(), "checksum") {
 		t.Fatalf("expected checksum error, got %v", err)
 	}

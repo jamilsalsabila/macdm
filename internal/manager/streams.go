@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"macdm/internal/config"
 	"macdm/internal/dash"
 	"macdm/internal/extractor"
 	"macdm/internal/hls"
@@ -56,6 +57,11 @@ func (m *Manager) execStream(ctx context.Context, id string, j *store.Job) error
 			name = sanitize(t)
 		}
 		dest = filepath.Join(filepath.Dir(dest), name+".mp4")
+	}
+	if j.Status == store.StatusQueued {
+		dest = m.uniqueDest(id, dest)
+	}
+	if dest != j.Dest {
 		_, _ = m.st.Update(id, func(jj *store.Job) {
 			jj.Dest = dest
 			jj.Filename = filepath.Base(dest)
@@ -66,17 +72,35 @@ func (m *Manager) execStream(ctx context.Context, id string, j *store.Job) error
 	// but done/total track segments so the % bar works; finalize() sets bytes.
 	var lastBytes int64
 	var lastT = time.Now()
+	var estTotal int64
+	var avgBps float64 // EWMA so the rate doesn't snap to 0 between segments
 	segProgress := func(sp streamProg) {
 		now := time.Now()
 		var bps int64
 		if dt := now.Sub(lastT).Seconds(); dt > 0.4 {
-			bps = int64(float64(sp.bytes-lastBytes) / dt)
+			inst := float64(sp.bytes-lastBytes) / dt
 			lastBytes, lastT = sp.bytes, now
+			if avgBps == 0 && inst > 0 {
+				avgBps = inst
+			} else {
+				avgBps += 0.25 * (inst - avgBps)
+			}
+			bps = int64(avgBps)
+		}
+		// Estimate the whole size from bytes-so-far vs segments-so-far so the %
+		// bar advances continuously instead of jumping one segment at a time.
+		if sp.doneSeg > 0 && sp.totalSeg > 0 {
+			e := sp.bytes * int64(sp.totalSeg) / int64(sp.doneSeg)
+			if e > estTotal {
+				estTotal = e // monotonic — never let the bar slide backwards
+			}
 		}
 		_, _ = m.st.Update(id, func(jj *store.Job) {
 			jj.Status = store.StatusDownloading
-			jj.DoneBytes = int64(sp.doneSeg)
-			jj.TotalBytes = int64(sp.totalSeg)
+			jj.DoneBytes = sp.bytes
+			jj.TotalBytes = estTotal
+			jj.Segments = sp.totalSeg
+			jj.SegmentsDone = sp.doneSeg
 			jj.Connections = len(sp.conns)
 			if bps > 0 {
 				jj.SpeedBps = bps
@@ -266,16 +290,46 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		return err
 	}
 
-	outDir := m.cfg.DownloadDir
+	finalDir := m.cfg.DownloadDir
 	if d := filepath.Dir(j.Dest); d != "." && d != "" {
-		outDir = d
+		finalDir = d
 	}
-	res, err := ex.Download(ctx, j.URL, extractor.DownloadOptions{
+	// yt-dlp downloads into a per-job scratch dir; we then move the result to a
+	// non-clobbering path (yt-dlp itself would silently skip a name that already
+	// exists, leaving the job with no file).
+	outDir := m.workDir(id)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	defer os.RemoveAll(outDir)
+
+	// Watchdog: if yt-dlp never starts downloading (stuck in extraction —
+	// throttled, broken extractor, dead network) fail with a clear message
+	// instead of leaving the job on "Resolving…" forever.
+	wdCtx, wdCancel := context.WithCancel(ctx)
+	defer wdCancel()
+	started := make(chan struct{}, 1)
+	stalled := make(chan struct{})
+	go func() {
+		select {
+		case <-started:
+		case <-wdCtx.Done():
+		case <-time.After(150 * time.Second):
+			close(stalled)
+			wdCancel() // kills the yt-dlp subprocess via ctx
+		}
+	}()
+
+	res, err := ex.Download(wdCtx, j.URL, extractor.DownloadOptions{
 		OutDir:         outDir,
-		FormatSelector: j.FormatID, // "" => extractor's 1080p-capped default
-		CookiesFrom:    m.cfg.CookiesFrom,
+		FormatSelector: j.FormatID,                // "" => extractor's 1080p-capped default
+		CookiesFrom:    config.Load().CookiesFrom, // fresh — Settings can change it without a restart
 		MergeFormat:    "mp4",
 	}, func(p extractor.Progress) {
+		select {
+		case started <- struct{}{}: // first callback — extraction got somewhere
+		default:
+		}
 		_, _ = m.st.Update(id, func(jj *store.Job) {
 			jj.Status = store.StatusDownloading
 			switch p.Stage {
@@ -303,12 +357,48 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		})
 	})
 	if err != nil {
+		select {
+		case <-stalled:
+			return fmt.Errorf("yt-dlp couldn't resolve this video within 150s — it may be throttled or need a newer yt-dlp (Settings → Update now)")
+		default:
+		}
 		if strings.Contains(strings.ToLower(err.Error()), "drm") {
 			return drm(err.Error())
 		}
 		return err
 	}
-	return finalize(m, id, res.Path)
+	if res.Path == "" {
+		return fmt.Errorf("yt-dlp produced no file")
+	}
+	final := m.uniqueDest(id, filepath.Join(finalDir, filepath.Base(res.Path)))
+	if err := moveFile(res.Path, final); err != nil {
+		return err
+	}
+	return finalize(m, id, final)
+}
+
+// moveFile renames, falling back to copy+remove across filesystems.
+func moveFile(src, dst string) error {
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Remove(src)
 }
 
 func finalize(m *Manager, id, path string) error {

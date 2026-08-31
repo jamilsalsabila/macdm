@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"macdm/internal/config"
 )
@@ -99,6 +100,51 @@ func nearDir(dir, name string) string {
 	return ""
 }
 
+// YtDlpInvocation returns the argv prefix for running the resolved yt-dlp. The
+// `yt-dlp` release is a zipapp with a `#!/usr/bin/env python3` shebang; a
+// GUI-launched daemon has a minimal PATH (no /usr/local/bin), so `env` can't
+// find python3 — invoke it as `<python3> <zipapp>` with an explicit interpreter.
+// The `yt-dlp_macos` PyInstaller build is a normal executable and runs directly.
+func YtDlpInvocation(ytdlpPath string) []string {
+	if ytdlpPath == "" {
+		return nil
+	}
+	f, err := os.Open(ytdlpPath)
+	if err != nil {
+		return []string{ytdlpPath}
+	}
+	head := make([]byte, 64)
+	n, _ := f.Read(head)
+	f.Close()
+	firstLine := string(head[:n])
+	if i := strings.IndexByte(firstLine, '\n'); i >= 0 {
+		firstLine = firstLine[:i]
+	}
+	// The zipapp release: `#!/usr/bin/env python3` then a PK zip. Needs an
+	// explicit interpreter because a GUI-launched daemon's PATH lacks
+	// /usr/local/bin, so `env` can't resolve python3.
+	if strings.HasPrefix(firstLine, "#!") && strings.Contains(firstLine, "python") {
+		if py := findPython3(); py != "" {
+			return []string{py, ytdlpPath}
+		}
+	}
+	return []string{ytdlpPath}
+}
+
+func findPython3() string {
+	for _, c := range []string{
+		"/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/usr/bin/python3",
+	} {
+		if isExec(c) {
+			return c
+		}
+	}
+	if p, err := exec.LookPath("python3"); err == nil {
+		return p
+	}
+	return ""
+}
+
 func isExec(p string) bool {
 	fi, err := os.Stat(p)
 	if err != nil || fi.IsDir() {
@@ -144,6 +190,8 @@ func Version(ctx context.Context, path string) string {
 	if path == "" {
 		return ""
 	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	for _, flag := range []string{"--version", "-version"} {
 		out, err := exec.CommandContext(ctx, path, flag).Output()
 		if err != nil || len(out) == 0 {

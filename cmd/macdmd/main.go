@@ -32,6 +32,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
+	defer st.Close() // final flush of any pending progress write
 
 	toolset := tools.Resolve(cfg)
 	log.Printf("tools: ffmpeg=%q yt-dlp=%q", toolset.Ffmpeg, toolset.YtDlp)
@@ -46,7 +47,7 @@ func main() {
 		Engine: engine.Config{
 			MaxConns:  cfg.MaxConns,
 			MinChunk:  1 << 20,
-			UserAgent: "MacDM/0.1",
+			UserAgent: engine.DefaultUserAgent,
 			Timeout:   30 * time.Second,
 		},
 	}, st)

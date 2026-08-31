@@ -10,8 +10,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"macdm/internal/config"
@@ -28,7 +30,55 @@ var (
 	githubDL  = "https://github.com"
 )
 
-const ytDlpAsset = "yt-dlp_macos"
+// ytDlpAsset picks the release asset. The `yt-dlp_macos` PyInstaller binary is
+// self-contained but pathologically slow on some Macs (Intel + older macOS
+// re-extract + Gatekeeper-assess ~40 MB every invocation — 50s+ per run). When a
+// real python3 is on PATH, the tiny `yt-dlp` zipapp is 10-30x faster.
+func ytDlpAsset() string {
+	if hasPython3() {
+		return "yt-dlp"
+	}
+	return "yt-dlp_macos"
+}
+
+// ytDlpVersion runs `--version` through the right interpreter (zipapp vs binary).
+func ytDlpVersion(ctx context.Context, path string) string {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	argv := YtDlpInvocation(path)
+	if len(argv) == 0 {
+		return ""
+	}
+	out, err := exec.CommandContext(ctx, argv[0], append(argv[1:], "--version")...).Output()
+	if err != nil {
+		return ""
+	}
+	line := string(out)
+	if i := strings.IndexByte(line, '\n'); i > 0 {
+		line = line[:i]
+	}
+	return strings.TrimSpace(line)
+}
+
+func hasPython3() bool {
+	p, err := exec.LookPath("python3")
+	if err != nil {
+		return false
+	}
+	// The macOS /usr/bin/python3 shim (no CLT installed) exits non-zero and
+	// pops a dialog — treat only a real interpreter as usable.
+	out, err := exec.Command(p, "-c", "import sys").CombinedOutput()
+	return err == nil && len(out) == 0
+}
+
+// ytDlpRepo maps a channel name to its GitHub repo. Nightly builds live in a
+// separate repo but use the same asset + SHA2-256SUMS layout.
+func ytDlpRepo(channel string) string {
+	if channel == "stable" {
+		return "yt-dlp/yt-dlp"
+	}
+	return "yt-dlp/yt-dlp-nightly-builds"
+}
 
 // managedYtDlp is where the auto-updated binary lives; tools.find() prefers it.
 func managedYtDlp() string {
@@ -40,18 +90,19 @@ type YtDlpStatus struct {
 	Path            string `json:"path"`
 	Version         string `json:"version"`
 	Latest          string `json:"latest"`
+	Channel         string `json:"channel"`
 	UpdateAvailable bool   `json:"update_available"`
 }
 
-// CheckYtDlp reports the installed yt-dlp version and the latest release tag.
-// A network failure is not fatal — the local fields are still filled.
-func CheckYtDlp(ctx context.Context, set Set) (YtDlpStatus, error) {
-	s := YtDlpStatus{Path: set.YtDlp}
+// CheckYtDlp reports the installed yt-dlp version and the latest release tag on
+// the given channel ("nightly"/"stable"). A network failure is not fatal — the
+// local fields are still filled.
+func CheckYtDlp(ctx context.Context, set Set, channel string) (YtDlpStatus, error) {
+	s := YtDlpStatus{Path: set.YtDlp, Channel: channel}
 	if set.YtDlp != "" {
-		v := Version(ctx, set.YtDlp) // "yt-dlp 2025.08.20" or "2025.08.20"
-		s.Version = strings.TrimSpace(strings.TrimPrefix(v, "yt-dlp"))
+		s.Version = strings.TrimSpace(strings.TrimPrefix(ytDlpVersion(ctx, set.YtDlp), "yt-dlp"))
 	}
-	latest, err := githubLatestTag(ctx)
+	latest, err := githubLatestTag(ctx, ytDlpRepo(channel))
 	if err != nil {
 		return s, err
 	}
@@ -60,16 +111,24 @@ func CheckYtDlp(ctx context.Context, set Set) (YtDlpStatus, error) {
 	return s, nil
 }
 
-// UpdateYtDlp downloads the latest yt-dlp_macos build into the managed bin dir,
-// verifying its SHA-256 against the release's SHA2-256SUMS before swapping it in
-// atomically. Returns the old and new version strings.
-func UpdateYtDlp(ctx context.Context) (from, to string, err error) {
+// updateMu serialises UpdateYtDlp so a manual "Update now" and the background
+// loop can't both download into the same dir at once.
+var updateMu sync.Mutex
+
+// UpdateYtDlp downloads the latest yt-dlp_macos build for the channel into the
+// managed bin dir, verifying its SHA-256 against the release's SHA2-256SUMS
+// before swapping it in atomically. Returns the old and new version strings.
+func UpdateYtDlp(ctx context.Context, channel string) (from, to string, err error) {
+	updateMu.Lock()
+	defer updateMu.Unlock()
+
+	repo := ytDlpRepo(channel)
 	dest := managedYtDlp()
 	if fi, e := os.Stat(dest); e == nil && !fi.IsDir() {
 		from = strings.TrimSpace(strings.TrimPrefix(Version(ctx, dest), "yt-dlp"))
 	}
 
-	tag, err := githubLatestTag(ctx)
+	tag, err := githubLatestTag(ctx, repo)
 	if err != nil {
 		return from, "", fmt.Errorf("check latest: %w", err)
 	}
@@ -77,22 +136,27 @@ func UpdateYtDlp(ctx context.Context) (from, to string, err error) {
 		return from, from, nil // already current
 	}
 
-	want, err := releaseSHA(ctx, tag, ytDlpAsset)
+	want, err := releaseSHA(ctx, repo, tag, ytDlpAsset())
 	if err != nil {
 		return from, "", fmt.Errorf("fetch checksums: %w", err)
 	}
 
-	binURL := fmt.Sprintf("%s/yt-dlp/yt-dlp/releases/download/%s/%s", githubDL, tag, ytDlpAsset)
+	binURL := fmt.Sprintf("%s/%s/releases/download/%s/%s", githubDL, repo, tag, ytDlpAsset())
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return from, "", err
 	}
-	tmp := filepath.Join(filepath.Dir(dest), ".yt-dlp.tmp")
+	f, err := os.CreateTemp(filepath.Dir(dest), "yt-dlp-*.download")
+	if err != nil {
+		return from, "", err
+	}
+	tmp := f.Name()
+	f.Close()
+	defer os.Remove(tmp) // always clean up, success or failure
+
 	got, err := downloadFile(ctx, binURL, tmp)
 	if err != nil {
 		return from, "", fmt.Errorf("download: %w", err)
 	}
-	defer os.Remove(tmp)
-
 	if want != "" && !strings.EqualFold(want, got) {
 		return from, "", fmt.Errorf("checksum mismatch: got %s want %s", got, want)
 	}
@@ -100,29 +164,31 @@ func UpdateYtDlp(ctx context.Context) (from, to string, err error) {
 		return from, "", err
 	}
 	// Confirm it executes before committing.
-	if v := Version(ctx, tmp); v == "" {
-		return from, "", fmt.Errorf("downloaded binary does not run")
+	if v := ytDlpVersion(ctx, tmp); v == "" {
+		return from, "", fmt.Errorf("downloaded yt-dlp does not run")
 	}
 	if err := os.Rename(tmp, dest); err != nil {
 		return from, "", err
 	}
-	to = strings.TrimSpace(strings.TrimPrefix(Version(ctx, dest), "yt-dlp"))
+	to = strings.TrimSpace(strings.TrimPrefix(ytDlpVersion(ctx, dest), "yt-dlp"))
 	return from, to, nil
 }
 
 // AutoUpdateLoop runs an initial check (if the stamp file is missing or >24h
-// old) then re-checks every 12h, until ctx is cancelled. Errors are logged, not
-// returned — a failed update must never take the daemon down.
-func AutoUpdateLoop(ctx context.Context, cfg config.Config) {
-	if !cfg.AutoUpdateYtDlpEnabled() {
-		return
-	}
+// old) then re-checks every 12h, until ctx is cancelled. Config is re-read each
+// run so a Settings change (enable/disable, channel) takes effect without a
+// daemon restart. Errors are logged, not returned.
+func AutoUpdateLoop(ctx context.Context, _ config.Config) {
 	stamp := filepath.Join(config.SupportDir(), ".ytdlp-checked")
 	run := func() {
+		cfg := config.Load()
+		if !cfg.AutoUpdateYtDlpEnabled() {
+			return
+		}
 		if fi, err := os.Stat(stamp); err == nil && time.Since(fi.ModTime()) < 24*time.Hour {
 			return
 		}
-		from, to, err := UpdateYtDlp(ctx)
+		from, to, err := UpdateYtDlp(ctx, cfg.YtDlpChannelName())
 		switch {
 		case err != nil:
 			log.Printf("yt-dlp auto-update: %v", err)
@@ -156,11 +222,15 @@ func AutoUpdateLoop(ctx context.Context, cfg config.Config) {
 
 // --- helpers ---
 
-func githubLatestTag(ctx context.Context) (string, error) {
+// ghClient has a short timeout so a slow/blocked GitHub never hangs the caller
+// (the Settings window's tool-status fetch, most importantly).
+var ghClient = &http.Client{Timeout: 6 * time.Second}
+
+func githubLatestTag(ctx context.Context, repo string) (string, error) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
-		githubAPI+"/repos/yt-dlp/yt-dlp/releases/latest", nil)
+		githubAPI+"/repos/"+repo+"/releases/latest", nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := ghClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -178,8 +248,8 @@ func githubLatestTag(ctx context.Context) (string, error) {
 }
 
 // releaseSHA returns the hex SHA-256 for asset within a release's SHA2-256SUMS.
-func releaseSHA(ctx context.Context, tag, asset string) (string, error) {
-	u := fmt.Sprintf("%s/yt-dlp/yt-dlp/releases/download/%s/SHA2-256SUMS", githubDL, tag)
+func releaseSHA(ctx context.Context, repo, tag, asset string) (string, error) {
+	u := fmt.Sprintf("%s/%s/releases/download/%s/SHA2-256SUMS", githubDL, repo, tag)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -203,8 +273,14 @@ func releaseSHA(ctx context.Context, tag, asset string) (string, error) {
 }
 
 func downloadFile(ctx context.Context, url, dest string) (sha string, err error) {
+	// No overall Timeout — the file is ~35 MB and connections vary wildly.
+	// ResponseHeaderTimeout catches a dead server; the caller's ctx cancels a
+	// user-abandoned update. A stall mid-body will hang until ctx expires.
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	client := &http.Client{Timeout: 90 * time.Second}
+	client := &http.Client{Transport: &http.Transport{
+		ResponseHeaderTimeout: 30 * time.Second,
+		IdleConnTimeout:       30 * time.Second,
+	}}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err

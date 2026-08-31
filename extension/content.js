@@ -112,6 +112,70 @@
     return location.href;
   }
 
+  // TikTok's <video> plays a session-locked DASH URL (chain_token / btag) that
+  // 403s outside the browser. The page embeds the real progressive URL in a
+  // JSON <script> — that's what Neat DM / yt-dlp use. Read it straight from the
+  // DOM (works in the content-script world; no page-context access needed).
+  function deepFindURL(obj, keys, depth) {
+    if (!obj || typeof obj !== "object" || depth > 9) return null;
+    const good = (s) =>
+      typeof s === "string" && /^https?:\/\/[^ ]+\/video\//.test(s) && !/chain_token/.test(s);
+    for (const k of keys) {
+      const v = obj[k];
+      if (good(v)) return v;
+      if (v && typeof v === "object") {
+        const list = v.UrlList || v.url_list;
+        if (Array.isArray(list)) {
+          const hit = list.find(good) || [...list].reverse().find((s) => /^https?:/.test(s));
+          if (hit) return hit;
+        }
+      }
+    }
+    for (const v of Array.isArray(obj) ? obj : Object.values(obj)) {
+      const r = deepFindURL(v, keys, depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  // tiktok-main.js runs in the PAGE context and posts the real progressive URLs
+  // (playAddr / downloadAddr / bitrateInfo) here — the isolated content script
+  // can't reach those window globals itself.
+  // tiktok-main.js (page context) posts { id, urls } for the CURRENTLY open clip.
+  let ttMsg = { id: null, urls: [] };
+  window.addEventListener("message", (e) => {
+    if (e.source !== window) return;
+    if (!/(^|\.)tiktok\.com$/i.test(location.hostname)) return;
+    const d = e.data;
+    if (!d || !d.__macdm_tiktok || !Array.isArray(d.urls)) return;
+    // Only accept real media URLs from the page's own state.
+    const urls = d.urls.filter((u) => typeof u === "string" && /^https:\/\/[^ ]+\/video\//.test(u));
+    if (urls.length) ttMsg = { id: d.id || null, urls };
+  });
+
+  function currentTikTokId() {
+    const m = location.pathname.match(/\/(?:video|photo)\/(\d+)/);
+    return m ? m[1] : null;
+  }
+
+  // A DIRECT media URL for the clip the user is on — only if we're sure it's the
+  // current one (the feed swaps clips without a full navigation).
+  function tiktokVideoURL(video) {
+    const id = currentTikTokId();
+    if (ttMsg.urls.length && (!id || !ttMsg.id || ttMsg.id === id)) {
+      return ttMsg.urls.find((u) => !/chain_token|[?&]tk=/.test(u)) || ttMsg.urls[0];
+    }
+    const src = video?.currentSrc || video?.src || "";
+    if (/^https?:/.test(src) && /aweme\/v1\/play|\/video\/tos\//.test(src)) return src;
+    return null;
+  }
+
+  function tiktokPermalink(video) {
+    if (/\/@[\w.-]+\/(video|photo)\/\d+/.test(location.pathname)) return location.href;
+    const p = postLinkNear(video);
+    return p && /\/@[\w.-]+\/(video|photo)\/\d+/.test(p) ? p : null;
+  }
+
   function place(video) {
     const r = video.getBoundingClientRect();
     if (r.width < MIN_W || r.height < MIN_H) {
@@ -186,6 +250,9 @@
     busy = true;
     btn.textContent = "sending…";
     const url = bestURL(currentVideo);
+    const onTikTok = /(^|\.)tiktok\.com$/i.test(location.hostname);
+    const ttURL = onTikTok ? tiktokVideoURL(currentVideo) : null;
+    const ttPermalink = onTikTok ? tiktokPermalink(currentVideo) : null;
 
     const done = (txt, ok) => {
       btn.textContent = txt;
@@ -195,12 +262,12 @@
       setTimeout(() => { busy = false; btn.textContent = "⬇ MacDM"; }, cool);
     };
 
-    if (!url) { done("✗ open the video first", false); return; }
+    if (!url && !ttURL && !ttPermalink) { done("✗ open the video first", false); return; }
 
     const timeout = setTimeout(() => done("✗ no daemon", false), 12000);
     try {
       chrome.runtime.sendMessage(
-        { type: "downloadPage", url, title: document.title },
+        { type: "downloadPage", url: url || location.href, ttURL, ttPermalink, title: document.title },
         (resp) => {
           clearTimeout(timeout);
           if (chrome.runtime.lastError) { done("✗ " + chrome.runtime.lastError.message, false); return; }

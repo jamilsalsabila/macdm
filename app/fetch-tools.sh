@@ -30,11 +30,20 @@ if [[ ! -x "$TOOLS/ffmpeg" ]]; then
   chmod +x "$TOOLS/ffmpeg"
 fi
 
-# --- yt-dlp ---
+# --- yt-dlp (nightly: site fixes land here first; MacDM auto-updates it too) ---
+# Prefer the tiny `yt-dlp` zipapp (needs python3) — the `yt-dlp_macos`
+# PyInstaller build re-extracts ~40 MB and gets Gatekeeper-assessed on EVERY
+# run, which is 50s+ per invocation on Intel / older macOS.
 if [[ ! -x "$TOOLS/yt-dlp" ]]; then
-  echo "yt-dlp: downloading yt-dlp_macos from GitHub Releases"
-  curl -fSL "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" \
-    -o "$TOOLS/yt-dlp"
+  if command -v python3 >/dev/null && python3 -c 'import sys' 2>/dev/null; then
+    echo "yt-dlp: downloading yt-dlp zipapp (nightly)"
+    curl -fSL "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp" \
+      -o "$TOOLS/yt-dlp"
+  else
+    echo "yt-dlp: no python3 — downloading yt-dlp_macos (nightly, slower)"
+    curl -fSL "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_macos" \
+      -o "$TOOLS/yt-dlp"
+  fi
   chmod +x "$TOOLS/yt-dlp"
 fi
 

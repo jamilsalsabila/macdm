@@ -112,7 +112,21 @@ func newSidecar(url string, p *Probe, conns int, minChunk int64) *sidecar {
 		return sc
 	}
 	sc.Chunks = splitRanges([]iv{{0, p.TotalBytes - 1}}, conns, minChunk)
+	sc.reserveSteal(conns)
 	return sc
+}
+
+// reserveSteal grows the Chunks backing array so work-stealing can append
+// sub-chunks without reallocating (which would invalidate the *chunk pointers
+// the workers hold).
+func (sc *sidecar) reserveSteal(conns int) {
+	want := len(sc.Chunks) + conns*3
+	if cap(sc.Chunks) >= want {
+		return
+	}
+	g := make([]chunk, len(sc.Chunks), want)
+	copy(g, sc.Chunks)
+	sc.Chunks = g
 }
 
 // replanConns folds the current chunks' progress into Done and re-splits the
@@ -131,6 +145,7 @@ func (sc *sidecar) replanConns(conns int, minChunk int64) {
 	missing := complementIv(sc.Done, sc.TotalBytes)
 	sc.Chunks = splitRanges(missing, conns, minChunk)
 	sc.Conns = conns
+	sc.reserveSteal(conns)
 }
 
 // splitRanges divides the given byte intervals into up to `conns` contiguous

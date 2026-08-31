@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -278,5 +279,202 @@ func TestServerIgnoresRange(t *testing.T) {
 	got, _ := os.ReadFile(dest)
 	if sha(got) != sha(body) {
 		t.Fatalf("content mismatch: %d of %d", len(got), len(body))
+	}
+}
+
+// TestStalledConnectionRecovers: the server sends the first half then hangs.
+// The chunk read must time out (not block forever) and the retry must finish.
+func TestStalledConnectionRecovers(t *testing.T) {
+	old := stallTimeout
+	stallTimeout = 1 * time.Second
+	defer func() { stallTimeout = old }()
+
+	body := bytes.Repeat([]byte("Z"), 400<<10)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		if n == 1 {
+			// first attempt: send a bit, then hang past the stall timeout
+			w.WriteHeader(200)
+			w.Write(body[:20<<10])
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(4 * time.Second)
+			return
+		}
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+	}))
+	defer srv.Close()
+
+	e := New(Config{MaxConns: 1, MinChunk: 1 << 20, Timeout: 10 * time.Second})
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := e.Run(ctx, DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if len(got) != len(body) {
+		t.Fatalf("size: got %d want %d", len(got), len(body))
+	}
+	if hits.Load() < 2 {
+		t.Fatalf("expected a retry, got %d requests", hits.Load())
+	}
+}
+
+// TestTruncatedRangeResponseRetries: a 206 that closes the connection cleanly
+// before delivering its whole range must NOT be accepted as a finished chunk —
+// otherwise a corrupt .part gets renamed to the final file. The retry must
+// resume from where it stopped and produce the exact bytes.
+func TestTruncatedRangeResponseRetries(t *testing.T) {
+	body := make([]byte, 2<<20)
+	rand.New(rand.NewSource(11)).Read(body)
+	var full atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		rng := r.Header.Get("Range")
+		var start, end int64
+		if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); err != nil || rng == "" {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			w.WriteHeader(200)
+			w.Write(body)
+			return
+		}
+		seg := body[start : end+1]
+		// First delivery of any real range: hand back only half, then stop.
+		short := len(seg)
+		if start != end && full.Add(1) <= 3 {
+			short = len(seg) / 2
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", short))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(seg[:short])
+	}))
+	defer srv.Close()
+
+	e := New(Config{MaxConns: 3, MinChunk: 256 << 10, Timeout: 10 * time.Second})
+	dest := filepath.Join(t.TempDir(), "archive.zip")
+	if _, err := e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if sha(got) != sha(body) {
+		t.Fatalf("content mismatch after truncated-range retry: %d of %d bytes", len(got), len(body))
+	}
+}
+
+// TestFlakyHostManyDrops: the server kills every connection after ~12KB, so a
+// 400KB chunk needs ~35 resume attempts — far past the old fixed cap of 5.
+// Because each attempt still makes progress the no-progress budget resets and
+// the download completes.
+func TestFlakyHostManyDrops(t *testing.T) {
+	body := make([]byte, 400<<10)
+	rand.New(rand.NewSource(99)).Read(body)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Accept-Ranges", "bytes")
+		start := int64(0)
+		if rg := r.Header.Get("Range"); strings.HasPrefix(rg, "bytes=") {
+			p := strings.SplitN(strings.TrimPrefix(rg, "bytes="), "-", 2)
+			start, _ = strconv.ParseInt(p[0], 10, 64)
+		}
+		seg := body[start:]
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(body)-1, len(body)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(seg)))
+		w.WriteHeader(http.StatusPartialContent)
+		n := 12 << 10
+		if n > len(seg) {
+			n = len(seg)
+		}
+		w.Write(seg[:n])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if n < len(seg) {
+			if hj, ok := w.(http.Hijacker); ok {
+				if c, _, err := hj.Hijack(); err == nil {
+					_ = c.Close()
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	e := New(Config{MaxConns: 1, MinChunk: 1 << 20, Timeout: 10 * time.Second})
+	dest := filepath.Join(t.TempDir(), "flaky.bin")
+	if _, err := e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if sha(got) != sha(body) {
+		t.Fatalf("content mismatch: %d of %d bytes", len(got), len(body))
+	}
+	if hits.Load() < 10 {
+		t.Fatalf("expected many resume attempts, got %d", hits.Load())
+	}
+}
+
+// TestWorkStealing: the first 2 MiB of the file is served at ~512 KiB/s *per
+// connection*; the rest is instant. With a fixed chunk-per-connection split the
+// download is gated by that one slow 2 MiB chunk (~4s). Work-stealing lets the
+// finished workers pile onto the slow range so it completes in ~1s.
+func TestWorkStealing(t *testing.T) {
+	const total = 8 << 20
+	const slow = 2 << 20
+	body := make([]byte, total)
+	rand.New(rand.NewSource(5)).Read(body)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		start, end := int64(0), int64(total-1)
+		if rg := r.Header.Get("Range"); strings.HasPrefix(rg, "bytes=") {
+			p := strings.SplitN(strings.TrimPrefix(rg, "bytes="), "-", 2)
+			start, _ = strconv.ParseInt(p[0], 10, 64)
+			if p[1] != "" {
+				end, _ = strconv.ParseInt(p[1], 10, 64)
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		seg := body[start : end+1]
+		fl, _ := w.(http.Flusher)
+		if start < slow {
+			for off := 0; off < len(seg); off += 32 << 10 {
+				e := off + 32<<10
+				if e > len(seg) {
+					e = len(seg)
+				}
+				w.Write(seg[off:e])
+				if fl != nil {
+					fl.Flush()
+				}
+				time.Sleep(60 * time.Millisecond) // ~512 KiB/s per connection
+			}
+			return
+		}
+		w.Write(seg)
+	}))
+	defer srv.Close()
+
+	e := New(Config{MaxConns: 4, MinChunk: 256 << 10, Timeout: 30 * time.Second})
+	dest := filepath.Join(t.TempDir(), "big.bin")
+	t0 := time.Now()
+	if _, err := e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	elapsed := time.Since(t0)
+	got, _ := os.ReadFile(dest)
+	if sha(got) != sha(body) {
+		t.Fatalf("content mismatch: %d of %d bytes", len(got), len(body))
+	}
+	t.Logf("work-stealing download took %v", elapsed)
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("work-stealing did not kick in: took %v (expected < 2.5s)", elapsed)
 	}
 }

@@ -38,7 +38,7 @@ MacDM — install
 2. First launch only: open Applications, right-click MacDM, choose "Open",
    then click "Open" in the dialog. (macOS blocks unsigned apps on a normal
    double-click. You only do this once.)
-   The menu-bar arrow icon means it's running.
+   The MacDM icon appears in the Dock and in the menu bar when it's running.
 
 3. Add the browser extension:
 

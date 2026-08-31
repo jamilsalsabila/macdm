@@ -54,6 +54,12 @@ type Job struct {
 	Connections int   `json:"connections"`
 	Resumable   bool  `json:"resumable"`
 
+	// Segments / SegmentsDone: for HLS/DASH the byte totals above are estimates
+	// (so the % bar moves smoothly); these carry the real segment counts for the
+	// "N segments" text.
+	Segments     int `json:"segments,omitempty"`
+	SegmentsDone int `json:"segments_done,omitempty"`
+
 	// Conns is the per-connection breakdown for the IDM-style detail table.
 	// Runtime state, persisted opportunistically like SpeedBps.
 	Conns []ConnStat `json:"conns,omitempty"`
@@ -136,6 +142,10 @@ type Store struct {
 	jobs     map[string]*Job
 	watchers map[int]chan Event
 	nextW    int
+
+	dirty    bool          // a progress update is waiting to be flushed
+	flushReq chan struct{} // wake the flush loop for an immediate write
+	stop     chan struct{}
 }
 
 // Event is broadcast to watchers whenever a job is created or changes.
@@ -153,9 +163,12 @@ func Open(path string) (*Store, error) {
 		path:     path,
 		jobs:     map[string]*Job{},
 		watchers: map[int]chan Event{},
+		flushReq: make(chan struct{}, 1),
+		stop:     make(chan struct{}),
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		go s.flushLoop()
 		return s, nil
 	}
 	if err != nil {
@@ -172,7 +185,61 @@ func Open(path string) (*Store, error) {
 		}
 		s.jobs[j.ID] = j
 	}
+	go s.flushLoop()
 	return s, nil
+}
+
+// flushLoop persists the store at most once a second (or immediately on an
+// explicit flush request) so a burst of progress updates during a download does
+// not turn into a burst of whole-file rewrites blocking the download goroutine.
+func (s *Store) flushLoop() {
+	t := time.NewTicker(1 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.stop:
+			s.flush()
+			return
+		case <-s.flushReq:
+			s.flush()
+		case <-t.C:
+			s.flush()
+		}
+	}
+}
+
+func (s *Store) flush() {
+	s.mu.Lock()
+	if !s.dirty {
+		s.mu.Unlock()
+		return
+	}
+	s.dirty = false
+	err := s.persistLocked()
+	s.mu.Unlock()
+	if err != nil {
+		// best-effort; the next tick retries
+		s.mu.Lock()
+		s.dirty = true
+		s.mu.Unlock()
+	}
+}
+
+// Close flushes any pending write and stops the flush loop.
+func (s *Store) Close() {
+	select {
+	case <-s.stop:
+	default:
+		close(s.stop)
+	}
+}
+
+// requestFlush asks the flush loop to write now (non-blocking).
+func (s *Store) requestFlush() {
+	select {
+	case s.flushReq <- struct{}{}:
+	default:
+	}
 }
 
 // List returns all jobs, newest first.
@@ -209,13 +276,14 @@ func (s *Store) Put(j *Job) error {
 	}
 	stored := *j
 	s.jobs[j.ID] = &stored
-	err := s.persistLocked()
+	s.dirty = true
 	// broadcast a SEPARATE copy — a later Update mutates the map entry in place
 	// and a watcher may still be marshalling the event.
 	ev := *j
 	s.broadcastLocked(Event{Type: "job", Job: &ev})
 	s.mu.Unlock()
-	return err
+	s.requestFlush() // a new job is worth writing right away
+	return nil
 }
 
 // Update applies fn to the stored job under the lock, then persists and notifies.
@@ -229,11 +297,22 @@ func (s *Store) Update(id string, fn func(*Job)) (*Job, error) {
 	fn(j)
 	j.UpdatedAt = time.Now()
 	cp := *j
-	if err := s.persistLocked(); err != nil {
-		return &cp, err
-	}
+	s.dirty = true
 	s.broadcastLocked(Event{Type: "job", Job: &cp})
+	// Flush now for state the user must not lose on a crash; progress ticks ride
+	// the 1s timer.
+	if terminalStatus(cp.Status) {
+		s.requestFlush()
+	}
 	return &cp, nil
+}
+
+func terminalStatus(s string) bool {
+	switch s {
+	case StatusCompleted, StatusError, StatusDRM, StatusPaused:
+		return true
+	}
+	return false
 }
 
 // Delete removes a job.
@@ -246,10 +325,9 @@ func (s *Store) Delete(id string) error {
 	}
 	delete(s.jobs, id)
 	cp := *j
-	if err := s.persistLocked(); err != nil {
-		return err
-	}
+	s.dirty = true
 	s.broadcastLocked(Event{Type: "delete", Job: &cp})
+	s.requestFlush() // non-blocking
 	return nil
 }
 

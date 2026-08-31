@@ -190,9 +190,13 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
     private func rebuildQualityMenu() {
         let formats = latest.formats ?? []
         let probing = latest.probing ?? false
+        // Keep the user's pick when the menu is rebuilt (the real formats arrive
+        // a few seconds after the static ladder).
+        let wasChosen = qualityMenu.numberOfItems > 0 ? qualityMenu.titleOfSelectedItem : nil
+        let chosenLabel = wasChosen.map { $0.components(separatedBy: "  (~").first ?? $0 }
         qualityMenu.removeAllItems()
         if formats.isEmpty {
-            qualityMenu.addItem(withTitle: probing ? "Detecting…" : "Original")
+            qualityMenu.addItem(withTitle: probing ? "Detecting… (Download works now)" : "Best available")
             qualityMenu.isEnabled = false
         } else {
             for f in formats {
@@ -200,7 +204,10 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
                 qualityMenu.addItem(withTitle: f.label + size)
             }
             qualityMenu.isEnabled = true
-            if let idx = formats.firstIndex(where: { ($0.height ?? 0) == 1080 }) {
+            if let want = chosenLabel,
+               let idx = formats.firstIndex(where: { $0.label == want }) {
+                qualityMenu.selectItem(at: idx)
+            } else if let idx = formats.firstIndex(where: { ($0.height ?? 0) == 1080 }) {
                 qualityMenu.selectItem(at: idx)
             }
         }

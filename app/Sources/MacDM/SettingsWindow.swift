@@ -16,6 +16,10 @@ final class SettingsWindowController: NSWindowController {
     private let ffmpegLabel = NSTextField(labelWithString: "ffmpeg: …")
     private let autoUpdate = NSButton(checkboxWithTitle: "Keep yt-dlp updated automatically", target: nil, action: nil)
     private let updateBtn = NSButton(title: "Update now", target: nil, action: nil)
+    private let channelPop = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let cookiesPop = NSPopUpButton(frame: .zero, pullsDown: false)
+
+    private let cookieBrowsers = ["none", "firefox", "chrome", "brave", "edge", "safari", "chromium", "vivaldi", "opera"]
 
     private var folder: String = (NSHomeDirectory() as NSString).appendingPathComponent("Downloads/MacDM")
 
@@ -74,12 +78,30 @@ final class SettingsWindowController: NSWindowController {
         updateBtn.action = #selector(updateNow)
         updateBtn.bezelStyle = .rounded
 
+        channelPop.addItems(withTitles: ["nightly (recommended)", "stable"])
+        channelPop.target = self
+        channelPop.action = #selector(channelChanged)
+        let channelRow = NSStackView(views: [NSTextField(labelWithString: "Channel:"), channelPop])
+        channelRow.spacing = 6
+
+        cookiesPop.addItems(withTitles: cookieBrowsers.map { $0 == "none" ? "none" : $0.capitalized })
+        cookiesPop.target = self
+        cookiesPop.action = #selector(cookiesChanged)
+        let cookiesHint = NSTextField(labelWithString: "(use your login for YouTube / Instagram / private videos)")
+        cookiesHint.textColor = .tertiaryLabelColor
+        cookiesHint.font = .systemFont(ofSize: 10)
+        let cookiesRow = NSStackView(views: [NSTextField(labelWithString: "Cookies from browser:"), cookiesPop])
+        cookiesRow.spacing = 6
+
         let sep = NSBox()
         sep.boxType = .separator
 
         let toolsBox = NSStackView(views: [
             ytdlpLabel,
             NSStackView(views: [autoUpdate, updateBtn]),
+            channelRow,
+            cookiesRow,
+            cookiesHint,
             ffmpegLabel,
         ])
         toolsBox.orientation = .vertical
@@ -137,6 +159,9 @@ final class SettingsWindowController: NSWindowController {
             self.ytdlpLabel.stringValue = s
             self.ffmpegLabel.stringValue = "ffmpeg: " + (info.ffmpeg.version.isEmpty ? "not found" : info.ffmpeg.version)
             self.autoUpdate.state = info.auto_update ? .on : .off
+            self.channelPop.selectItem(at: (yt.channel == "stable") ? 1 : 0)
+            let cf = (info.cookies_from ?? "").lowercased()
+            self.cookiesPop.selectItem(at: max(0, self.cookieBrowsers.firstIndex(of: cf.isEmpty ? "none" : cf) ?? 0))
         }
     }
 
@@ -146,9 +171,18 @@ final class SettingsWindowController: NSWindowController {
         DaemonClient.shared.setConfig(["auto_update_ytdlp": autoUpdate.state == .on])
     }
 
+    @objc private func channelChanged() {
+        DaemonClient.shared.setConfig(["ytdlp_channel": channelPop.indexOfSelectedItem == 1 ? "stable" : "nightly"])
+    }
+
+    @objc private func cookiesChanged() {
+        let pick = cookieBrowsers[cookiesPop.indexOfSelectedItem]
+        DaemonClient.shared.setConfig(["cookies_from": pick == "none" ? "" : pick])
+    }
+
     @objc private func updateNow() {
         updateBtn.isEnabled = false
-        updateBtn.title = "Updating…"
+        updateBtn.title = "Downloading… (~35 MB)"
         DaemonClient.shared.updateYtDlp { [weak self] _, error in
             guard let self = self else { return }
             self.updateBtn.title = "Update now"

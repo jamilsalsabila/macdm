@@ -14,7 +14,7 @@ const DefaultAddr = "127.0.0.1:7345"
 // Version is bumped whenever the daemon's wire behaviour changes. The menu-bar
 // app compares it against its own build and restarts a mismatched daemon so a
 // stale background macdmd never lingers after a rebuild.
-const Version = "0.4.0"
+const Version = "0.5.8"
 
 // Config is the on-disk settings file (config.json in the support dir). Every
 // field has a working default, so the file is optional.
@@ -42,11 +42,24 @@ type Config struct {
 	// check). Pointer so an absent key means "not set" — Load defaults it to
 	// true, since a stale yt-dlp is the usual reason YouTube stops working.
 	AutoUpdateYtDlp *bool `json:"auto_update_ytdlp,omitempty"`
+
+	// YtDlpChannel is "nightly" (default) or "stable". yt-dlp's own guidance is
+	// that most users want nightly — site fixes (TikTok, YouTube) land there days
+	// to weeks before a stable tag.
+	YtDlpChannel string `json:"ytdlp_channel,omitempty"`
 }
 
 // AutoUpdateYtDlpEnabled reports the effective setting (default true).
 func (c Config) AutoUpdateYtDlpEnabled() bool {
 	return c.AutoUpdateYtDlp == nil || *c.AutoUpdateYtDlp
+}
+
+// YtDlpChannelName returns "stable" or "nightly" (the default).
+func (c Config) YtDlpChannelName() string {
+	if c.YtDlpChannel == "stable" {
+		return "stable"
+	}
+	return "nightly"
 }
 
 // SupportDir is ~/Library/Application Support/MacDM, created on demand.

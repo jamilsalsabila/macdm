@@ -11,7 +11,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         FirstRunSetup.run()
+        Notifier.configure()
         DaemonClient.shared.configure(addr: addr)
+
+        NSApp.mainMenu = MainMenu.build(target: self,
+                                        settingsAction: #selector(openSettings),
+                                        openAction: #selector(addURL))
+        mainWindow.show()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let b = statusItem.button {
@@ -40,6 +46,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ note: Notification) {
         DaemonClient.shared.stopStream()
         // leave the daemon running so downloads survive the UI quitting
+    }
+
+    // Keep running (Dock + status item) when the last window closes — downloads
+    // continue in the background and the user reopens from either entry point.
+    func applicationShouldTerminateAfterLastWindowClosed(_ app: NSApplication) -> Bool { false }
+
+    // Clicking the Dock icon with no window open brings the main window back.
+    func applicationShouldHandleReopen(_ app: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { mainWindow.show() }
+        return true
     }
 
     // MARK: menu
@@ -75,9 +91,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     ? j.filename.prefix(31) + "…" : Substring(j.filename)
                 let it = NSMenuItem(
                     title: "   \(name) — \(Int(j.percent))%  \(Fmt.speed(j.speed_bps))",
-                    action: #selector(openMain), keyEquivalent: "")
+                    action: #selector(openJobDetail(_:)), keyEquivalent: "")
                 it.toolTip = j.filename
                 it.target = self
+                it.representedObject = j.id
                 m.addItem(it)
             }
         }
@@ -87,6 +104,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openMain() { mainWindow.show() }
+    @objc private func openJobDetail(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        mainWindow.showDetail(jobID: id)
+    }
     @objc private func openSettings() { SettingsWindowController.shared.show() }
     @objc private func addURL() {
         mainWindow.show()

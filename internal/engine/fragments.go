@@ -12,6 +12,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Fragment is one byte-range slice of a media file, addressed by its own URL
@@ -222,6 +223,10 @@ func (e *Engine) RunFragments(ctx context.Context, dest string, headers map[stri
 }
 
 func (e *Engine) fetchFragment(ctx context.Context, f *os.File, fr Fragment, headers map[string]string) (int64, error) {
+	// A fragment is small (a few hundred KB); a minute is generous, and it caps
+	// a stalled connection instead of hanging the whole assembly.
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
 	r, err := e.req(ctx, http.MethodGet, fr.URL, headers)
 	if err != nil {
 		return 0, err
@@ -237,10 +242,19 @@ func (e *Engine) fetchFragment(ctx context.Context, f *os.File, fr Fragment, hea
 
 	buf := make([]byte, 128*1024)
 	off := fr.Start
+	maxN := fr.End - fr.Start + 1
 	var n int64
 	for {
 		nr, er := resp.Body.Read(buf)
 		if nr > 0 {
+			// Never write past this fragment's slot — an over-long response
+			// would otherwise clobber the next fragment's bytes.
+			if n+int64(nr) > maxN {
+				nr = int(maxN - n)
+			}
+			if nr <= 0 {
+				return n, nil
+			}
 			if _, ew := f.WriteAt(buf[:nr], off); ew != nil {
 				return n, ew
 			}

@@ -80,3 +80,21 @@ func TestIsPageHost(t *testing.T) {
 		}
 	}
 }
+
+func TestMediaCDNNotPageHost(t *testing.T) {
+	cdn := []string{
+		"v16-webapp-prime.tiktok.com", "v19-webapp.tiktok.com",
+		"p16-sign-va.tiktokcdn.com", "v3-web.tiktokcdn-us.com",
+		"api.tiktokv.com", "scontent.cdninstagram.com",
+	}
+	for _, h := range cdn {
+		if IsPageHost(h) {
+			t.Errorf("%s should NOT be a page host", h)
+		}
+	}
+	for _, h := range []string{"www.tiktok.com", "tiktok.com", "m.tiktok.com", "www.youtube.com"} {
+		if !IsPageHost(h) {
+			t.Errorf("%s SHOULD be a page host", h)
+		}
+	}
+}

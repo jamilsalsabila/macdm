@@ -37,28 +37,30 @@ struct Job: Codable, Identifiable {
     var resumable: Bool?
     var quality: String?
     var conns: [ConnStat]?
+    var segments: Int?
+    var segments_done: Int?
 
     var percent: Double {
         total_bytes > 0 ? min(100, Double(done_bytes) / Double(total_bytes) * 100) : 0
     }
     var isRunning: Bool { status == "downloading" || status == "probing" || status == "queued" }
 
-    /// While an adaptive stream downloads, total/done are SEGMENT counts, not
-    /// bytes — finalize() swaps them for the real file size on completion.
+    /// An adaptive stream in flight: total/done bytes are estimates and the real
+    /// segment counts are in `segments` / `segments_done`.
     var streamingSegments: Bool {
-        (kind == "hls" || kind == "dash") && status != "completed"
+        (kind == "hls" || kind == "dash") && status != "completed" && (segments ?? 0) > 0
     }
     var sizeText: String {
-        if streamingSegments { return "\(total_bytes) segments" }
+        if streamingSegments { return "\(segments ?? 0) segments" }
         return total_bytes > 0 ? Fmt.bytes(total_bytes) : "—"
     }
     var etaText: String {
-        guard status == "downloading", !streamingSegments else { return "—" }
+        guard status == "downloading", total_bytes > 0, speed_bps > 0 else { return "—" }
         return Fmt.eta(done: done_bytes, total: total_bytes, bps: speed_bps)
     }
     var doneText: String {
         if streamingSegments {
-            return "\(done_bytes) / \(total_bytes) segments  (\(String(format: "%.1f", percent))%)"
+            return "\(segments_done ?? 0) / \(segments ?? 0) segments  (\(String(format: "%.1f", percent))%)"
         }
         return total_bytes > 0
             ? "\(Fmt.bytes(done_bytes))  (\(String(format: "%.1f", percent))%)"
@@ -102,11 +104,13 @@ struct ToolsInfo: Codable {
         var path: String
         var version: String
         var latest: String
+        var channel: String?
         var update_available: Bool
     }
     var ffmpeg: Tool
     var ytdlp: YtDlp
     var auto_update: Bool
+    var cookies_from: String?
 }
 
 private struct UpdateResult: Codable { var ok: Bool; var from: String; var to: String }
@@ -140,6 +144,10 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     var onProposal: ((Proposal) -> Void)?
 
     private(set) var jobs: [String: Job] = [:]
+    /// When the current SSE stream connected. The daemon replays every existing
+    /// job (old completed ones included) right after connect; we suppress
+    /// "download complete" notifications for a moment so that backlog is silent.
+    private var streamConnectedAt = Date.distantPast
     private var sseTask: URLSessionDataTask?
     private lazy var session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
     private var buffer = Data()
@@ -222,7 +230,7 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     func updateYtDlp(_ done: @escaping (_ newVersion: String?, _ error: String?) -> Void) {
         var req = URLRequest(url: base.appendingPathComponent("api/tools/ytdlp/update"))
         req.httpMethod = "POST"
-        req.timeoutInterval = 180
+        req.timeoutInterval = 600 // ~35 MB download; slow links need room
         URLSession.shared.dataTask(with: req) { data, resp, err in
             DispatchQueue.main.async {
                 if let err = err { done(nil, err.localizedDescription); return }
@@ -272,7 +280,14 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
         guard let t = try? JSONDecoder().decode(TypeOnly.self, from: json) else { return }
         switch t.type {
         case "job":
-            if let e = try? JSONDecoder().decode(JobEnvelope.self, from: json) { jobs[e.job.id] = e.job }
+            if let e = try? JSONDecoder().decode(JobEnvelope.self, from: json) {
+                let prev = jobs[e.job.id]
+                jobs[e.job.id] = e.job
+                if e.job.status == "completed", prev?.status != "completed",
+                   Date().timeIntervalSince(streamConnectedAt) > 3 {
+                    DispatchQueue.main.async { Notifier.downloadFinished(e.job) }
+                }
+            }
         case "delete":
             if let e = try? JSONDecoder().decode(JobEnvelope.self, from: json) { jobs.removeValue(forKey: e.job.id) }
         case "proposal":
@@ -291,6 +306,7 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     func urlSession(_ s: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         if let h = response as? HTTPURLResponse, h.statusCode == 200 {
+            streamConnectedAt = Date()
             DispatchQueue.main.async { self.onConnection?(true) }
         }
         completionHandler(.allow)

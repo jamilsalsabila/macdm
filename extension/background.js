@@ -140,6 +140,49 @@ const FRAGMENT_HOSTS = /(^|\.)(fbcdn\.net|cdninstagram\.com|fbsbx\.com|akamaized
 const caught = new Map();
 // tabId -> Map(baseUrlKey -> {frags: Map(start -> {url,start,end}), ...})
 const fragGroups = new Map();
+// tabId -> "origin+pathname" of the last real page load (SPA-nav guard)
+const tabPath = new Map();
+
+// MV3 kills the service worker after ~30s idle, wiping the maps above. Mirror
+// them to chrome.storage.session (in-memory, per-browser-session, survives the
+// SW restart) so a catch is still there when the user clicks a minute later.
+let saveTimer = null;
+function persistState() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    const c = {};
+    for (const [tab, m] of caught) c[tab] = [...m.values()];
+    const g = {};
+    for (const [tab, m] of fragGroups) {
+      g[tab] = [...m.values()].map((grp) => ({
+        key: grp.key, category: grp.category, headers: grp.headers,
+        title: grp.title, total: grp.total, ts: grp.ts,
+        frags: [...grp.frags.values()],
+      }));
+    }
+    try { chrome.storage.session.set({ macdm_caught: c, macdm_frags: g }); } catch {}
+  }, 400);
+}
+async function restoreState() {
+  try {
+    const { macdm_caught, macdm_frags } = await chrome.storage.session.get(["macdm_caught", "macdm_frags"]);
+    for (const tab in macdm_caught || {}) {
+      const m = new Map();
+      for (const it of macdm_caught[tab]) m.set(it.url, it);
+      caught.set(Number(tab), m);
+    }
+    for (const tab in macdm_frags || {}) {
+      const m = new Map();
+      for (const grp of macdm_frags[tab]) {
+        const frags = new Map();
+        for (const f of grp.frags) frags.set(f.start, f);
+        m.set(grp.key, { ...grp, frags });
+      }
+      fragGroups.set(Number(tab), m);
+    }
+  } catch {}
+}
+const stateReady = restoreState();
 
 const RANGEY_MEDIA_CT = /^(video|audio)\//i;
 
@@ -196,7 +239,15 @@ function parseFragment(rawUrl, ct, status, contentRange, reqRange) {
 // requestId -> { headers } captured at send time, consumed at response time
 const pendingHeaders = new Map();
 
-const RELEVANT_HEADERS = ["referer", "origin", "user-agent", "cookie", "authorization"];
+// Headers forwarded to the daemon so it can replay the request the way the
+// browser made it. TikTok / ByteDance CDNs 403 a request that is missing the
+// fetch-metadata + client-hint headers, so mirror those too.
+const RELEVANT_HEADERS = [
+  "referer", "origin", "user-agent", "cookie", "authorization",
+  "accept", "accept-language",
+  "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+  "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+];
 // Range is captured for fragment detection but NOT forwarded as a job header
 // (the daemon sets its own ranges).
 const CAPTURE_HEADERS = [...RELEVANT_HEADERS, "range"];
@@ -259,6 +310,7 @@ chrome.webRequest.onHeadersReceived.addListener(
       g.set(frag.key, grp);
       fragGroups.set(details.tabId, g);
       updateBadge(details.tabId);
+      persistState();
       return;
     }
 
@@ -280,19 +332,32 @@ chrome.webRequest.onHeadersReceived.addListener(
       });
       caught.set(details.tabId, tabMap);
       updateBadge(details.tabId);
+      persistState();
     }
   },
   { urls: ["<all_urls>"] },
   respSpec
 );
 
-chrome.tabs.onRemoved.addListener((tabId) => { caught.delete(tabId); fragGroups.delete(tabId); });
+chrome.tabs.onRemoved.addListener((tabId) => {
+  caught.delete(tabId);
+  fragGroups.delete(tabId);
+  tabPath.delete(tabId);
+  persistState();
+});
+// Clear a tab's catch list only on a real page load — not on every SPA history
+// change (YouTube/TikTok fire onUpdated with a new url on each in-app nav, which
+// would wipe the media we just caught for the current clip).
 chrome.tabs.onUpdated.addListener((tabId, info) => {
-  if (info.status === "loading" && info.url) {
-    caught.delete(tabId);
-    fragGroups.delete(tabId);
-    updateBadge(tabId);
-  }
+  if (info.status !== "loading" || !info.url) return;
+  let key = info.url;
+  try { const u = new URL(info.url); key = u.origin + u.pathname; } catch {}
+  if (tabPath.get(tabId) === key) return; // same document, SPA nav — keep the catches
+  tabPath.set(tabId, key);
+  caught.delete(tabId);
+  fragGroups.delete(tabId);
+  updateBadge(tabId);
+  persistState();
 });
 
 function updateBadge(tabId) {
@@ -300,6 +365,28 @@ function updateBadge(tabId) {
   chrome.action.setBadgeBackgroundColor({ color: "#0a84ff" });
   chrome.action.setBadgeText({ tabId, text: n ? String(n) : "" });
 }
+
+// bestCaughtMedia returns the most useful sniffed media item for a tab: prefer a
+// progressive video by size, then any video, then audio. Used when there is no
+// page URL yt-dlp can resolve (or the site's yt-dlp extractor is unreliable).
+function bestCaughtMedia(tabId) {
+  const items = [...(caught.get(tabId)?.values() || [])];
+  const rank = (it) => (it.category === "video" ? 2 : it.category === "audio" ? 1 : 0);
+  let best = null;
+  for (const it of items) {
+    if (rank(it) === 0) continue;
+    if (!best ||
+        rank(it) > rank(best) ||
+        (rank(it) === rank(best) && (it.size || 0) > (best.size || 0))) {
+      best = it;
+    }
+  }
+  return best;
+}
+
+// yt-dlp's extractors for these hosts are frequently broken between releases —
+// a directly sniffed progressive URL is more reliable there.
+const YTDLP_UNRELIABLE = /(^|\.)(tiktok\.com)$/i;
 
 // Collapse a fragment group into a caught-item-like record for the popup.
 function groupToItem(grp) {
@@ -358,6 +445,7 @@ async function startDownload({ url, headers, referer, title, conns, fragments })
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
+    await stateReady; // the SW may have just restarted — wait for the maps
     switch (msg.type) {
       case "getCaught": {
         const tabId = msg.tabId ?? sender.tab?.id;
@@ -387,17 +475,73 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case "downloadPage": {
         const tab = sender.tab;
-        // Prefer a real permalink (…/reel/<id>/, …/p/<id>/, …/watch?v=…): yt-dlp
-        // resolves those to the FULL muxed video+audio at best quality. The
-        // byte-range fragment groups we collect on Instagram/Facebook are per
-        // *track* (video and audio arrive as separate progressive files), so
-        // assembling one group alone gives a silent clip or audio only — use
-        // that path only when there is no usable page URL.
-        // The content script's best guess, else the tab's own URL (often the
-        // permalink when the user opened the video directly).
+        const tabHost = (() => { try { return new URL(tab?.url || "").hostname; } catch { return ""; } })();
+
+        // yt-dlp resolves a real permalink to the FULL muxed video+audio at best
+        // quality — prefer it, EXCEPT on hosts whose yt-dlp extractor is
+        // currently flaky (TikTok). There, use the progressive URL the content
+        // script pulled from the page JSON (msg.ttURL) — the sniffed <video>
+        // URL is a session-locked DASH stream that 403s. Replay the browser's
+        // captured session headers (Cookie / ttwid / UA) with it.
+        const sniffed = bestCaughtMedia(tab?.id);
+        if (YTDLP_UNRELIABLE.test(tabHost)) {
+          const referer = tab?.url || "https://www.tiktok.com/";
+          const cookie = sniffed?.headers &&
+            (sniffed.headers.Cookie || sniffed.headers.cookie);
+          const vibe = {
+            "Sec-Fetch-Dest": "video", "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "same-site", "Accept": "*/*", "Referer": referer,
+          };
+          // 1. The page's own declared URL for THIS clip (tiktok-main.js matched
+          //    it to the current video id) — direct download, session headers
+          //    replayed. Correct clip AND no yt-dlp.
+          if (msg.ttURL) {
+            sendResponse(await startDownload({
+              url: msg.ttURL, referer, title: msg.title || tab?.title,
+              headers: Object.assign({}, cookie ? { Cookie: cookie } : {}, vibe),
+            }));
+            break;
+          }
+          // 2. The permalink → yt-dlp. Slower, but guaranteed to be the clip the
+          //    address bar is on (the sniffed stream URL can be a *previous*
+          //    video from scrolling the feed).
+          if (msg.ttPermalink) {
+            sendResponse(await startDownload({
+              url: msg.ttPermalink, referer, title: msg.title || tab?.title,
+            }));
+            break;
+          }
+          // 3. Fall back to the sniffed stream URL + captured cookies.
+          if (sniffed && cookie) {
+            sendResponse(await startDownload({
+              url: sniffed.url, referer, title: msg.title || tab?.title,
+              headers: Object.assign({}, sniffed.headers, vibe),
+            }));
+            break;
+          }
+          sendResponse({ ok: false, error: "let the video play for a second, then try again" });
+          break;
+        }
+
         const pageURL = isExtractableURL(msg.url) ? msg.url
                       : isExtractableURL(tab?.url) ? tab.url
                       : null;
+
+        // YouTube genuinely needs yt-dlp (signature descrambling). Everywhere
+        // else, a directly sniffed media stream (Neat DM style) is faster and
+        // dodges yt-dlp being slow/throttled — try it first, fall back to the
+        // page URL.
+        const isYouTube = /(^|\.)(youtube\.com|youtu\.be)$/i.test(tabHost);
+        if (!isYouTube && sniffed) {
+          sendResponse(await startDownload({
+            url: sniffed.url,
+            headers: sniffed.headers,
+            referer: tab?.url,
+            title: msg.title || tab?.title,
+          }));
+          break;
+        }
+
         if (pageURL) {
           sendResponse(await startDownload({
             url: pageURL,
@@ -406,6 +550,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }));
           break;
         }
+
+        if (sniffed) {
+          sendResponse(await startDownload({
+            url: sniffed.url,
+            headers: sniffed.headers,
+            referer: tab?.url,
+            title: msg.title || tab?.title,
+          }));
+          break;
+        }
+
         const g = fragGroups.get(tab?.id);
         if (g && g.size) {
           // Pick the biggest group by total bytes — that is the video track.

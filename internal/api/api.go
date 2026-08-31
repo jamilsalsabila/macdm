@@ -7,6 +7,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -73,21 +74,26 @@ type toolInfo struct {
 
 func (s *Server) getTools(w http.ResponseWriter, r *http.Request) {
 	set := s.mgr.Tools()
-	yt, _ := tools.CheckYtDlp(r.Context(), set) // best-effort; local fields still filled
+	cfg := config.Load()
+	tctx, tcancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer tcancel()
+	yt, _ := tools.CheckYtDlp(tctx, set, cfg.YtDlpChannelName()) // best-effort; local fields always filled
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ffmpeg": toolInfo{Path: set.Ffmpeg, Version: tools.Version(r.Context(), set.Ffmpeg)},
 		"ytdlp": map[string]any{
 			"path":             yt.Path,
 			"version":          yt.Version,
 			"latest":           yt.Latest,
+			"channel":          yt.Channel,
 			"update_available": yt.UpdateAvailable,
 		},
-		"auto_update": config.Load().AutoUpdateYtDlpEnabled(),
+		"auto_update":  cfg.AutoUpdateYtDlpEnabled(),
+		"cookies_from": cfg.CookiesFrom,
 	})
 }
 
 func (s *Server) updateYtDlp(w http.ResponseWriter, r *http.Request) {
-	from, to, err := tools.UpdateYtDlp(r.Context())
+	from, to, err := tools.UpdateYtDlp(r.Context(), config.Load().YtDlpChannelName())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
@@ -99,6 +105,7 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AutoUpdateYtDlp *bool   `json:"auto_update_ytdlp"`
 		CookiesFrom     *string `json:"cookies_from"`
+		YtDlpChannel    *string `json:"ytdlp_channel"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -110,6 +117,9 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CookiesFrom != nil {
 		c.CookiesFrom = *req.CookiesFrom
+	}
+	if req.YtDlpChannel != nil && (*req.YtDlpChannel == "stable" || *req.YtDlpChannel == "nightly") {
+		c.YtDlpChannel = *req.YtDlpChannel
 	}
 	if err := config.Save(c); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
@@ -302,16 +312,29 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 	notices, cancelN := s.mgr.Subscribe()
 	defer cancelN()
 
+	// write returns false once the socket is dead so we stop instead of spinning
+	// on a half-open connection until r.Context() eventually notices.
+	write := func(format string, a ...any) bool {
+		if _, err := fmt.Fprintf(w, format, a...); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
 	// Prime the client with the current state.
 	for _, j := range s.mgr.Store().List() {
-		writeSSE(w, store.Event{Type: "job", Job: j})
+		if !write("data: %s\n\n", mustJSON(store.Event{Type: "job", Job: j})) {
+			return
+		}
 	}
 	for _, p := range s.mgr.PendingProposals() {
-		writeRawSSE(w, "proposal", p)
+		if !write("data: {\"type\":\"proposal\",\"proposal\":%s}\n\n", mustJSON(p)) {
+			return
+		}
 	}
-	flusher.Flush()
 
-	keepalive := time.NewTicker(15 * time.Second)
+	keepalive := time.NewTicker(10 * time.Second)
 	defer keepalive.Stop()
 
 	for {
@@ -322,21 +345,32 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return // watcher dropped (slow client) — let it reconnect
 			}
-			writeSSE(w, ev)
-			flusher.Flush()
+			if !write("data: %s\n\n", mustJSON(ev)) {
+				return
+			}
 		case n, ok := <-notices:
 			if !ok {
 				notices = nil // disable this case; a nil channel never fires (no spin)
 				continue
 			}
 			// n.Data is already JSON; forward it under n.Type.
-			fmt.Fprintf(w, "data: {\"type\":%q,\"%s\":%s}\n\n", n.Type, noticeKey(n.Type), n.Data)
-			flusher.Flush()
+			if !write("data: {\"type\":%q,\"%s\":%s}\n\n", n.Type, noticeKey(n.Type), n.Data) {
+				return
+			}
 		case <-keepalive.C:
-			fmt.Fprint(w, ": keepalive\n\n")
-			flusher.Flush()
+			if !write(": keepalive\n\n") {
+				return
+			}
 		}
 	}
+}
+
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "null"
+	}
+	return string(b)
 }
 
 func noticeKey(t string) string {
@@ -344,14 +378,6 @@ func noticeKey(t string) string {
 		return "proposal"
 	}
 	return "data"
-}
-
-func writeRawSSE(w http.ResponseWriter, typ string, v any) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return
-	}
-	fmt.Fprintf(w, "data: {\"type\":%q,\"%s\":%s}\n\n", typ, noticeKey(typ), b)
 }
 
 func statusFor(err error) int {
@@ -369,14 +395,6 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]string{"error": err.Error()})
-}
-
-func writeSSE(w http.ResponseWriter, ev store.Event) {
-	b, err := json.Marshal(ev)
-	if err != nil {
-		return
-	}
-	fmt.Fprintf(w, "data: %s\n\n", b)
 }
 
 func isLoopback(remoteAddr string) bool {

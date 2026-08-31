@@ -33,12 +33,17 @@ type Config struct {
 	Timeout   time.Duration // per-request timeout (not whole-download)
 }
 
+// DefaultUserAgent is a current Chrome UA. Many CDNs 403 a non-browser
+// User-Agent, and the sniffer often can't capture the real one (MV3 hides it on
+// some requests), so this is the fallback for a job that carries none.
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
 // Default returns sensible values matching IDM-class defaults.
 func Default() Config {
 	return Config{
 		MaxConns:  8,
 		MinChunk:  1 << 20, // 1 MiB
-		UserAgent: "MacDM/0.1 (+https://example.invalid/macdm)",
+		UserAgent: DefaultUserAgent,
 		Timeout:   30 * time.Second,
 	}
 }
@@ -79,18 +84,12 @@ type Engine struct {
 	client *http.Client
 }
 
-// New builds an Engine. A nil client gets a default with generous connection limits.
+// New builds an Engine. The HTTP client uses a Chrome-disguised TLS handshake
+// (see utls.go) and preserves auth headers across same-site redirects.
 func New(cfg Config) *Engine {
-	tr := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConns:        64,
-		MaxIdleConnsPerHost: 32,
-		MaxConnsPerHost:     0,
-		ForceAttemptHTTP2:   true,
-	}
 	return &Engine{
 		cfg:    cfg,
-		client: &http.Client{Transport: tr},
+		client: newHTTPClient(),
 	}
 }
 
@@ -125,9 +124,27 @@ func (e *Engine) ProbeURL(ctx context.Context, rawurl string, headers map[string
 	if err != nil {
 		return nil, err
 	}
+
+	// Some CDNs (TikTok/ByteDance) 403 a 1-byte range probe but serve the full
+	// GET fine — retry once without the Range header before giving up.
+	if resp.StatusCode == http.StatusForbidden {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		r2, e2 := e.req(ctx, http.MethodGet, rawurl, headers)
+		if e2 != nil {
+			return nil, e2
+		}
+		if resp, err = e.client.Do(r2); err != nil {
+			return nil, err
+		}
+	}
 	defer func() { _, _ = io.Copy(io.Discard, resp.Body); resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		snip, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		if s := strings.TrimSpace(collapseWS(string(snip))); s != "" {
+			return nil, fmt.Errorf("probe: %s — %s", resp.Status, s)
+		}
 		return nil, fmt.Errorf("probe: unexpected status %s", resp.Status)
 	}
 
@@ -197,6 +214,8 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 	case multi && sc.Conns != conns:
 		// connection count changed since last run — re-split the missing bytes
 		sc.replanConns(conns, e.cfg.MinChunk)
+	default:
+		sc.reserveSteal(conns) // resuming an earlier plan — keep stealing headroom
 	}
 
 	f, err := os.OpenFile(spec.Dest+".part", os.O_RDWR|os.O_CREATE, 0o644)
@@ -252,10 +271,15 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 	defer progStop()
 	if onProgress != nil {
 		go func() {
-			t := time.NewTicker(500 * time.Millisecond)
+			t := time.NewTicker(250 * time.Millisecond)
 			defer t.Stop()
 			last := done.Load()
 			lastT := time.Now()
+			// Exponential moving average over the 250ms samples (~a few seconds
+			// of memory). Without it the rate jumps to 0 whenever a tick lands
+			// between bursts — common when connections are mid-retry.
+			var avg float64
+			seeded := false
 			for {
 				select {
 				case <-progCtx.Done():
@@ -263,13 +287,18 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 				case now := <-t.C:
 					cur := done.Load()
 					dt := now.Sub(lastT).Seconds()
-					var sp int64
+					var inst float64
 					if dt > 0 {
-						sp = int64(float64(cur-last) / dt)
+						inst = float64(cur-last) / dt
 					}
 					last, lastT = cur, now
+					if !seeded && inst > 0 {
+						avg, seeded = inst, true
+					} else {
+						avg += 0.15 * (inst - avg)
+					}
 					onProgress(Progress{
-						DoneBytes: cur, TotalBytes: pr.TotalBytes, SpeedBps: sp,
+						DoneBytes: cur, TotalBytes: pr.TotalBytes, SpeedBps: int64(avg),
 						NumConns: conns, Resumable: pr.AcceptRanges, Conns: snapshotConns(),
 					})
 				}
@@ -298,15 +327,84 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 		}
 	}()
 
-	// fetch every not-yet-complete chunk, at most `conns` in flight
-	g := newGroup(conns)
-	for i := range sc.Chunks {
-		c := &sc.Chunks[i]
-		if c.remaining() <= 0 {
-			continue
+	// Work-stealing pool: `conns` workers, each pulls the next unstarted chunk;
+	// once every chunk is claimed, an idle worker splits the biggest in-flight
+	// chunk and takes its second half, so one slow connection can't leave a long
+	// tail while the others sit idle.
+	minChunk := e.cfg.MinChunk
+	if minChunk < 1 {
+		minChunk = 1 << 20
+	}
+	var stealMu sync.Mutex
+	next := func() *chunk {
+		if ctx.Err() != nil {
+			return nil
 		}
+		stealMu.Lock()
+		defer stealMu.Unlock()
+		scMu.Lock()
+		defer scMu.Unlock()
+
+		// 1. a chunk nobody has started yet
+		for i := range sc.Chunks {
+			c := &sc.Chunks[i]
+			if c.Status == "" && c.remaining() > 0 {
+				c.Status = "connecting" // claim it
+				return c
+			}
+		}
+		// 2. otherwise split the biggest range still in flight
+		if len(sc.Chunks) >= cap(sc.Chunks) {
+			return nil
+		}
+		var best *chunk
+		var bestLeft int64
+		for i := range sc.Chunks {
+			c := &sc.Chunks[i]
+			if c.End < 0 || c.Status == "done" {
+				continue
+			}
+			if left := c.End - (c.Start + c.Done) + 1; left > bestLeft {
+				bestLeft, best = left, c
+			}
+		}
+		if best == nil || bestLeft < 2*minChunk {
+			return nil
+		}
+		mid := best.Start + best.Done + bestLeft/2
+		origEnd := best.End
+		best.End = mid - 1 // the owner notices via the re-read in fetchChunkOnce
+		sc.Chunks = append(sc.Chunks, chunk{
+			Index: len(sc.Chunks), Start: mid, End: origEnd, Status: "connecting",
+		})
+		return &sc.Chunks[len(sc.Chunks)-1]
+	}
+
+	scMu.Lock()
+	pending := 0
+	for i := range sc.Chunks {
+		if sc.Chunks[i].remaining() > 0 {
+			pending++
+		}
+	}
+	scMu.Unlock()
+	workers := conns
+	if workers > pending {
+		workers = pending
+	}
+
+	g := newGroup(conns)
+	for w := 0; w < workers; w++ {
 		g.go_(func() error {
-			return e.fetchChunk(ctx, spec, f, c, &scMu, &done)
+			for {
+				c := next()
+				if c == nil {
+					return nil
+				}
+				if err := e.fetchChunk(ctx, spec, f, c, &scMu, &done); err != nil {
+					return err
+				}
+			}
 		})
 	}
 	err = g.wait()
@@ -358,25 +456,34 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 }
 
 func (e *Engine) fetchChunk(ctx context.Context, spec DownloadSpec, f *os.File, c *chunk, scMu *sync.Mutex, done *atomic.Int64) error {
-	const maxTries = 5
+	// Give up only after this many attempts in a row moved *zero* bytes. An
+	// attempt that transferred something resets the counter — a flaky link that
+	// drops every few MB still finishes instead of failing the whole job at 5.
+	const maxDeadTries = 6
+	// Absolute ceiling for a pathological "1 byte then drop" server.
+	const maxTries = 200
 	var lastErr error
+	dead := 0
 	for try := 0; try < maxTries; try++ {
-		if try > 0 {
+		if dead > 0 {
+			back := time.Duration(dead*dead) * 500 * time.Millisecond
+			if back > 15*time.Second {
+				back = 15 * time.Second
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(try*try) * 500 * time.Millisecond):
+			case <-time.After(back):
 			}
 		}
 		n, err := e.fetchChunkOnce(ctx, spec, f, c, scMu, done)
-		_ = n
 		if err == nil {
 			setChunkStatus(scMu, c, "done")
 			return nil
 		}
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 			setChunkStatus(scMu, c, "idle")
-			return err
+			return context.Canceled
 		}
 		if errors.Is(err, errRangeIgnored) {
 			// Not retryable: the server does not honour Range. Propagate so Run
@@ -384,8 +491,15 @@ func (e *Engine) fetchChunk(ctx context.Context, spec DownloadSpec, f *os.File, 
 			setChunkStatus(scMu, c, "done")
 			return err
 		}
+		// errStalled and ordinary network errors land here. c.Done kept whatever
+		// bytes arrived, so the next attempt resumes from there.
 		lastErr = err
 		setChunkStatus(scMu, c, "error")
+		if n > 0 {
+			dead = 0
+		} else if dead++; dead >= maxDeadTries {
+			break
+		}
 	}
 	return fmt.Errorf("chunk %d: %w", c.Index, lastErr)
 }
@@ -396,26 +510,72 @@ func setChunkStatus(scMu *sync.Mutex, c *chunk, s string) {
 	scMu.Unlock()
 }
 
+// stallTimeout aborts a chunk read that has gone this long without a byte — a
+// half-open connection would otherwise hang until the whole job is cancelled.
+// A var (not const) so tests can shorten it.
+var stallTimeout = 30 * time.Second
+
+// errStalled marks a chunk that timed out mid-transfer (retryable).
+var errStalled = errors.New("connection stalled")
+
 func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.File, c *chunk, scMu *sync.Mutex, done *atomic.Int64) (int64, error) {
+	// A watchdog context: cancelled by the parent (pause/shutdown) OR by us when
+	// no data has arrived for stallTimeout.
+	rctx, rcancel := context.WithCancel(ctx)
+	defer rcancel()
+	var lastRead atomic.Int64
+	lastRead.Store(time.Now().UnixNano())
+	stalled := make(chan struct{})
+	go func() {
+		t := time.NewTicker(5 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-rctx.Done():
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, lastRead.Load())) > stallTimeout {
+					close(stalled)
+					rcancel()
+					return
+				}
+			}
+		}
+	}()
+	wasStalled := func() bool {
+		select {
+		case <-stalled:
+			return true
+		default:
+			return false
+		}
+	}
+
+	scMu.Lock()
 	start := c.Start + c.Done
+	chunkEnd := c.End
+	scMu.Unlock()
 	setChunkStatus(scMu, c, "connecting")
-	r, err := e.req(ctx, http.MethodGet, spec.URL, spec.Headers)
+	r, err := e.req(rctx, http.MethodGet, spec.URL, spec.Headers)
 	if err != nil {
 		return 0, err
 	}
-	single := c.Start == 0 && c.End < 0
+	single := c.Start == 0 && chunkEnd < 0
 	if !single {
-		r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, c.End))
+		r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, chunkEnd))
 	}
 
 	resp, err := e.client.Do(r)
 	if err != nil {
+		if wasStalled() {
+			return 0, errStalled
+		}
 		return 0, err
 	}
 	defer resp.Body.Close()
 
 	if single && resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("expected 200, got %s", resp.Status)
+		return 0, statusErr(resp)
 	}
 	// The server ignored our Range header and sent the whole body (some CDNs —
 	// Instagram/Facebook — range via query params instead). If this is the
@@ -426,20 +586,39 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 		return 0, errRangeIgnored
 	}
 	if !single && resp.StatusCode != http.StatusPartialContent && !fullBody {
-		return 0, fmt.Errorf("expected 206, got %s", resp.Status)
+		return 0, statusErr(resp)
 	}
 
 	setChunkStatus(scMu, c, "receiving")
 	buf := make([]byte, 128*1024)
 	var written int64
 	off := start
-	limit := int64(-1)
-	if !single && !fullBody {
-		limit = c.length()
-	}
+	ranged := !single && !fullBody
 	for {
 		nr, er := resp.Body.Read(buf)
+
+		// Re-read the chunk end every iteration: work-stealing may have shrunk
+		// it (another worker took the tail), and a compliant 206 never
+		// over-delivers but a broken server might — either way, one byte past
+		// the boundary corrupts the neighbouring range.
+		endNow := int64(-1)
+		if ranged {
+			scMu.Lock()
+			endNow = c.End
+			scMu.Unlock()
+		}
+
 		if nr > 0 {
+			if endNow >= 0 {
+				room := endNow - off + 1
+				if room <= 0 {
+					return written, nil // range fully taken — nothing left to do
+				}
+				if int64(nr) > room {
+					nr = int(room)
+				}
+			}
+			lastRead.Store(time.Now().UnixNano())
 			if _, ew := f.WriteAt(buf[:nr], off); ew != nil {
 				return written, ew
 			}
@@ -454,13 +633,22 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 			if fullBody {
 				return written, errRangeIgnored // Run: mark siblings done, we have it all
 			}
+			// EOF before the (possibly shrunk) end means the server dropped the
+			// connection early. Marking it "done" would rename a corrupt .part;
+			// return errStalled so fetchChunk retries and resumes from c.Done.
+			if endNow >= 0 && off <= endNow {
+				return written, errStalled
+			}
 			return written, nil
 		}
 		if er != nil {
+			if wasStalled() {
+				return written, errStalled
+			}
 			return written, er
 		}
-		if limit >= 0 && c.Done >= limit {
-			return written, nil
+		if endNow >= 0 && off > endNow {
+			return written, nil // chunk complete
 		}
 	}
 }
@@ -482,6 +670,22 @@ func filenameFrom(rawurl, contentDisposition string) string {
 		}
 	}
 	return "download"
+}
+
+// collapseWS turns any run of whitespace into a single space — for squeezing a
+// server error page into one readable line.
+func collapseWS(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// statusErr builds an error from a non-2xx response, appending a snippet of the
+// body (CDN 403 pages usually say *why* — bad signature, expired, region).
+func statusErr(resp *http.Response) error {
+	snip, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+	if s := collapseWS(string(snip)); s != "" {
+		return fmt.Errorf("%s — %s", resp.Status, s)
+	}
+	return fmt.Errorf("unexpected status %s", resp.Status)
 }
 
 func sanitizeName(s string) string {
