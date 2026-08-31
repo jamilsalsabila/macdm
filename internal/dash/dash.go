@@ -1,8 +1,9 @@
 // Package dash parses an MPD manifest far enough to download a static (VOD)
 // presentation: it picks the best video Representation and the best audio
 // Representation, expands their SegmentTemplate (with $Number$/$Time$ and an
-// optional SegmentTimeline) into segment URLs, downloads them, and concatenates
-// each track's init + media segments into one file per track.
+// optional SegmentTimeline) or their SegmentList into segment URLs, downloads
+// them, and concatenates each track's init + media segments into one file per
+// track.
 //
 // ContentProtection (Widevine/PlayReady/cenc) is detected and refused.
 // Live manifests (type="dynamic") are refused too.
@@ -45,6 +46,7 @@ type adaptationSet struct {
 	ContentType       string           `xml:"contentType,attr"`
 	BaseURL           string           `xml:"BaseURL"`
 	SegmentTemplate   *segmentTemplate `xml:"SegmentTemplate"`
+	SegmentList       *segmentList     `xml:"SegmentList"`
 	ContentProtection []struct {
 		SchemeIdURI string `xml:"schemeIdUri,attr"`
 	} `xml:"ContentProtection"`
@@ -60,6 +62,7 @@ type representation struct {
 	MimeType          string           `xml:"mimeType,attr"`
 	BaseURL           string           `xml:"BaseURL"`
 	SegmentTemplate   *segmentTemplate `xml:"SegmentTemplate"`
+	SegmentList       *segmentList     `xml:"SegmentList"`
 	ContentProtection []struct {
 		SchemeIdURI string `xml:"schemeIdUri,attr"`
 	} `xml:"ContentProtection"`
@@ -80,6 +83,21 @@ type segmentTimeline struct {
 		D int64  `xml:"d,attr"`
 		R int    `xml:"r,attr"`
 	} `xml:"S"`
+}
+
+// segmentList is the explicit-list addressing mode: every segment is named by
+// its own <SegmentURL>, rather than derived from a template.
+type segmentList struct {
+	Duration       int `xml:"duration,attr"`
+	Timescale      int `xml:"timescale,attr"`
+	Initialization *struct {
+		SourceURL string `xml:"sourceURL,attr"`
+		Range     string `xml:"range,attr"`
+	} `xml:"Initialization"`
+	SegmentURLs []struct {
+		Media      string `xml:"media,attr"`
+		MediaRange string `xml:"mediaRange,attr"`
+	} `xml:"SegmentURL"`
 }
 
 // Track is one resolved, downloadable stream (video or audio).
@@ -298,6 +316,10 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 			if st == nil {
 				st = as.SegmentTemplate
 			}
+			sl := rep.SegmentList
+			if sl == nil {
+				sl = as.SegmentList
+			}
 
 			var t *Track
 			switch {
@@ -305,6 +327,12 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 				rbase := resolveBase(asbase, rep.BaseURL)
 				var err error
 				if t, err = expandTemplate(rbase, rep, st); err != nil {
+					return nil, err
+				}
+			case sl != nil:
+				rbase := resolveBase(asbase, rep.BaseURL)
+				var err error
+				if t, err = expandList(rbase, rep, sl); err != nil {
 					return nil, err
 				}
 			case rep.BaseURL != "":
@@ -320,7 +348,7 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 					Bandwidth: rep.Bandwidth,
 				}
 			default:
-				continue // SegmentList not supported yet
+				continue // no addressing mode we can resolve
 			}
 			t.Kind = kind
 			switch kind {
@@ -342,6 +370,51 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 	return out, nil
 }
 
+// expandList resolves SegmentList addressing: an explicit <SegmentURL> per
+// segment instead of a template. Each media attribute is resolved against the
+// Representation's base, and <Initialization sourceURL> gives the init segment.
+func expandList(base *url.URL, rep representation, sl *segmentList) (*Track, error) {
+	t := &Track{Codecs: rep.Codecs, Height: rep.Height, Bandwidth: rep.Bandwidth}
+
+	if sl.Initialization != nil {
+		switch {
+		case sl.Initialization.SourceURL != "":
+			t.InitURL = resolveRef(base, sl.Initialization.SourceURL)
+		case sl.Initialization.Range != "":
+			// The init segment is a byte range of BaseURL. Track carries plain
+			// URLs with no ranges, so this would silently fetch the whole file
+			// as "init" and corrupt the concatenation.
+			return nil, fmt.Errorf("SegmentList with a byte-range Initialization is not supported")
+		}
+	}
+
+	for _, su := range sl.SegmentURLs {
+		if su.Media == "" {
+			// mediaRange-only: every segment is a byte range of one file. Same
+			// problem as above — refuse rather than assemble garbage.
+			return nil, fmt.Errorf("SegmentList addressed by mediaRange is not supported")
+		}
+		t.Segments = append(t.Segments, resolveRef(base, su.Media))
+	}
+	if len(t.Segments) == 0 {
+		return nil, fmt.Errorf("SegmentList has no SegmentURL entries")
+	}
+	return t, nil
+}
+
+// resolveRef resolves a possibly-relative reference against base, leaving it
+// untouched when it will not parse.
+func resolveRef(base *url.URL, ref string) string {
+	u, err := url.Parse(strings.TrimSpace(ref))
+	if err != nil {
+		return ref
+	}
+	if base == nil {
+		return u.String()
+	}
+	return base.ResolveReference(u).String()
+}
+
 func expandTemplate(base *url.URL, rep representation, st *segmentTemplate) (*Track, error) {
 	subst := func(s string, number int, time int64) string {
 		s = strings.ReplaceAll(s, "$RepresentationID$", rep.ID)
@@ -351,12 +424,7 @@ func expandTemplate(base *url.URL, rep representation, st *segmentTemplate) (*Tr
 		s = strings.ReplaceAll(s, "$$", "$")
 		return s
 	}
-	resolve := func(ref string) string {
-		if u, err := url.Parse(ref); err == nil {
-			return base.ResolveReference(u).String()
-		}
-		return ref
-	}
+	resolve := func(ref string) string { return resolveRef(base, ref) }
 
 	t := &Track{
 		Codecs:    rep.Codecs,

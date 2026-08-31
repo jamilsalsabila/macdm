@@ -86,10 +86,10 @@ These are design choices, not bugs — MacDM stops where a download manager shou
   and muxed in, so a video-only variant no longer downloads silent. Alternate
   *subtitle* renditions are still not merged, and `#EXT-X-BYTERANGE` and
   re-timing across `#EXT-X-DISCONTINUITY` are not handled.
-- **DASH** supports only `SegmentTemplate` (with `SegmentTimeline`) and
-  single-file `BaseURL`. `SegmentList`, `SegmentBase`-index-only multi-segment,
-  and multi-`Period` concatenation are not supported. Embedded subtitles are
-  not fetched.
+- **DASH** supports `SegmentTemplate` (with `SegmentTimeline`), `SegmentList`
+  addressed by `media` URLs, and single-file `BaseURL`. Byte-range addressing
+  (`SegmentURL@mediaRange`, `SegmentBase`-index-only) is refused rather than
+  mis-assembled, and multi-`Period` concatenation is not supported.
 - **Subtitle tracks are never downloaded**, for either HLS or DASH.
 - **MV3 header visibility.** Chrome does not reliably expose `Cookie`,
   `User-Agent`, or `Authorization` on caught requests, so a *direct* media
