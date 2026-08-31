@@ -1,4 +1,8 @@
 /bin/
+# stray binaries from `go build ./cmd/...` run at the repo root
+/macdm
+/macdmd
+/macdm-nmhost
 /app/.build/
 /app/.tools/
 /dist/
