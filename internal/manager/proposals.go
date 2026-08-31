@@ -32,7 +32,10 @@ type Proposal struct {
 	Referer   string               `json:"referer,omitempty"`
 	Headers   map[string]string    `json:"headers,omitempty"`
 	Formats   []store.FormatChoice `json:"formats,omitempty"`
-	CreatedAt time.Time            `json:"created_at"`
+	// Language choices the extractor found, for the dialog's pickers.
+	AudioLangs []string  `json:"audio_langs,omitempty"`
+	SubLangs   []string  `json:"sub_langs,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // AcceptOptions are the choices the dialog collects.
@@ -229,6 +232,8 @@ func (m *Manager) enrichProposal(id, rawurl string, headers map[string]string) {
 	p.Resumable = pr.Resumable
 	p.DRM = pr.DRM
 	p.Formats = pr.Formats
+	p.AudioLangs = pr.AudioLangs
+	p.SubLangs = pr.SubLangs
 	if pr.Filename != "" {
 		p.Filename = pr.Filename
 	}

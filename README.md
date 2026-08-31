@@ -94,8 +94,9 @@ These are design choices, not bugs — MacDM stops where a download manager shou
   Byte-range addressing (`SegmentURL@mediaRange`, `SegmentBase`-index-only) is
   refused rather than mis-assembled.
 - **Extractor (yt-dlp) downloads** can pick a dubbed audio track and write
-  subtitles: set *Audio language* and *Subtitle languages* in Settings (e.g.
-  `id` and `id,en`). Subtitles land as `.srt` sidecars, and the merged audio is
+  subtitles. The New Download dialog lists what the video actually offers —
+  those rows are hidden when there is nothing to choose — and Settings holds a
+  default (e.g. `id` and `id,en`) for downloads that skip the dialog. Subtitles land as `.srt` sidecars, and the merged audio is
   tagged with its real language. Left blank, yt-dlp picks audio by bitrate —
   which on a multi-language video is not necessarily the original.
 - **Subtitles** from HLS/DASH are saved as a sidecar `.vtt` next to the video (named

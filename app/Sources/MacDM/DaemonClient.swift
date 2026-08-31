@@ -81,6 +81,8 @@ struct Proposal: Codable, Identifiable {
     var drm: Bool
     var probing: Bool?
     var formats: [FormatChoice]?
+    var audio_langs: [String]?
+    var sub_langs: [String]?
 }
 
 /// Result of POST /api/probe.
@@ -94,6 +96,8 @@ struct ProbeResult: Codable {
     var drm: Bool
     var live: Bool
     var formats: [FormatChoice]?
+    var audio_langs: [String]?
+    var sub_langs: [String]?
     var note: String?
 }
 
@@ -184,8 +188,11 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
 
     func add(url: String, dest: String? = nil, conns: Int? = nil, formatID: String? = nil,
              quality: String? = nil, filename: String? = nil,
+             audioLang: String? = nil, subLangs: String? = nil,
              completion: ((Result<Job, Error>) -> Void)? = nil) {
         var body: [String: Any] = ["url": url]
+        if let a = audioLang, !a.isEmpty { body["audio_lang"] = a }
+        if let sl = subLangs, !sl.isEmpty { body["subtitle_langs"] = sl }
         if let n = filename, !n.isEmpty { body["filename"] = n }
         if let d = dest { body["dest"] = d }
         if let c = conns { body["conns"] = c }
@@ -233,8 +240,11 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     /// straight away instead of waiting for it to turn up over SSE.
     func accept(_ proposalID: String, dest: String?, filename: String?, conns: Int,
                 formatID: String?, quality: String?,
+                audioLang: String? = nil, subLangs: String? = nil,
                 completion: ((Job?) -> Void)? = nil) {
         var body: [String: Any] = ["conns": conns]
+        if let a = audioLang, !a.isEmpty { body["audio_lang"] = a }
+        if let s = subLangs, !s.isEmpty { body["subtitle_langs"] = s }
         if let d = dest { body["dest"] = d }
         if let f = filename { body["filename"] = f }
         if let fid = formatID { body["format_id"] = fid }

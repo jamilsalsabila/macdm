@@ -29,7 +29,11 @@ type ProbeResult struct {
 	DRM       bool                 `json:"drm"`
 	Live      bool                 `json:"live"`
 	Formats   []store.FormatChoice `json:"formats,omitempty"`
-	Note      string               `json:"note,omitempty"`
+	// Languages the extractor found: dubbed soundtracks and channel-provided
+	// subtitles. Empty when the site offers no choice.
+	AudioLangs []string `json:"audio_langs,omitempty"`
+	SubLangs   []string `json:"sub_langs,omitempty"`
+	Note       string   `json:"note,omitempty"`
 }
 
 // Probe inspects a URL without downloading. It is best-effort: network hiccups
@@ -68,6 +72,8 @@ func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]s
 		}
 		res.Title = info.Title
 		res.Live = info.IsLive
+		res.AudioLangs = info.AudioLanguages()
+		res.SubLangs = info.SubtitleLanguages()
 		if fs := info.QualityChoices(); len(fs) > 0 {
 			res.Formats = fs
 		}

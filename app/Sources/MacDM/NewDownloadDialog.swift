@@ -15,6 +15,14 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
     private let urlField = NSTextField(labelWithString: "")
     private let categoryField = NSTextField(labelWithString: "")
     private let qualityMenu = NSPopUpButton()
+    private let audioMenu = NSPopUpButton()
+    private let subsMenu = NSPopUpButton()
+    /// Language rows are hidden unless the video actually offers a choice, so a
+    /// normal download is not cluttered with two useless menus.
+    private var audioRow: NSStackView?
+    private var subsRow: NSStackView?
+    private var audioCodes: [String] = []
+    private var subCodes: [String] = []
     private let connStepper = NSStepper()
     private let connLabel = NSTextField(labelWithString: "")
     private let dlButton = NSButton()
@@ -64,6 +72,7 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
         win.center()
         build()
         rebuildQualityMenu()
+        rebuildLanguageMenus()
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -133,6 +142,8 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
             labelled("Save to:", folderRow),
             labelled("Category:", categoryField),
             labelled("Quality:", qualityMenu),
+            { let r = labelled("Audio language:", audioMenu); audioRow = r; return r }(),
+            { let r = labelled("Subtitles:", subsMenu); subsRow = r; return r }(),
             labelled("Connections:", connRow),
             labelled("URL:", urlField),
         ]
@@ -159,6 +170,8 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
             stack.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
             nameField.widthAnchor.constraint(equalToConstant: 320),
             qualityMenu.widthAnchor.constraint(equalToConstant: 250),
+            audioMenu.widthAnchor.constraint(equalToConstant: 250),
+            subsMenu.widthAnchor.constraint(equalToConstant: 250),
             btns.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         win.contentView = root
@@ -180,11 +193,58 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
             if !p.resumable { connStepper.integerValue = 1; connLabel.stringValue = "1" }
         }
         rebuildQualityMenu()
+        rebuildLanguageMenus()
         if p.drm {
             window?.title = "Cannot download — DRM protected"
             dlButton.isEnabled = false
             laterButton.isEnabled = false
         }
+    }
+
+    /// Fills the language menus from what the probe found. Both rows stay
+    /// hidden when the site offers no alternatives — most videos have one
+    /// soundtrack and no subtitles, and empty pickers only confuse.
+    private func rebuildLanguageMenus() {
+        audioCodes = latest.audio_langs ?? []
+        subCodes = latest.sub_langs ?? []
+
+        let keepAudio = audioMenu.indexOfSelectedItem
+        audioMenu.removeAllItems()
+        audioMenu.addItem(withTitle: "Default")
+        for c in audioCodes { audioMenu.addItem(withTitle: languageName(c)) }
+        if keepAudio > 0 && keepAudio < audioMenu.numberOfItems {
+            audioMenu.selectItem(at: keepAudio)
+        }
+        audioRow?.isHidden = audioCodes.isEmpty
+
+        let keepSubs = subsMenu.indexOfSelectedItem
+        subsMenu.removeAllItems()
+        subsMenu.addItem(withTitle: "None")
+        for c in subCodes { subsMenu.addItem(withTitle: languageName(c)) }
+        if keepSubs > 0 && keepSubs < subsMenu.numberOfItems {
+            subsMenu.selectItem(at: keepSubs)
+        }
+        subsRow?.isHidden = subCodes.isEmpty
+
+        window?.setContentSize(window?.contentView?.fittingSize ?? .zero)
+    }
+
+    /// "id" -> "Indonesian (id)". Falls back to the raw tag when macOS has no
+    /// name for it, so an unusual code is still selectable.
+    private func languageName(_ code: String) -> String {
+        let name = Locale.current.localizedString(forIdentifier: code)
+            ?? Locale.current.localizedString(forLanguageCode: code)
+        return name.map { "\($0) (\(code))" } ?? code
+    }
+
+    /// The chosen tags, or nil for "leave it to the Settings default".
+    private var chosenAudioLang: String? {
+        let i = audioMenu.indexOfSelectedItem
+        return i > 0 && i - 1 < audioCodes.count ? audioCodes[i - 1] : nil
+    }
+    private var chosenSubLangs: String? {
+        let i = subsMenu.indexOfSelectedItem
+        return i > 0 && i - 1 < subCodes.count ? subCodes[i - 1] : nil
     }
 
     private func rebuildQualityMenu() {
@@ -271,7 +331,8 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
             // collected here and then dropped, so a rename silently did nothing.
             DaemonClient.shared.add(url: latest.url, dest: folder, conns: connStepper.integerValue,
                                     formatID: f?.id, quality: f?.label,
-                                    filename: name.isEmpty ? nil : name) { result in
+                                    filename: name.isEmpty ? nil : name,
+                                    audioLang: chosenAudioLang, subLangs: chosenSubLangs) { result in
                 showProgress(try? result.get())
             }
         } else {
@@ -279,6 +340,7 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
                                        filename: name.isEmpty ? nil : name,
                                        conns: connStepper.integerValue,
                                        formatID: f?.id, quality: f?.label,
+                                       audioLang: chosenAudioLang, subLangs: chosenSubLangs,
                                        completion: showProgress)
         }
         dismiss()
