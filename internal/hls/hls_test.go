@@ -5,6 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"fmt"
+	"macdm/internal/ratelimit"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -737,5 +738,112 @@ b.ts
 	}
 	if !strings.HasSuffix(p.Segments[0].URL, "/a.ts") || !strings.HasSuffix(p.Segments[1].URL, "/b.ts") {
 		t.Fatalf("segment URLs wrong: %+v", p.Segments)
+	}
+}
+
+// Extracting in-band captions costs a full decode pass, so it must only run
+// when the manifest actually declares them.
+func TestClosedCaptionsForDeclaration(t *testing.T) {
+	m := `#EXTM3U
+#EXT-X-MEDIA:TYPE=CLOSED-CAPTIONS,GROUP-ID="cc",NAME="English",LANGUAGE="en",INSTREAM-ID="CC1"
+#EXT-X-STREAM-INF:BANDWIDTH=1,CLOSED-CAPTIONS="cc"
+withcc.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2,CLOSED-CAPTIONS=NONE
+nocc.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3
+silent.m3u8
+`
+	p, err := parse(m, mustURL("https://x/y/m.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Variants) != 3 {
+		t.Fatalf("want 3 variants, got %d", len(p.Variants))
+	}
+	if ok, lang := p.ClosedCaptionsFor(p.Variants[0]); !ok || lang != "en" {
+		t.Errorf("declared variant: got ok=%v lang=%q, want true/en", ok, lang)
+	}
+	// NONE is an explicit "there are none" — decoding it would be wasted work.
+	if ok, _ := p.ClosedCaptionsFor(p.Variants[1]); ok {
+		t.Error(`CLOSED-CAPTIONS=NONE must report no captions`)
+	}
+	// No attribute at all: nothing claimed, so nothing to decode for.
+	if ok, _ := p.ClosedCaptionsFor(p.Variants[2]); ok {
+		t.Error("a variant with no CLOSED-CAPTIONS attribute must report none")
+	}
+}
+
+// A named group with no matching #EXT-X-MEDIA still claims captions.
+func TestClosedCaptionsForUndescribedGroup(t *testing.T) {
+	p, _ := parse("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1,CLOSED-CAPTIONS=\"cc\"\nv.m3u8\n",
+		mustURL("https://x/y/m.m3u8"))
+	ok, lang := p.ClosedCaptionsFor(p.Variants[0])
+	if !ok || lang != "" {
+		t.Fatalf("got ok=%v lang=%q, want true with no language", ok, lang)
+	}
+}
+
+// Segments never touch the download engine, so a speed limit that lived only
+// there would apply to plain files and be ignored by exactly the streams people
+// most want to hold back. The ceiling must reach Assemble too, and must hold
+// across its concurrent workers rather than per worker.
+func TestAssembleRespectsTheSpeedLimit(t *testing.T) {
+	const (
+		segments = 16
+		segSize  = 32 << 10 // 512 KB in total
+		limit    = 512 << 10
+	)
+	mux := http.NewServeMux()
+	blob := []byte(strings.Repeat("x", segSize))
+	for i := 0; i < segments; i++ {
+		mux.HandleFunc(fmt.Sprintf("/s%d.ts", i), func(w http.ResponseWriter, r *http.Request) {
+			w.Write(blob)
+		})
+	}
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	var pl strings.Builder
+	pl.WriteString("#EXTM3U\n#EXT-X-TARGETDURATION:2\n")
+	for i := 0; i < segments; i++ {
+		fmt.Fprintf(&pl, "#EXTINF:2.0,\n%s/s%d.ts\n", srv.URL, i)
+	}
+	pl.WriteString("#EXT-X-ENDLIST\n")
+	mux.HandleFunc("/i.m3u8", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, pl.String()) })
+
+	run := func(t *testing.T, bps int64) time.Duration {
+		t.Helper()
+		c := NewClient(srv.Client(), nil)
+		c.SetLimiter(ratelimit.New(bps))
+		p, err := c.Parse(context.Background(), srv.URL+"/i.m3u8")
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := filepath.Join(t.TempDir(), "o.ts")
+		start := time.Now()
+		if err := c.Assemble(context.Background(), p,
+			AssembleOptions{Dir: t.TempDir(), OutFile: out, Conns: 6}, nil); err != nil {
+			t.Fatal(err)
+		}
+		elapsed := time.Since(start)
+		fi, err := os.Stat(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size() != segments*segSize {
+			t.Fatalf("assembled %d bytes, want %d — throttling changed the output",
+				fi.Size(), segments*segSize)
+		}
+		return elapsed
+	}
+
+	// 512 KB through a 512 KB/s ceiling: about a second, six workers or not.
+	limited := run(t, limit)
+	if limited < 500*time.Millisecond {
+		t.Errorf("512 KB through a 512 KB/s ceiling took %v — the limit is per worker, or never reached Assemble", limited)
+	}
+	unlimited := run(t, 0)
+	if unlimited > limited/2 {
+		t.Errorf("unlimited run took %v vs %v limited; the comparison proves nothing", unlimited, limited)
 	}
 }

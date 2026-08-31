@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"macdm/internal/ratelimit"
 	"macdm/internal/store"
 	"macdm/internal/subs"
 )
@@ -43,6 +44,10 @@ type Variant struct {
 	// SubtitleGroup is the SUBTITLES="..." attribute, naming the group of
 	// #EXT-X-MEDIA subtitle renditions offered with this variant.
 	SubtitleGroup string
+	// CaptionGroup is CLOSED-CAPTIONS="...", naming a group of in-band
+	// CEA-608/708 caption declarations. The literal NONE means the variant
+	// carries none, which is worth knowing: it saves a decode pass.
+	CaptionGroup string
 }
 
 // Rendition is one #EXT-X-MEDIA entry — an alternative audio (or subtitle)
@@ -97,6 +102,36 @@ type Playlist struct {
 	InitOffset int64
 	InitLength int64
 	Key        *Key // playlist-level key (may be overridden per segment)
+}
+
+// ClosedCaptionsFor reports whether v declares in-band CEA-608/708 captions,
+// and the language if one is named.
+//
+// Extracting captions means decoding the whole video (they live in the video
+// bitstream, not a track), which costs about a minute per hour of footage — far
+// too much to spend on every download when almost none carry them. The manifest
+// says so up front, so ask it.
+func (p *Playlist) ClosedCaptionsFor(v Variant) (declared bool, lang string) {
+	if v.CaptionGroup == "" || strings.EqualFold(v.CaptionGroup, "NONE") {
+		return false, ""
+	}
+	for i := range p.Media {
+		r := &p.Media[i]
+		if strings.EqualFold(r.Type, "CLOSED-CAPTIONS") && r.GroupID == v.CaptionGroup {
+			return true, firstNonEmptyStr(r.Language, r.Name)
+		}
+	}
+	// The group is named but not described. The variant still claims captions.
+	return true, ""
+}
+
+func firstNonEmptyStr(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
 
 // SubtitlesFor returns the subtitle rendition to download for v, or nil when
@@ -218,7 +253,15 @@ func (p *Playlist) BestVariant() (Variant, bool) {
 type Client struct {
 	http    *http.Client
 	headers map[string]string
+	// limiter paces segment transfers. Segments do not go through the download
+	// engine, so without this a speed limit would apply to plain files and be
+	// ignored by exactly the streams people most want to hold back. nil means
+	// no limit.
+	limiter *ratelimit.Bucket
 }
+
+// SetLimiter shares a transfer ceiling with this client. Pass nil for none.
+func (c *Client) SetLimiter(b *ratelimit.Bucket) { c.limiter = b }
 
 func NewClient(h *http.Client, headers map[string]string) *Client {
 	if h == nil {
@@ -368,6 +411,7 @@ func parse(text string, base *url.URL) (*Playlist, error) {
 				Codecs:        strings.Trim(attrs["CODECS"], `"`),
 				AudioGroup:    attrs["AUDIO"],
 				SubtitleGroup: attrs["SUBTITLES"],
+				CaptionGroup:  attrs["CLOSED-CAPTIONS"],
 			}
 
 		case strings.HasPrefix(ln, "#EXT-X-KEY:"):
@@ -686,6 +730,9 @@ func (c *Client) fetchToFile(ctx context.Context, rawurl, dst string, seg Segmen
 			}
 			if onBytes != nil {
 				onBytes(n)
+			}
+			if werr := c.limiter.Wait(ctx, n); werr != nil {
+				return werr
 			}
 		}
 		if rerr == io.EOF {

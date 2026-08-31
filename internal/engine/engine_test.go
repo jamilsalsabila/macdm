@@ -5,7 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"macdm/internal/diskspace"
+	"macdm/internal/ratelimit"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -626,5 +629,151 @@ func TestSidecarMatching(t *testing.T) {
 	// A size change always invalidates: it is a different resource.
 	if idc.matches("http://a/x?sig=2", "vid|123", &Probe{TotalBytes: 101}) {
 		t.Error("a different size must not match")
+	}
+}
+
+// A download larger than the disk must be refused up front. Creating the .part
+// file at its final size looks like a reservation but is not: APFS makes it
+// sparse and holds back nothing, so without an explicit check the transfer
+// starts happily and dies once the volume actually fills.
+func TestRefusesDownloadLargerThanTheDisk(t *testing.T) {
+	dir := t.TempDir()
+	avail, err := diskspace.Avail(dir)
+	if err != nil {
+		t.Skip("cannot measure the volume:", err)
+	}
+
+	// Advertise a size far past the free space. The body is never served: the
+	// point is that the check fires before any of it is requested.
+	huge := avail * 4
+	// The probe itself asks for "bytes=0-0" to learn whether ranges work; that
+	// one byte is not a transfer. Anything wider is.
+	var bulkRequests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.FormatInt(huge, 10))
+		if rng := r.Header.Get("Range"); r.Method == http.MethodGet && rng != "" && rng != "bytes=0-0" {
+			bulkRequests.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	e := New(Config{MaxConns: 4, MinChunk: 1 << 20, Timeout: 10 * time.Second})
+	dest := filepath.Join(dir, "toobig.bin")
+
+	_, err = e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil)
+	if err == nil {
+		t.Fatal("a download four times the size of the disk must be refused")
+	}
+	var de *diskspace.Error
+	if !errors.As(err, &de) {
+		t.Fatalf("want a *diskspace.Error naming the shortfall, got %T: %v", err, err)
+	}
+	if n := bulkRequests.Load(); n != 0 {
+		t.Errorf("%d bulk requests were made; the refusal must come before any transfer", n)
+	}
+	if _, err := os.Stat(dest + ".part"); !os.IsNotExist(err) {
+		t.Error("no .part file should be left behind by a download that never started")
+	}
+}
+
+// The check must weigh only the bytes still missing, or resuming a download
+// that already occupies most of the free space would be refused for space it
+// is itself using.
+func TestSpaceCheckCountsOnlyMissingBytes(t *testing.T) {
+	body := make([]byte, 3<<20)
+	rand.New(rand.NewSource(9)).Read(body)
+	srv := httptest.NewServer(serveBlob(body, true, 0))
+	defer srv.Close()
+
+	e := New(Config{MaxConns: 3, MinChunk: 512 << 10, Timeout: 10 * time.Second})
+	dest := filepath.Join(t.TempDir(), "blob.bin")
+
+	if _, err := e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	// Run again over the finished file: nothing is missing, so nothing is needed.
+	if _, err := e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+		t.Fatalf("re-running a complete download must not be refused for space: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if sha(got) != sha(body) {
+		t.Fatal("content changed")
+	}
+}
+
+// A ceiling has to hold across a whole download, including one split over
+// several connections — the case where a naive per-connection limiter would
+// quietly deliver four times the number the user typed.
+func TestSpeedLimitPacesAMultiConnectionDownload(t *testing.T) {
+	const size = 1 << 20
+	body := make([]byte, size)
+	rand.New(rand.NewSource(21)).Read(body)
+	srv := httptest.NewServer(serveBlob(body, true, 0))
+	defer srv.Close()
+
+	run := func(t *testing.T, limit int64) time.Duration {
+		t.Helper()
+		e := New(Config{
+			MaxConns: 4, MinChunk: 64 << 10, Timeout: 10 * time.Second,
+			Limiter: ratelimit.New(limit),
+		})
+		dest := filepath.Join(t.TempDir(), "blob.bin")
+		start := time.Now()
+		if _, err := e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		elapsed := time.Since(start)
+		got, _ := os.ReadFile(dest)
+		if sha(got) != sha(body) {
+			t.Fatal("throttling must not corrupt the file")
+		}
+		return elapsed
+	}
+
+	// 1 MB through a 1 MB/s ceiling: about a second, four connections or not.
+	limited := run(t, size)
+	if limited < 600*time.Millisecond {
+		t.Errorf("1 MB through a 1 MB/s ceiling took %v — the limit is per connection, or not applied at all", limited)
+	}
+	if limited > 4*time.Second {
+		t.Errorf("1 MB through a 1 MB/s ceiling took %v — far slower than asked", limited)
+	}
+
+	// The same download unlimited, to show the delay is the limiter and not
+	// the loopback server being slow.
+	unlimited := run(t, 0)
+	if unlimited > limited/2 {
+		t.Errorf("unlimited run took %v vs %v limited; the comparison proves nothing", unlimited, limited)
+	}
+}
+
+// Pausing must not wait out a token debt: at 4 KB/s the remaining bytes would
+// take many minutes, and cancelling has to return promptly regardless.
+func TestSpeedLimitDoesNotDelayPause(t *testing.T) {
+	body := make([]byte, 4<<20)
+	rand.New(rand.NewSource(22)).Read(body)
+	srv := httptest.NewServer(serveBlob(body, true, 0))
+	defer srv.Close()
+
+	e := New(Config{
+		MaxConns: 2, MinChunk: 1 << 20, Timeout: 10 * time.Second,
+		Limiter: ratelimit.New(4 << 10),
+	})
+	dest := filepath.Join(t.TempDir(), "blob.bin")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err := e.Run(ctx, DownloadSpec{URL: srv.URL, Dest: dest}, nil)
+	if err == nil {
+		t.Fatal("a cancelled download should report the cancellation")
+	}
+	if el := time.Since(start); el > 5*time.Second {
+		t.Errorf("cancelling a throttled download took %v; pause must not wait for tokens", el)
 	}
 }

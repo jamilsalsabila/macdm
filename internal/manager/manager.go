@@ -14,7 +14,10 @@ import (
 	"sync"
 	"time"
 
+	"macdm/internal/diskspace"
 	"macdm/internal/engine"
+	"macdm/internal/ratelimit"
+	"macdm/internal/schedule"
 	"macdm/internal/sniff"
 	"macdm/internal/store"
 	"macdm/internal/tools"
@@ -29,6 +32,13 @@ type Config struct {
 	WorkDir     string // scratch space for stream segments; "" => DownloadDir/.macdm-work
 	Engine      engine.Config
 	MaxActive   int // concurrent downloads; 0 => 4
+	// SpeedLimitBps caps the total transfer rate across every running job.
+	// 0 means no limit. Changeable at runtime via SetSpeedLimit.
+	SpeedLimitBps int64
+
+	// Schedule confines downloading to a recurring window. The zero value is
+	// disabled, and downloads run whenever they like.
+	Schedule    schedule.Window
 	Tools       tools.Set
 	CookiesFrom string // browser for yt-dlp --cookies-from-browser; "" => none
 
@@ -46,6 +56,16 @@ type Manager struct {
 	eng   *engine.Engine
 	slots chan struct{}
 	hub   *proposalHub
+	// limiter is the single transfer ceiling shared by the engine and the
+	// stream clients, so one figure covers everything at once.
+	limiter *ratelimit.Bucket
+
+	// schedMu guards sched only. Kept apart from mu, which start() already
+	// holds while it reads the window.
+	schedMu  sync.RWMutex
+	sched    schedule.Window
+	stopOnce sync.Once
+	stopped  chan struct{}
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc
@@ -59,16 +79,131 @@ func New(cfg Config, st *store.Store) *Manager {
 	if cfg.WorkDir == "" {
 		cfg.WorkDir = filepath.Join(cfg.DownloadDir, ".macdm-work")
 	}
+	// One bucket for everything: the engine's connections and the stream
+	// clients' segment fetches all draw from it, so the ceiling the user sets
+	// is the total, not a per-download allowance.
+	limiter := ratelimit.New(cfg.SpeedLimitBps)
+	cfg.Engine.Limiter = limiter
 	m := &Manager{
 		cfg:     cfg,
 		st:      st,
+		limiter: limiter,
 		eng:     engine.New(cfg.Engine),
 		slots:   make(chan struct{}, cfg.MaxActive),
 		running: map[string]context.CancelFunc{},
 		hub:     newProposalHub(),
+		sched:   cfg.Schedule,
+		stopped: make(chan struct{}),
 	}
 	m.pruneWorkDirs()
+	go m.watchSchedule(30 * time.Second)
 	return m
+}
+
+// watchSchedule opens and closes the download window as the clock passes it.
+// Polling rather than timing the next edge keeps it right across a laptop sleep
+// or a clock change, where a timer set hours ago would fire at the wrong moment.
+func (m *Manager) watchSchedule(every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.stopped:
+			return
+		case <-t.C:
+			m.applySchedule()
+		}
+	}
+}
+
+// applySchedule stops what may not run now and starts what may.
+func (m *Manager) applySchedule() {
+	w := m.Schedule()
+	if !w.Enabled {
+		return
+	}
+	if w.Active(time.Now()) {
+		m.releaseHeld()
+		return
+	}
+	for _, j := range m.st.List() {
+		if !holdable(j) {
+			continue
+		}
+		// Mark the hold before cancelling: the download goroutine sets the
+		// status on its way out, and must not find the flag missing.
+		//
+		// The status is re-checked inside the update because a job can finish
+		// in the moment between being listed and being held, and dragging a
+		// completed download back out of "completed" would be a lie.
+		held := false
+		_, _ = m.st.Update(j.ID, func(jj *store.Job) {
+			if !holdable(jj) {
+				return
+			}
+			jj.ScheduledHold = true
+			jj.Error = "waiting for the download window (" + w.String() + ")"
+			held = true
+		})
+		if held {
+			_ = m.Pause(j.ID)
+		}
+	}
+}
+
+// holdable reports whether a job is doing work the scheduler may interrupt.
+func holdable(j *store.Job) bool {
+	switch j.Status {
+	case store.StatusDownloading, store.StatusProbing, store.StatusQueued:
+		return true
+	}
+	return false
+}
+
+// SetSchedule replaces the download window while the daemon runs, and applies
+// it at once rather than at the next tick — someone who has just switched the
+// scheduler off expects their downloads back immediately.
+func (m *Manager) SetSchedule(w schedule.Window) {
+	m.schedMu.Lock()
+	m.sched = w
+	m.schedMu.Unlock()
+
+	if !w.Enabled || w.Active(time.Now()) {
+		// Release anything the scheduler is holding, including when it has just
+		// been turned off entirely.
+		m.releaseHeld()
+		return
+	}
+	m.applySchedule()
+}
+
+// releaseHeld restarts the jobs the scheduler put down — and only those. A job
+// the user paused stays paused, and a job that finished while held is simply
+// unmarked rather than downloaded a second time.
+func (m *Manager) releaseHeld() {
+	for _, j := range m.st.List() {
+		if !j.ScheduledHold {
+			continue
+		}
+		if j.Status == store.StatusCompleted {
+			_, _ = m.st.Update(j.ID, func(jj *store.Job) { jj.ScheduledHold = false })
+			continue
+		}
+		m.start(j.ID)
+	}
+}
+
+// Schedule reports the window in force.
+func (m *Manager) Schedule() schedule.Window {
+	m.schedMu.RLock()
+	defer m.schedMu.RUnlock()
+	return m.sched
+}
+
+// scheduleBlocks reports whether the window is shut right now.
+func (m *Manager) scheduleBlocks() (schedule.Window, bool) {
+	w := m.Schedule()
+	return w, w.Enabled && !w.Active(time.Now())
 }
 
 // pruneWorkDirs deletes per-job scratch dirs that no live job owns. Dirs
@@ -92,6 +227,16 @@ func (m *Manager) pruneWorkDirs() {
 		}
 	}
 }
+
+// SetSpeedLimit changes the total transfer ceiling in bytes per second while
+// downloads are running; 0 removes it. Takes effect on the next block of bytes,
+// with no restart and no interruption to jobs in flight.
+func (m *Manager) SetSpeedLimit(bytesPerSec int64) {
+	m.limiter.SetLimit(bytesPerSec)
+}
+
+// SpeedLimit reports the current ceiling in bytes per second; 0 means none.
+func (m *Manager) SpeedLimit() int64 { return m.limiter.Limit() }
 
 // Store exposes the underlying store for the API layer (list/get/watch).
 func (m *Manager) Store() *store.Store { return m.st }
@@ -238,11 +383,24 @@ func (m *Manager) Pause(id string) error {
 	m.mu.Lock()
 	cancel, ok := m.running[id]
 	m.mu.Unlock()
-	if !ok {
-		return errors.New("job is not running")
+	if ok {
+		cancel()
+		return nil
 	}
-	cancel()
-	return nil
+	// A job the scheduler is holding is not running, but pausing it still means
+	// something: leave it alone when the window opens.
+	if j, err := m.st.Get(id); err == nil && j.ScheduledHold {
+		_, _ = m.st.Update(id, func(jj *store.Job) {
+			jj.ScheduledHold = false
+			jj.Error = ""
+			// A job that finished under a stray hold keeps its result.
+			if jj.Status != store.StatusCompleted {
+				jj.Status = store.StatusPaused
+			}
+		})
+		return nil
+	}
+	return errors.New("job is not running")
 }
 
 // Remove pauses (if running) and deletes a job. The finished/partial file in the
@@ -254,6 +412,21 @@ func (m *Manager) Remove(id string) error {
 }
 
 func (m *Manager) start(id string) {
+	// Gated here rather than at each caller: Add, Accept, Resume and the
+	// scheduler's own sweep all funnel through this one place.
+	if w, blocked := m.scheduleBlocks(); blocked {
+		_, _ = m.st.Update(id, func(j *store.Job) {
+			if j.Status == store.StatusCompleted {
+				return
+			}
+			j.ScheduledHold = true
+			j.Status = store.StatusPaused
+			j.SpeedBps = 0
+			j.Error = "waiting for the download window (" + w.String() + ")"
+		})
+		return
+	}
+
 	m.mu.Lock()
 	if _, busy := m.running[id]; busy {
 		m.mu.Unlock()
@@ -262,6 +435,14 @@ func (m *Manager) start(id string) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.running[id] = cancel
 	m.mu.Unlock()
+
+	// Running now, so it is no longer waiting on the clock.
+	_, _ = m.st.Update(id, func(j *store.Job) {
+		if j.ScheduledHold {
+			j.ScheduledHold = false
+			j.Error = ""
+		}
+	})
 
 	go func() {
 		defer func() {
@@ -574,6 +755,12 @@ func transientErr(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, errDRM) {
 		return false
 	}
+	// Running out of disk is permanent until the user frees some. Retrying
+	// changes nothing, and "connection lost — retrying" would misdescribe it.
+	var noSpace *diskspace.Error
+	if errors.As(err, &noSpace) {
+		return false
+	}
 	s := strings.ToLower(err.Error())
 	permanent := []string{
 		"drm", "unsupported url", "byte-range fragment", "not a downloadable",
@@ -592,7 +779,13 @@ func transientErr(err error) bool {
 func (m *Manager) setStatus(id, status, msg string) {
 	_, _ = m.st.Update(id, func(j *store.Job) {
 		j.Status = status
-		j.Error = msg
+		// A scheduler hold owns the note explaining itself. Cancelling a job
+		// makes its goroutine report "paused" with no message on the way out,
+		// which would wipe "waiting for the download window" the instant the
+		// scheduler wrote it. A real message still wins.
+		if !j.ScheduledHold || msg != "" {
+			j.Error = msg
+		}
 		if status != store.StatusDownloading {
 			j.SpeedBps = 0
 		}
@@ -611,6 +804,7 @@ func (m *Manager) fail(id, msg string) {
 // subprocess) and waits briefly for them to unwind. Call it before the process
 // exits so yt-dlp/ffmpeg children don't leak.
 func (m *Manager) Shutdown(wait time.Duration) {
+	m.stopOnce.Do(func() { close(m.stopped) })
 	m.mu.Lock()
 	for _, cancel := range m.running {
 		cancel()

@@ -286,6 +286,14 @@ type DownloadOptions struct {
 	// AutoSubs also accepts machine-generated captions when a requested
 	// language has no channel-provided subtitles.
 	AutoSubs bool
+	// LimitBps caps this yt-dlp process's transfer rate. 0 means no limit.
+	//
+	// yt-dlp is a separate process, so it cannot draw on the shared bucket the
+	// engine and stream clients use — it gets the whole ceiling to itself. With
+	// a direct download running alongside, the true total can therefore reach
+	// twice the figure. This path is only a fallback, so that is a fair trade
+	// against the alternative of it being unthrottled entirely.
+	LimitBps int64
 }
 
 // Result reports the finished file.
@@ -342,6 +350,9 @@ func (e *Extractor) Download(ctx context.Context, pageURL string, opt DownloadOp
 	}
 	if e.ffmpeg != "" {
 		args = append(args, "--ffmpeg-location", e.ffmpeg)
+	}
+	if opt.LimitBps > 0 {
+		args = append(args, "--limit-rate", strconv.FormatInt(opt.LimitBps, 10))
 	}
 	if opt.CookiesFrom != "" {
 		args = append(args, "--cookies-from-browser", opt.CookiesFrom)

@@ -21,13 +21,20 @@ final class SettingsWindowController: NSWindowController {
     private let subLangsField = NSTextField()
     private let autoSubsBox = NSButton(checkboxWithTitle: "Also accept auto-generated captions", target: nil, action: nil)
     private let audioLangField = NSTextField()
+    private let speedLimitField = NSTextField()
+    private let scheduleBox = NSButton(checkboxWithTitle: "Only download between", target: nil, action: nil)
+    private let startField = NSTextField()
+    private let stopField = NSTextField()
+    private let daysControl = NSSegmentedControl(labels: ["S", "M", "T", "W", "T", "F", "S"],
+                                                 trackingMode: .selectAny, target: nil, action: nil)
+    private let scheduleState = NSTextField(labelWithString: "")
 
     private let cookieBrowsers = ["none", "firefox", "chrome", "brave", "edge", "safari", "chromium", "vivaldi", "opera"]
 
     private var folder: String = (NSHomeDirectory() as NSString).appendingPathComponent("Downloads/MacDM")
 
     private convenience init() {
-        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 412),
                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
         win.title = "MacDM Settings"
         win.center()
@@ -100,6 +107,11 @@ final class SettingsWindowController: NSWindowController {
         autoSubsBox.target = self
         autoSubsBox.action = #selector(subtitleSettingsChanged)
 
+        speedLimitField.placeholderString = "0 = unlimited"
+        speedLimitField.target = self
+        speedLimitField.action = #selector(speedLimitChanged)
+        speedLimitField.widthAnchor.constraint(equalToConstant: 90).isActive = true
+
         audioLangField.placeholderString = "e.g. id — blank for default"
         audioLangField.target = self
         audioLangField.action = #selector(audioLangChanged)
@@ -111,6 +123,36 @@ final class SettingsWindowController: NSWindowController {
         let cookiesRow = NSStackView(views: [NSTextField(labelWithString: "Cookies from browser:"), cookiesPop])
         cookiesRow.spacing = 6
         for r in [subsRow, autoRow, audioRow] { r.spacing = 6 }
+
+        scheduleBox.target = self
+        scheduleBox.action = #selector(scheduleChanged)
+        for f in [startField, stopField] {
+            f.placeholderString = "HH:MM"
+            f.target = self
+            f.action = #selector(scheduleChanged)
+            f.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        }
+        daysControl.target = self
+        daysControl.action = #selector(scheduleChanged)
+        scheduleState.textColor = .tertiaryLabelColor
+        scheduleState.font = .systemFont(ofSize: 10)
+
+        let scheduleRow = NSStackView(views: [
+            scheduleBox, startField, NSTextField(labelWithString: "and"), stopField,
+        ])
+        scheduleRow.spacing = 6
+        let daysRow = NSStackView(views: [daysControl, scheduleState])
+        daysRow.spacing = 8
+        let scheduleBlock = NSStackView(views: [scheduleRow, daysRow])
+        scheduleBlock.orientation = .vertical
+        scheduleBlock.alignment = .leading
+        scheduleBlock.spacing = 6
+
+        let speedHint = NSTextField(labelWithString: "KB/s, shared by every download at once")
+        speedHint.textColor = .tertiaryLabelColor
+        speedHint.font = .systemFont(ofSize: 10)
+        let speedRow = NSStackView(views: [speedLimitField, speedHint])
+        speedRow.spacing = 6
 
         let sep = NSBox()
         sep.boxType = .separator
@@ -137,6 +179,8 @@ final class SettingsWindowController: NSWindowController {
         let stack = NSStackView(views: [
             labelled("Max. connections number:", connRow),
             labelled("Default download folder:", NSStackView(views: [folderLabel, change])),
+            labelled("Speed limit:", speedRow),
+            labelled("Schedule:", scheduleBlock),
             autoAccept,
             sep,
             labelled("Bundled tools:", toolsBox),
@@ -185,6 +229,17 @@ final class SettingsWindowController: NSWindowController {
             self.subLangsField.stringValue = info.subtitle_langs ?? ""
             self.autoSubsBox.state = (info.auto_subs ?? false) ? .on : .off
             self.audioLangField.stringValue = info.audio_lang ?? ""
+            let bps = info.speed_limit_bps ?? 0
+            self.speedLimitField.stringValue = bps > 0 ? "\(bps / 1024)" : ""
+            if let sc = info.schedule {
+                self.scheduleBox.state = sc.enabled ? .on : .off
+                self.startField.stringValue = sc.enabled ? sc.start : "02:00"
+                self.stopField.stringValue = sc.enabled ? sc.stop : "06:00"
+                for i in 0..<7 {
+                    self.daysControl.setSelected(sc.days.contains(i), forSegment: i)
+                }
+                self.updateScheduleState(enabled: sc.enabled, open: sc.enabled ? sc.open : nil)
+            }
             let cf = (info.cookies_from ?? "").lowercased()
             self.cookiesPop.selectItem(at: max(0, self.cookieBrowsers.firstIndex(of: cf.isEmpty ? "none" : cf) ?? 0))
         }
@@ -205,6 +260,66 @@ final class SettingsWindowController: NSWindowController {
             "subtitle_langs": subLangsField.stringValue.trimmingCharacters(in: .whitespaces),
             "auto_subs": autoSubsBox.state == .on,
         ])
+    }
+
+    /// The field is in KB/s because that is the unit people think in for a cap;
+    /// the daemon works in bytes per second. Anything unparseable means "no
+    /// limit", which is the safe reading of an empty or mistyped box.
+    @objc private func speedLimitChanged() {
+        let text = speedLimitField.stringValue.trimmingCharacters(in: .whitespaces)
+        let kb = max(0, Int64(text) ?? 0)
+        speedLimitField.stringValue = kb == 0 ? "" : "\(kb)"
+        DaemonClient.shared.setConfig(["speed_limit_bps": kb * 1024])
+    }
+
+    /// Times are validated by the daemon, which refuses anything that is not
+    /// HH:MM — a window saved from a typo would block every download until
+    /// someone worked out why. An empty field falls back to a sensible night.
+    @objc private func scheduleChanged() {
+        let start = startField.stringValue.trimmingCharacters(in: .whitespaces)
+        let stop = stopField.stringValue.trimmingCharacters(in: .whitespaces)
+        var days: [Int] = []
+        for i in 0..<7 where daysControl.isSelected(forSegment: i) { days.append(i) }
+        if days.isEmpty { days = Array(0..<7) }
+
+        startField.stringValue = start.isEmpty ? "02:00" : start
+        stopField.stringValue = stop.isEmpty ? "06:00" : stop
+        let wanted = scheduleBox.state == .on
+        DaemonClient.shared.setConfig([
+            "schedule_enabled": wanted,
+            "schedule_start": startField.stringValue,
+            "schedule_stop": stopField.stringValue,
+            "schedule_days": days,
+        ]) { [weak self] error in
+            guard let self = self else { return }
+            if let error = error {
+                // Refused: say why and put the checkbox back, rather than
+                // leaving it on for a schedule that was never accepted.
+                self.scheduleBox.state = .off
+                self.updateScheduleState(enabled: false, open: nil)
+                self.scheduleState.stringValue = error
+                self.scheduleState.textColor = .systemRed
+                return
+            }
+            self.scheduleState.textColor = .tertiaryLabelColor
+            self.refreshTools()
+        }
+        updateScheduleState(enabled: wanted, open: nil)
+    }
+
+    private func updateScheduleState(enabled: Bool, open: Bool?) {
+        startField.isEnabled = enabled
+        stopField.isEnabled = enabled
+        daysControl.isEnabled = enabled
+        guard enabled else {
+            scheduleState.stringValue = ""
+            return
+        }
+        switch open {
+        case .some(true):  scheduleState.stringValue = "window is open — downloads are running"
+        case .some(false): scheduleState.stringValue = "window is shut — downloads are waiting"
+        case nil:          scheduleState.stringValue = ""
+        }
     }
 
     @objc private func audioLangChanged() {

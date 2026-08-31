@@ -171,3 +171,40 @@ func formatTimestamp(ms int64) string {
 	ms -= s * 1000
 	return fmt.Sprintf("%02d:%02d:%02d.%03d", h, m, s, ms)
 }
+
+// assOverride matches an ASS override block like {\an7}. ffmpeg's CEA-608
+// decoder emits them for caption positioning, but an SRT player has no idea
+// what they mean and shows them as literal text.
+var assOverride = regexp.MustCompile(`\{\\[^}]*\}`)
+
+// CleanSRT tidies the SRT ffmpeg produces from embedded closed captions:
+// positioning codes are dropped, and a cue left empty by that is removed along
+// with its now-dangling index. Font tags are kept — players understand them and
+// 608 uses colour to tell speakers apart.
+func CleanSRT(data []byte) []byte {
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	var out []string
+	n := 0
+	for _, block := range strings.Split(text, "\n\n") {
+		lines := strings.Split(strings.Trim(block, "\n"), "\n")
+		if len(lines) < 3 {
+			continue // an SRT cue is index, timing, then at least one line
+		}
+		var body []string
+		for _, ln := range lines[2:] {
+			ln = strings.TrimSpace(assOverride.ReplaceAllString(ln, ""))
+			if ln != "" {
+				body = append(body, ln)
+			}
+		}
+		if len(body) == 0 {
+			continue
+		}
+		n++
+		out = append(out, fmt.Sprintf("%d\n%s\n%s", n, lines[1], strings.Join(body, "\n")))
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return []byte(strings.Join(out, "\n\n") + "\n")
+}

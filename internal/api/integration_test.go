@@ -148,3 +148,179 @@ func TestAPINoDeadlock(t *testing.T) {
 		t.Fatalf("daemon unresponsive after churn: %q", got)
 	}
 }
+
+// A speed limit is worth having mainly for a download already in flight, so
+// setting it must reach the running manager and not just the config file.
+func TestSpeedLimitAppliesToTheRunningManager(t *testing.T) {
+	// config.Save writes under the support dir, which is derived from $HOME.
+	// Redirect it so the test never touches the real settings file.
+	t.Setenv("HOME", t.TempDir())
+
+	st, err := store.Open(t.TempDir() + "/jobs.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr := manager.New(manager.Config{DownloadDir: t.TempDir()}, st)
+	defer mgr.Shutdown(time.Second)
+	srv := httptest.NewServer(api.New(mgr))
+	defer srv.Close()
+
+	if got := mgr.SpeedLimit(); got != 0 {
+		t.Fatalf("a fresh manager starts unlimited, got %d", got)
+	}
+
+	post := func(body string) int {
+		t.Helper()
+		resp, err := http.Post(srv.URL+"/api/config", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	if code := post(`{"speed_limit_bps": 262144}`); code != http.StatusNoContent {
+		t.Fatalf("POST /api/config = %d, want 204", code)
+	}
+	if got := mgr.SpeedLimit(); got != 262144 {
+		t.Errorf("manager ceiling = %d, want 262144 — the setting never reached the running downloads", got)
+	}
+
+	// Zero lifts it again.
+	if code := post(`{"speed_limit_bps": 0}`); code != http.StatusNoContent {
+		t.Fatalf("POST /api/config = %d, want 204", code)
+	}
+	if got := mgr.SpeedLimit(); got != 0 {
+		t.Errorf("manager ceiling = %d after setting 0, want unlimited", got)
+	}
+
+	// A negative ceiling is a mistake, not "unlimited by another name".
+	if code := post(`{"speed_limit_bps": -1}`); code != http.StatusBadRequest {
+		t.Errorf("a negative limit returned %d, want 400", code)
+	}
+
+	// An unrelated patch must not disturb the ceiling.
+	if code := post(`{"speed_limit_bps": 131072}`); code != http.StatusNoContent {
+		t.Fatal("setup patch failed")
+	}
+	if code := post(`{"audio_lang": "id"}`); code != http.StatusNoContent {
+		t.Fatal("unrelated patch failed")
+	}
+	if got := mgr.SpeedLimit(); got != 131072 {
+		t.Errorf("ceiling = %d after an unrelated patch, want it left at 131072", got)
+	}
+}
+
+// The schedule must reach the running daemon, and a typo must never become a
+// window that silently blocks every download.
+func TestSchedulePatchAppliesAndValidates(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	st, err := store.Open(t.TempDir() + "/jobs.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr := manager.New(manager.Config{DownloadDir: t.TempDir()}, st)
+	defer mgr.Shutdown(time.Second)
+	srv := httptest.NewServer(api.New(mgr))
+	defer srv.Close()
+
+	post := func(body string) int {
+		t.Helper()
+		resp, err := http.Post(srv.URL+"/api/config", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	if w := mgr.Schedule(); w.Enabled {
+		t.Fatal("a fresh manager has no schedule")
+	}
+
+	code := post(`{"schedule_enabled": true, "schedule_start": "02:00", "schedule_stop": "06:00", "schedule_days": [1,2,3,4,5]}`)
+	if code != http.StatusNoContent {
+		t.Fatalf("POST /api/config = %d, want 204", code)
+	}
+	w := mgr.Schedule()
+	if !w.Enabled || w.Start != 120 || w.Stop != 360 {
+		t.Fatalf("window = %+v, want 02:00-06:00 enabled", w)
+	}
+	if w.Days[int(time.Saturday)] || !w.Days[int(time.Wednesday)] {
+		t.Errorf("weekday selection wrong: %s", w)
+	}
+
+	// Bad input is refused, and leaves the working window in place.
+	for _, bad := range []string{
+		`{"schedule_start": "25:00"}`,
+		`{"schedule_stop": "abc"}`,
+		`{"schedule_start": "0200"}`,
+		`{"schedule_days": [9]}`,
+		`{"schedule_days": [-1]}`,
+	} {
+		if code := post(bad); code != http.StatusBadRequest {
+			t.Errorf("%s returned %d, want 400", bad, code)
+		}
+	}
+	if got := mgr.Schedule(); got.Start != 120 || got.Stop != 360 || !got.Enabled {
+		t.Errorf("a rejected patch changed the live window: %s", got)
+	}
+
+	// Switching it off releases the daemon immediately.
+	if code := post(`{"schedule_enabled": false}`); code != http.StatusNoContent {
+		t.Fatalf("disabling returned %d", code)
+	}
+	if mgr.Schedule().Enabled {
+		t.Error("schedule still enabled after being switched off")
+	}
+}
+
+// Switching the scheduler on without usable times used to report success and do
+// nothing — the window silently disabled itself. Say so instead.
+func TestEnablingScheduleWithoutTimesIsRefused(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	st, err := store.Open(t.TempDir() + "/jobs.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mgr := manager.New(manager.Config{DownloadDir: t.TempDir()}, st)
+	defer mgr.Shutdown(time.Second)
+	srv := httptest.NewServer(api.New(mgr))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/api/config", "application/json",
+		strings.NewReader(`{"schedule_enabled": true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("enabling with no times returned %d, want 400", resp.StatusCode)
+	}
+	if mgr.Schedule().Enabled {
+		t.Error("a refused patch must not enable the schedule")
+	}
+
+	// With times, the same call succeeds.
+	resp2, err := http.Post(srv.URL+"/api/config", "application/json",
+		strings.NewReader(`{"schedule_enabled": true, "schedule_start": "02:00", "schedule_stop": "06:00"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	io.Copy(io.Discard, resp2.Body)
+	if resp2.StatusCode != http.StatusNoContent {
+		t.Fatalf("a complete schedule returned %d, want 204", resp2.StatusCode)
+	}
+	if !mgr.Schedule().Enabled {
+		t.Error("schedule should be enabled")
+	}
+}

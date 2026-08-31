@@ -39,6 +39,13 @@ struct Job: Codable, Identifiable {
     var conns: [ConnStat]?
     var segments: Int?
     var segments_done: Int?
+    /// The scheduler is holding this job until the download window opens. It is
+    /// "paused" like any other, so without this the list could not tell the
+    /// user why nothing is happening.
+    var scheduled_hold: Bool?
+
+    /// What to show in the status column.
+    var statusText: String { (scheduled_hold ?? false) ? "scheduled" : status }
 
     var percent: Double {
         total_bytes > 0 ? min(100, Double(done_bytes) / Double(total_bytes) * 100) : 0
@@ -102,6 +109,16 @@ struct ProbeResult: Codable {
 }
 
 /// Result of GET /api/tools.
+/// The download window in force, as the daemon reports it.
+struct ScheduleInfo: Codable {
+    var enabled: Bool
+    var start: String
+    var stop: String
+    var days: [Int]
+    /// Whether the window is open at this moment.
+    var open: Bool
+}
+
 struct ToolsInfo: Codable {
     struct Tool: Codable { var path: String; var version: String }
     struct YtDlp: Codable {
@@ -118,6 +135,9 @@ struct ToolsInfo: Codable {
     var subtitle_langs: String?
     var auto_subs: Bool?
     var audio_lang: String?
+    /// Total transfer ceiling in bytes per second; 0 means unlimited.
+    var speed_limit_bps: Int64?
+    var schedule: ScheduleInfo?
 }
 
 private struct UpdateResult: Codable { var ok: Bool; var from: String; var to: String }
@@ -290,6 +310,25 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     }
 
     func setConfig(_ body: [String: Any]) { post("api/config", body) }
+
+    /// Same, but reports what the daemon said. Settings the daemon can refuse —
+    /// a schedule with a mistyped time — need the answer, or the window would
+    /// show a setting that never took effect.
+    func setConfig(_ body: [String: Any], done: @escaping (String?) -> Void) {
+        post("api/config", body) { data, code in
+            var message: String?
+            if code < 200 || code > 299 {
+                if let d = data,
+                   let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                   let e = obj["error"] as? String {
+                    message = e
+                } else {
+                    message = "the daemon refused this setting (HTTP \(code))"
+                }
+            }
+            DispatchQueue.main.async { done(message) }
+        }
+    }
 
     // MARK: SSE
 

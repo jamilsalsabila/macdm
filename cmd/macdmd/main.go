@@ -54,6 +54,8 @@ func main() {
 		MaxActive:        cfg.MaxActive,
 		Tools:            toolset,
 		CookiesFrom:      cfg.CookiesFrom,
+		SpeedLimitBps:    cfg.SpeedLimitBps,
+		Schedule:         cfg.ScheduleWindow(),
 		AutoAccept:       cfg.AutoAccept,
 		PromptTimeoutSec: cfg.PromptTimeoutSec,
 		Engine: engine.Config{

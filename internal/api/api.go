@@ -19,6 +19,7 @@ import (
 
 	"macdm/internal/config"
 	"macdm/internal/manager"
+	"macdm/internal/schedule"
 	"macdm/internal/store"
 	"macdm/internal/tools"
 )
@@ -78,6 +79,13 @@ func (s *Server) getTools(w http.ResponseWriter, r *http.Request) {
 	tctx, tcancel := context.WithTimeout(r.Context(), 12*time.Second)
 	defer tcancel()
 	yt, _ := tools.CheckYtDlp(tctx, set, cfg.YtDlpChannelName()) // best-effort; local fields always filled
+	sched := s.mgr.Schedule()
+	schedDays := []int{}
+	for i, on := range sched.Days {
+		if on {
+			schedDays = append(schedDays, i)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ffmpeg": toolInfo{Path: set.Ffmpeg, Version: tools.Version(r.Context(), set.Ffmpeg)},
 		"ytdlp": map[string]any{
@@ -92,6 +100,15 @@ func (s *Server) getTools(w http.ResponseWriter, r *http.Request) {
 		"subtitle_langs": cfg.SubtitleLangs,
 		"auto_subs":      cfg.AutoSubs,
 		"audio_lang":     cfg.AudioLang,
+		// From the manager, not the file: this is the ceiling in force now.
+		"speed_limit_bps": s.mgr.SpeedLimit(),
+		"schedule": map[string]any{
+			"enabled": sched.Enabled,
+			"start":   schedule.FormatHM(sched.Start),
+			"stop":    schedule.FormatHM(sched.Stop),
+			"days":    schedDays,
+			"open":    sched.Active(time.Now()),
+		},
 	})
 }
 
@@ -112,6 +129,11 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 		SubtitleLangs   *string `json:"subtitle_langs"`
 		AutoSubs        *bool   `json:"auto_subs"`
 		AudioLang       *string `json:"audio_lang"`
+		SpeedLimitBps   *int64  `json:"speed_limit_bps"`
+		ScheduleEnabled *bool   `json:"schedule_enabled"`
+		ScheduleStart   *string `json:"schedule_start"`
+		ScheduleStop    *string `json:"schedule_stop"`
+		ScheduleDays    *[]int  `json:"schedule_days"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -136,9 +158,75 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 	if req.YtDlpChannel != nil && (*req.YtDlpChannel == "stable" || *req.YtDlpChannel == "nightly") {
 		c.YtDlpChannel = *req.YtDlpChannel
 	}
+	touchedSpeed := false
+	if req.SpeedLimitBps != nil {
+		if *req.SpeedLimitBps < 0 {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("speed_limit_bps cannot be negative"))
+			return
+		}
+		c.SpeedLimitBps = *req.SpeedLimitBps
+		touchedSpeed = true
+	}
+	touchedSchedule := false
+	if req.ScheduleEnabled != nil {
+		c.ScheduleEnabled = *req.ScheduleEnabled
+		touchedSchedule = true
+	}
+	// Validate the times before storing them: a window saved from a typo would
+	// block every download until someone worked out why.
+	for _, f := range []struct {
+		in   *string
+		out  *string
+		name string
+	}{
+		{req.ScheduleStart, &c.ScheduleStart, "schedule_start"},
+		{req.ScheduleStop, &c.ScheduleStop, "schedule_stop"},
+	} {
+		if f.in == nil {
+			continue
+		}
+		if _, err := schedule.ParseHM(*f.in); err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("%s: %w", f.name, err))
+			return
+		}
+		*f.out = *f.in
+		touchedSchedule = true
+	}
+	if req.ScheduleDays != nil {
+		for _, d := range *req.ScheduleDays {
+			if d < 0 || d > 6 {
+				writeErr(w, http.StatusBadRequest, fmt.Errorf("schedule_days: %d is not a weekday (0-6)", d))
+				return
+			}
+		}
+		c.ScheduleDays = *req.ScheduleDays
+		touchedSchedule = true
+	}
+
+	// ScheduleWindow silently disables itself on unusable times, which is the
+	// right failure for a config file read at startup but the wrong answer to
+	// someone switching the scheduler on: it would report success and do
+	// nothing at all.
+	if c.ScheduleEnabled && !c.ScheduleWindow().Enabled {
+		writeErr(w, http.StatusBadRequest,
+			fmt.Errorf("the schedule needs a start and stop time in HH:MM"))
+		return
+	}
+
 	if err := config.Save(c); err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
+	}
+	// Only once the file is safely written: reporting a failure while the
+	// running daemon had already changed would leave the two disagreeing.
+	if touchedSpeed {
+		// Immediately, not at the next restart — throttling a download already
+		// in flight is the case people actually want this for.
+		s.mgr.SetSpeedLimit(c.SpeedLimitBps)
+	}
+	if touchedSchedule {
+		// Likewise: switching the scheduler off gives the downloads back at once.
+		s.mgr.SetSchedule(c.ScheduleWindow())
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

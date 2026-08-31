@@ -16,6 +16,7 @@ import (
 
 	"macdm/internal/config"
 	"macdm/internal/dash"
+	"macdm/internal/diskspace"
 	"macdm/internal/engine"
 	"macdm/internal/extractor"
 	"macdm/internal/hls"
@@ -173,6 +174,7 @@ func workerRow(id, seg int, status string, bytes int64) store.ConnStat {
 
 func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest string, mx *mux.Muxer, prog segProgFn, muxProg muxProgFn) error {
 	c := hls.NewClient(streamHTTPClient(), j.Headers)
+	c.SetLimiter(m.limiter)
 
 	// A FormatID that is a URL is a specific variant playlist the user picked.
 	startURL := j.URL
@@ -189,6 +191,12 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 	// #EXT-X-MEDIA rendition. Downloading only the variant gave a silent file.
 	var audioPl *hls.Playlist
 	var subRend *hls.Rendition
+	var ccDeclared bool
+	var ccLang string
+	// BANDWIDTH of the chosen variant, kept for the disk-space estimate below.
+	// Per the HLS spec it already accounts for the audio rendition played with
+	// it, so it covers both tracks.
+	var variantBps int
 	if master.IsMaster {
 		v, ok := master.BestVariant()
 		if !ok {
@@ -203,6 +211,8 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 			}
 		}
 		subRend = master.SubtitlesFor(v)
+		ccDeclared, ccLang = master.ClosedCaptionsFor(v)
+		variantBps = v.Bandwidth
 	}
 	for _, p := range []*hls.Playlist{pl, audioPl} {
 		if p == nil {
@@ -214,6 +224,14 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 		if p.Live {
 			return fmt.Errorf("this is a live stream (no #EXT-X-ENDLIST) — MacDM only downloads finished VOD")
 		}
+	}
+
+	var playlistSeconds float64
+	for _, sg := range pl.Segments {
+		playlistSeconds += sg.Duration
+	}
+	if err := planSpace(wd, dest, bitrateBytes(playlistSeconds, variantBps)); err != nil {
+		return err
 	}
 
 	// Segment counts and bytes from both tracks feed one progress bar, the way
@@ -277,6 +295,9 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 		return err
 	}
 	m.fetchHLSSubtitles(ctx, c, id, dest, subRend)
+	if ccDeclared {
+		m.extractClosedCaptions(ctx, mx, id, assembled, dest, ccLang)
+	}
 	_ = os.RemoveAll(wd) // assembled successfully — scratch segments no longer needed
 	return finalize(m, id, dest)
 }
@@ -341,6 +362,14 @@ func (m *Manager) execExtractDirect(ctx context.Context, id string, j *store.Job
 		if med != nil {
 			total += med.Size
 		}
+	}
+
+	// Here the sizes are exact rather than estimated from a bitrate, so this is
+	// the one stream path that can say for certain the download will not fit.
+	// A refusal is final: it is not a reason to fall back to yt-dlp, which would
+	// only run out of space more slowly.
+	if err := planSpace(outDir, j.Dest, total); err != nil {
+		return err
 	}
 	var doneBase int64
 	fetch := func(med *extractor.DirectMedia, file string) error {
@@ -490,6 +519,38 @@ func firstNonBlank(vals ...string) string {
 	return ""
 }
 
+// firstPeriodVideoFile returns the first muxed period, which is where in-band
+// captions are read from. Multi-period presentations only get the captions of
+// their opening period; extracting from every one and stitching the timelines
+// is not worth it for a track that is a bonus.
+func firstPeriodVideoFile(periodFiles []string) string {
+	if len(periodFiles) == 0 {
+		return ""
+	}
+	return periodFiles[0]
+}
+
+// extractClosedCaptions saves CEA-608/708 captions carried inside the video
+// bitstream as an SRT beside the finished file. Best-effort and silent when
+// there are none — most videos carry no captions at all.
+func (m *Manager) extractClosedCaptions(ctx context.Context, mx *mux.Muxer, id, video, dest, lang string) {
+	tmp := video + ".cc.srt"
+	found, err := mx.ExtractClosedCaptions(ctx, video, tmp)
+	if err != nil {
+		log.Printf("macdm: closed captions: %v", err)
+		return
+	}
+	if !found {
+		return
+	}
+	defer os.Remove(tmp)
+	data, err := os.ReadFile(tmp)
+	if err != nil {
+		return
+	}
+	m.writeSubtitles(id, dest, lang, ".srt", data)
+}
+
 // writeSubtitles saves a subtitle track next to the video as
 // "<name>.<lang>.vtt". Subtitles are a bonus: every failure here is logged into
 // the job note and swallowed, because losing them must never fail a download
@@ -520,6 +581,7 @@ func extOr(path, fallback string) string {
 
 func (m *Manager) execDASH(ctx context.Context, id string, j *store.Job, wd, dest string, mx *mux.Muxer, prog segProgFn, muxProg muxProgFn) error {
 	c := dash.NewClient(streamHTTPClient(), j.Headers)
+	c.SetLimiter(m.limiter)
 
 	preferHeight := 0
 	if strings.HasPrefix(j.FormatID, "h") {
@@ -544,6 +606,26 @@ func (m *Manager) execDASH(ctx context.Context, id string, j *store.Job, wd, des
 			total += len(pd.Audio.Segments)
 		}
 	}
+	// The busiest period's bitrate, not the sum: periods run one after another,
+	// so they never overlap in time. Taking the largest overestimates slightly,
+	// which is the safe direction for a space check.
+	peakBps := 0
+	for _, pd := range man.Periods {
+		bps := 0
+		if pd.Video != nil {
+			bps += pd.Video.Bandwidth
+		}
+		if pd.Audio != nil {
+			bps += pd.Audio.Bandwidth
+		}
+		if bps > peakBps {
+			peakBps = bps
+		}
+	}
+	if err := planSpace(wd, dest, bitrateBytes(man.Duration.Seconds(), peakBps)); err != nil {
+		return err
+	}
+
 	var doneSegBase, doneBytesBase int64
 	step := func(p dash.Progress) {
 		prog(streamProg{
@@ -628,6 +710,13 @@ func (m *Manager) execDASH(ctx context.Context, id string, j *store.Job, wd, des
 	}
 	if err := moveFile(final, dest); err != nil {
 		return err
+	}
+	// Only when the MPD declares them: the extraction decodes the whole video,
+	// roughly a minute per hour, which is not worth spending blindly.
+	if man.CaptionLang != "" {
+		if vTrack := firstPeriodVideoFile(periodFiles); vTrack != "" {
+			m.extractClosedCaptions(ctx, mx, id, vTrack, dest, man.CaptionLang)
+		}
 	}
 	if man.Subtitle != nil {
 		if data, ext, err := c.FetchSubtitles(ctx, man.Subtitle); err != nil {
@@ -735,6 +824,9 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		AudioLang:      firstNonBlank(j.AudioLang, cfg.AudioLang),
 		SubLangs:       firstNonBlank(j.SubtitleLangs, cfg.SubtitleLangs),
 		AutoSubs:       cfg.AutoSubs,
+		// yt-dlp downloads in its own process, out of reach of the shared
+		// bucket, so the ceiling has to be handed to it directly.
+		LimitBps: m.limiter.Limit(),
 	}, func(p extractor.Progress) {
 		select {
 		case started <- struct{}{}: // first callback — extraction got somewhere
@@ -941,6 +1033,36 @@ func looksGeneric(name string) bool {
 		return true
 	}
 	return len(base) <= 2
+}
+
+// planSpace refuses a stream download that cannot possibly fit, before a single
+// byte is fetched.
+//
+// A stream needs room twice over: every segment lands in the scratch directory
+// and the muxed result is written beside it, and the scratch is only cleared
+// once that has succeeded. Scratch and destination are usually the same volume,
+// so the two have to be weighed together — which is what diskspace.CheckAll
+// does, while still handling a destination on an external drive.
+//
+// The estimate comes from the manifest's own declared bitrate and is therefore
+// approximate. It is used only to turn away a download that misses by a wide
+// margin; est <= 0 means "no idea", and never blocks anything.
+func planSpace(wd, dest string, est int64) error {
+	if est <= 0 {
+		return nil
+	}
+	return diskspace.CheckAll(
+		diskspace.Need{Path: wd, Bytes: est},
+		diskspace.Need{Path: dest, Bytes: est},
+	)
+}
+
+// bitrateBytes converts a declared bitrate and a duration into a byte count.
+func bitrateBytes(seconds float64, bitsPerSec int) int64 {
+	if seconds <= 0 || bitsPerSec <= 0 {
+		return 0
+	}
+	return int64(seconds * float64(bitsPerSec) / 8)
 }
 
 func humanBytes(n int64) string {

@@ -80,3 +80,60 @@ func TestSaveRoundTrips(t *testing.T) {
 		t.Error("temp file left behind by Save")
 	}
 }
+
+// A mistyped time must not become a window that silently blocks every download,
+// so anything unparseable disables the schedule rather than being guessed at.
+func TestScheduleWindowRefusesBadInput(t *testing.T) {
+	base := Config{ScheduleEnabled: true, ScheduleStart: "02:00", ScheduleStop: "06:00"}
+	if w := base.ScheduleWindow(); !w.Enabled || w.Start != 120 || w.Stop != 360 {
+		t.Fatalf("a valid schedule did not survive: %+v", w)
+	}
+
+	for _, bad := range []Config{
+		{ScheduleEnabled: true, ScheduleStart: "", ScheduleStop: "06:00"},
+		{ScheduleEnabled: true, ScheduleStart: "02:00", ScheduleStop: "25:00"},
+		{ScheduleEnabled: true, ScheduleStart: "oops", ScheduleStop: "06:00"},
+	} {
+		if w := bad.ScheduleWindow(); w.Enabled {
+			t.Errorf("%+v produced an enabled window %s; bad input must disable it", bad, w)
+		}
+	}
+
+	// Disabled wins regardless of the times.
+	off := Config{ScheduleStart: "02:00", ScheduleStop: "06:00"}
+	if off.ScheduleWindow().Enabled {
+		t.Error("ScheduleEnabled=false must produce a disabled window")
+	}
+}
+
+// No weekday selected would be a window that could never open — never what
+// anyone means, so it reads as every day.
+func TestScheduleWindowWithNoDaysMeansEveryDay(t *testing.T) {
+	c := Config{ScheduleEnabled: true, ScheduleStart: "02:00", ScheduleStop: "06:00"}
+	w := c.ScheduleWindow()
+	for i, on := range w.Days {
+		if !on {
+			t.Errorf("weekday %d is off; an empty day list should mean every day", i)
+		}
+	}
+
+	c.ScheduleDays = []int{1, 3, 5}
+	w = c.ScheduleWindow()
+	for _, want := range []int{1, 3, 5} {
+		if !w.Days[want] {
+			t.Errorf("weekday %d should be selected", want)
+		}
+	}
+	for _, notWant := range []int{0, 2, 4, 6} {
+		if w.Days[notWant] {
+			t.Errorf("weekday %d should not be selected", notWant)
+		}
+	}
+
+	// Out-of-range entries are ignored rather than crashing or wrapping.
+	c.ScheduleDays = []int{-1, 2, 99}
+	w = c.ScheduleWindow()
+	if !w.Days[2] || w.Days[0] || w.Days[6] {
+		t.Errorf("out-of-range weekdays were not ignored cleanly: %s", w)
+	}
+}

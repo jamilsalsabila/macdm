@@ -3,12 +3,15 @@ package dash
 import (
 	"context"
 	"fmt"
+	"macdm/internal/ratelimit"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestParseAndAssembleTimeline(t *testing.T) {
@@ -276,5 +279,262 @@ func TestSegmentListEmptyIsRefused(t *testing.T) {
 </MPD>`)
 	if err == nil {
 		t.Fatal("a SegmentList with no SegmentURL entries must be an error")
+	}
+}
+
+// @timescale defaults to 1 per the DASH spec, and the segment count is a
+// ceiling — a stream whose duration divides evenly (1h of 2s segments is
+// exactly 1800) must not be asked for one past the end. DASH-IF's own
+// reference streams are written this way and used to fail outright.
+func TestSegmentTemplateDefaultTimescaleAndExactCount(t *testing.T) {
+	man, err := parseMPD(t, `<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT1H">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate startNumber="1" initialization="$RepresentationID$/init.mp4"
+                       duration="2" media="$RepresentationID$/$Number$.m4s"/>
+      <Representation id="V300" codecs="avc1.64001e" bandwidth="300000" width="640" height="360"/>
+    </AdaptationSet>
+  </Period>
+</MPD>`)
+	if err != nil {
+		t.Fatalf("a SegmentTemplate without @timescale is valid: %v", err)
+	}
+	if man.Video == nil {
+		t.Fatal("no video track")
+	}
+	if n := len(man.Video.Segments); n != 1800 {
+		t.Fatalf("want exactly 1800 segments for 1h of 2s, got %d", n)
+	}
+	last := man.Video.Segments[len(man.Video.Segments)-1]
+	if !strings.HasSuffix(last, "/1800.m4s") {
+		t.Fatalf("last segment should be 1800, got %s", last)
+	}
+}
+
+// A duration that does not divide evenly still needs the trailing partial
+// segment.
+func TestSegmentTemplateCountRoundsUp(t *testing.T) {
+	man, err := parseMPD(t, `<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT11S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate startNumber="1" duration="2" media="$Number$.m4s"/>
+      <Representation id="V" bandwidth="1" width="64" height="36"/>
+    </AdaptationSet>
+  </Period>
+</MPD>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(man.Video.Segments); n != 6 {
+		t.Fatalf("11s of 2s segments needs 6 (5 full + 1 partial), got %d", n)
+	}
+}
+
+// Extracting in-band CEA-608 captions means decoding the whole video, so the
+// caller only does it when the MPD declares them. That makes this parse
+// load-bearing: lose it and captions silently stop being extracted.
+func TestAccessibilityDeclaresCEA608Language(t *testing.T) {
+	mpd := func(acc string) string {
+		return `<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT1M">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">` + acc + `
+      <SegmentTemplate startNumber="1" timescale="1" duration="2"
+                       initialization="$RepresentationID$/init.mp4"
+                       media="$RepresentationID$/$Number$.m4s"/>
+      <Representation id="V300" codecs="avc1.64001e" bandwidth="300000" width="640" height="360"/>
+    </AdaptationSet>
+  </Period>
+</MPD>`
+	}
+	cases := []struct {
+		name string
+		acc  string
+		want string
+	}{
+		{
+			// The shape the DASH-IF reference stream uses.
+			name: "cea-608 with a channel language",
+			acc:  `<Accessibility schemeIdUri="urn:scte:dash:cc:cea-608:2015" value="CC1=eng"/>`,
+			want: "eng",
+		},
+		{
+			name: "multiple channels take the first",
+			acc:  `<Accessibility schemeIdUri="urn:scte:dash:cc:cea-608:2015" value="CC1=eng;CC3=spa"/>`,
+			want: "eng",
+		},
+		{
+			name: "an unrelated accessibility scheme declares nothing",
+			acc:  `<Accessibility schemeIdUri="urn:mpeg:dash:role:2011" value="description"/>`,
+			want: "",
+		},
+		{
+			name: "no accessibility element at all",
+			acc:  ``,
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			man, err := parseMPD(t, mpd(tc.acc))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if man.CaptionLang != tc.want {
+				t.Errorf("CaptionLang = %q, want %q", man.CaptionLang, tc.want)
+			}
+		})
+	}
+}
+
+// mediaPresentationDuration used to be parked in a package-level global between
+// Parse and expandTemplate, on the assumption that parsing is never concurrent.
+// It is: the manager runs several downloads at once. Two manifests parsed
+// together would trade durations, and the loser computed its segment count from
+// the other's length — a one-hour video quietly truncated to one minute, with
+// no error anywhere. Run under -race this also proves the global is gone.
+func TestConcurrentParsesDoNotShareDuration(t *testing.T) {
+	mpd := func(dur string) string {
+		return `<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="` + dur + `">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate startNumber="1" timescale="1" duration="2"
+                       initialization="$RepresentationID$/init.mp4"
+                       media="$RepresentationID$/$Number$.m4s"/>
+      <Representation id="V" codecs="avc1.64001e" bandwidth="300000" width="640" height="360"/>
+    </AdaptationSet>
+  </Period>
+</MPD>`
+	}
+	cases := []struct {
+		dur      string
+		wantSegs int
+	}{
+		{"PT1H", 1800}, // 3600s / 2s
+		{"PT1M", 30},   //   60s / 2s
+		{"PT10M", 300},
+		{"PT2H", 3600},
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(cases))
+	got := make([]int, len(cases))
+	for i, c := range cases {
+		wg.Add(1)
+		go func(i int, dur string) {
+			defer wg.Done()
+			man, err := parseMPD(t, mpd(dur))
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			got[i] = len(man.Video.Segments)
+		}(i, c.dur)
+	}
+	wg.Wait()
+
+	for i, c := range cases {
+		if errs[i] != nil {
+			t.Fatalf("%s: %v", c.dur, errs[i])
+		}
+		if got[i] != c.wantSegs {
+			t.Errorf("%s: got %d segments, want %d — a concurrent parse leaked its duration in",
+				c.dur, got[i], c.wantSegs)
+		}
+	}
+}
+
+// The duration is also published, so a caller can size the download up front.
+func TestManifestReportsDuration(t *testing.T) {
+	man, err := parseMPD(t, `<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT1H30M">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate startNumber="1" timescale="1" duration="2"
+                       initialization="$RepresentationID$/init.mp4"
+                       media="$RepresentationID$/$Number$.m4s"/>
+      <Representation id="V" codecs="avc1.64001e" bandwidth="300000" width="640" height="360"/>
+    </AdaptationSet>
+  </Period>
+</MPD>`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 90 * time.Minute; man.Duration != want {
+		t.Errorf("Duration = %v, want %v", man.Duration, want)
+	}
+}
+
+// The DASH segment loop is wired to the same shared ceiling as HLS and the
+// engine. Wiring that looks right is not proof, so measure it.
+func TestAssembleTrackRespectsTheSpeedLimit(t *testing.T) {
+	const (
+		segments = 16
+		segSize  = 32 << 10 // 512 KB in total
+		limit    = 512 << 10
+	)
+	blob := strings.Repeat("x", segSize)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v-init.mp4", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "") })
+	for i := 1; i <= segments; i++ {
+		mux.HandleFunc(fmt.Sprintf("/v-%d.m4s", i), func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, blob)
+		})
+	}
+	mux.HandleFunc("/m.mpd", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/dash+xml")
+		fmt.Fprintf(w, `<?xml version="1.0"?>
+<MPD type="static" mediaPresentationDuration="PT%dS">
+  <Period>
+    <AdaptationSet mimeType="video/mp4">
+      <Representation id="v" bandwidth="1200000" width="1280" height="720" codecs="avc1.640028">
+        <SegmentTemplate media="v-$Number$.m4s" initialization="v-init.mp4" startNumber="1"
+                         timescale="1" duration="1"/>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>`, segments)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	run := func(t *testing.T, bps int64) time.Duration {
+		t.Helper()
+		c := NewClient(srv.Client(), nil)
+		c.SetLimiter(ratelimit.New(bps))
+		man, err := c.Parse(context.Background(), srv.URL+"/m.mpd")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := len(man.Video.Segments); n != segments {
+			t.Fatalf("got %d segments, want %d", n, segments)
+		}
+		out := filepath.Join(t.TempDir(), "v.m4s")
+		start := time.Now()
+		if err := c.AssembleTrack(context.Background(), man.Video, out,
+			DownloadOptions{Dir: t.TempDir(), Conns: 6}, nil); err != nil {
+			t.Fatal(err)
+		}
+		elapsed := time.Since(start)
+		fi, err := os.Stat(out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi.Size() != segments*segSize {
+			t.Fatalf("assembled %d bytes, want %d", fi.Size(), segments*segSize)
+		}
+		return elapsed
+	}
+
+	limited := run(t, limit)
+	if limited < 500*time.Millisecond {
+		t.Errorf("512 KB through a 512 KB/s ceiling took %v — the limit never reached AssembleTrack", limited)
+	}
+	unlimited := run(t, 0)
+	if unlimited > limited/2 {
+		t.Errorf("unlimited run took %v vs %v limited; the comparison proves nothing", unlimited, limited)
 	}
 }

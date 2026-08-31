@@ -48,6 +48,11 @@ type Job struct {
 
 	Status string `json:"status"`
 	Error  string `json:"error,omitempty"`
+	// ScheduledHold marks a job the scheduler stopped, or would not let start,
+	// because the download window is shut. It is what separates "waiting for
+	// 2am" from a pause the user asked for: only the former is picked up again
+	// on its own when the window opens.
+	ScheduledHold bool `json:"scheduled_hold,omitempty"`
 
 	TotalBytes  int64 `json:"total_bytes"`
 	DoneBytes   int64 `json:"done_bytes"`

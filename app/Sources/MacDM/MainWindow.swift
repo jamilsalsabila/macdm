@@ -233,7 +233,8 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         case "size":
             cell.textField?.stringValue = j.sizeText
         case "status":
-            cell.textField?.stringValue = j.status
+            cell.textField?.stringValue = j.statusText
+            cell.textField?.toolTip = j.error
         case "speed":
             cell.textField?.stringValue = j.status == "downloading" ? Fmt.speed(j.speed_bps) : "—"
         case "eta":

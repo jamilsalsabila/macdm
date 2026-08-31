@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"macdm/internal/ratelimit"
 	"macdm/internal/store"
 	"macdm/internal/subs"
 )
@@ -52,6 +53,10 @@ type adaptationSet struct {
 	ContentProtection []struct {
 		SchemeIdURI string `xml:"schemeIdUri,attr"`
 	} `xml:"ContentProtection"`
+	Accessibility []struct {
+		SchemeIdURI string `xml:"schemeIdUri,attr"`
+		Value       string `xml:"value,attr"`
+	} `xml:"Accessibility"`
 	Representations []representation `xml:"Representation"`
 }
 
@@ -124,6 +129,14 @@ type Manifest struct {
 	// Optional: its absence never fails a download.
 	Subtitle *Track
 
+	// CaptionLang is the first period's caption language (see PeriodTracks).
+	CaptionLang string
+
+	// Duration is mediaPresentationDuration. Zero when the MPD omits it.
+	// Used to size the download before it starts, so it can be refused for
+	// lack of disk space rather than dying most of the way through.
+	Duration time.Duration
+
 	// Periods holds every period in order. A presentation split across periods
 	// (ad insertion is the usual reason) is only complete if all of them are
 	// downloaded — using just the first silently truncates the video.
@@ -135,13 +148,25 @@ type PeriodTracks struct {
 	Video    *Track
 	Audio    *Track
 	Subtitle *Track
+	// CaptionLang is the language of closed captions carried inside the video
+	// bitstream, declared by an <Accessibility> element. Empty when the MPD
+	// says nothing — captions may still be present, just unlabelled.
+	CaptionLang string
 }
 
 // Client fetches and parses.
 type Client struct {
 	http    *http.Client
 	headers map[string]string
+	// limiter paces segment transfers. Segments do not go through the download
+	// engine, so without this a speed limit would apply to plain files and be
+	// ignored by exactly the streams people most want to hold back. nil means
+	// no limit.
+	limiter *ratelimit.Bucket
 }
+
+// SetLimiter shares a transfer ceiling with this client. Pass nil for none.
+func (c *Client) SetLimiter(b *ratelimit.Bucket) { c.limiter = b }
 
 func NewClient(h *http.Client, headers map[string]string) *Client {
 	if h == nil {
@@ -221,6 +246,9 @@ func (c *Client) fetchToFile(ctx context.Context, u, dst string, onBytes func(in
 			}
 			if onBytes != nil {
 				onBytes(n)
+			}
+			if werr := c.limiter.Wait(ctx, n); werr != nil {
+				return werr
 			}
 		}
 		if rerr == io.EOF {
@@ -340,14 +368,14 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 	if len(m.Periods) == 0 {
 		return nil, fmt.Errorf("mpd has no periods")
 	}
-	mpdDuration.Store(parseISODurationMS(m.MediaPresentationDuration))
+	durationMS := parseISODurationMS(m.MediaPresentationDuration)
 
 	base, _ := url.Parse(rawurl)
 	base = resolveBase(base, m.BaseURL)
 
-	out := &Manifest{}
+	out := &Manifest{Duration: time.Duration(durationMS) * time.Millisecond}
 	for _, p := range m.Periods {
-		pt, err := resolvePeriod(base, p, preferHeight)
+		pt, err := resolvePeriod(base, p, preferHeight, durationMS)
 		if err != nil {
 			return nil, err
 		}
@@ -360,12 +388,13 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 		return nil, fmt.Errorf("no downloadable tracks (unsupported segment addressing?)")
 	}
 	out.Video, out.Audio, out.Subtitle = out.Periods[0].Video, out.Periods[0].Audio, out.Periods[0].Subtitle
+	out.CaptionLang = out.Periods[0].CaptionLang
 	return out, nil
 }
 
 // resolvePeriod picks the best video/audio/subtitle representation of a single
 // <Period>.
-func resolvePeriod(base *url.URL, p period, preferHeight int) (PeriodTracks, error) {
+func resolvePeriod(base *url.URL, p period, preferHeight int, durationMS int64) (PeriodTracks, error) {
 	var out PeriodTracks
 	pbase := resolveBase(base, p.BaseURL)
 
@@ -414,7 +443,7 @@ func resolvePeriod(base *url.URL, p period, preferHeight int) (PeriodTracks, err
 			case st != nil:
 				rbase := resolveBase(asbase, rep.BaseURL)
 				var err error
-				if t, err = expandTemplate(rbase, rep, st); err != nil {
+				if t, err = expandTemplate(rbase, rep, st, durationMS); err != nil {
 					return out, err
 				}
 			case sl != nil:
@@ -443,6 +472,7 @@ func resolvePeriod(base *url.URL, p period, preferHeight int) (PeriodTracks, err
 			case "video":
 				if out.Video == nil {
 					out.Video = t
+					out.CaptionLang = cea608Lang(as.Accessibility)
 				}
 			case "audio":
 				if out.Audio == nil {
@@ -506,7 +536,7 @@ func resolveRef(base *url.URL, ref string) string {
 	return base.ResolveReference(u).String()
 }
 
-func expandTemplate(base *url.URL, rep representation, st *segmentTemplate) (*Track, error) {
+func expandTemplate(base *url.URL, rep representation, st *segmentTemplate, durationMS int64) (*Track, error) {
 	subst := func(s string, number int, time int64) string {
 		s = strings.ReplaceAll(s, "$RepresentationID$", rep.ID)
 		s = strings.ReplaceAll(s, "$Bandwidth$", strconv.Itoa(rep.Bandwidth))
@@ -551,33 +581,58 @@ func expandTemplate(base *url.URL, rep representation, st *segmentTemplate) (*Tr
 		return t, nil
 	}
 
-	// duration-based addressing: need total duration
-	if st.Duration <= 0 || st.Timescale <= 0 {
-		return nil, fmt.Errorf("SegmentTemplate without timeline needs duration+timescale")
+	// duration-based addressing: need a segment duration and a total.
+	if st.Duration <= 0 {
+		return nil, fmt.Errorf("SegmentTemplate has neither a timeline nor a duration")
 	}
-	// caller passes total via a package-level hack? Instead derive from MPD dur.
-	// We approximate: the manifest duration is parsed by Parse and stored globally.
-	total := mpdDuration.Load()
+	// @timescale defaults to 1 per the DASH spec — requiring it rejected
+	// perfectly valid manifests, including DASH-IF's own reference streams.
+	timescale := st.Timescale
+	if timescale <= 0 {
+		timescale = 1
+	}
+	total := durationMS
 	if total == 0 {
 		return nil, fmt.Errorf("cannot determine segment count (no mediaPresentationDuration)")
 	}
-	segDur := float64(st.Duration) / float64(st.Timescale)
-	count := int(float64(total)/1000/segDur) + 1
+	// Integer ceiling, not float+1: a stream whose duration divides evenly by
+	// the segment duration (a 1h stream of 2s segments is exactly 1800) would
+	// otherwise be asked for one segment past the end and 404 at the finish
+	// line. Float arithmetic here also risks landing just above a whole number.
+	segMS := int64(st.Duration) * 1000 / int64(timescale)
+	if segMS <= 0 {
+		return nil, fmt.Errorf("SegmentTemplate duration is too small to address")
+	}
+	count := int((total + segMS - 1) / segMS)
 	for i := 0; i < count; i++ {
 		t.Segments = append(t.Segments, resolve(subst(st.Media, start+i, int64(i*st.Duration))))
 	}
 	return t, nil
 }
 
-// mpdDuration carries mediaPresentationDuration (ms) between Parse and
-// expandTemplate for the duration-addressing branch. Parse is not concurrent
-// per-manifest so this is safe in practice; documented as a known simplification.
-var mpdDuration atomic.Int64
-
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {
 		if strings.TrimSpace(v) != "" {
 			return v
+		}
+	}
+	return ""
+}
+
+// cea608Lang reads the first language out of an SCTE CEA-608 accessibility
+// declaration, e.g. value="CC1=eng;CC3=swe" -> "eng".
+func cea608Lang(acc []struct {
+	SchemeIdURI string `xml:"schemeIdUri,attr"`
+	Value       string `xml:"value,attr"`
+}) string {
+	for _, a := range acc {
+		if !strings.Contains(strings.ToLower(a.SchemeIdURI), "cea-608") {
+			continue
+		}
+		for _, part := range strings.Split(a.Value, ";") {
+			if _, lang, ok := strings.Cut(strings.TrimSpace(part), "="); ok && lang != "" {
+				return lang
+			}
 		}
 	}
 	return ""
@@ -790,7 +845,6 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 	return out.Close()
 }
 
-// SetManifestDuration is called by Parse to publish mediaPresentationDuration.
 func parseISODurationMS(s string) int64 {
 	// PT#H#M#S(.fraction)
 	s = strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(s)), "PT")

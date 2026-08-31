@@ -23,6 +23,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"macdm/internal/diskspace"
+	"macdm/internal/ratelimit"
 )
 
 // Config tunes a downloader. The zero value is not useful; use Default.
@@ -31,6 +34,10 @@ type Config struct {
 	MinChunk  int64         // never split a file into pieces smaller than this
 	UserAgent string        // fallback UA when a job carries none
 	Timeout   time.Duration // per-request timeout (not whole-download)
+	// Limiter paces transfers against a user-set ceiling. It is shared with the
+	// stream clients so one figure covers everything MacDM is downloading; nil
+	// means no limit. The bucket itself is safe to retune while jobs run.
+	Limiter *ratelimit.Bucket
 }
 
 // DefaultUserAgent is a current Chrome UA. Many CDNs 403 a non-browser
@@ -221,6 +228,17 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 		sc.replanConns(conns, e.cfg.MinChunk)
 	default:
 		sc.reserveSteal(conns) // resuming an earlier plan — keep stealing headroom
+	}
+
+	// Only the bytes still missing: a resume must not be refused over space its
+	// own .part file already occupies. Checked before the Truncate below, which
+	// looks like a reservation but is not — APFS makes that file sparse and
+	// holds back nothing, so without this a download far larger than the disk
+	// starts happily and dies most of the way through.
+	if pr.TotalBytes > 0 {
+		if err := diskspace.Check(spec.Dest, pr.TotalBytes-sc.completedBytes()); err != nil {
+			return pr, err
+		}
 	}
 
 	f, err := os.OpenFile(spec.Dest+".part", os.O_RDWR|os.O_CREATE, 0o644)
@@ -625,6 +643,13 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 			c.Done += int64(nr)
 			scMu.Unlock()
 			done.Add(int64(nr))
+			// Pace after accounting, so progress reports what has really
+			// arrived and the pause below is what the next read waits on.
+			// TCP backpressure does the rest: not reading is what slows the
+			// sender down.
+			if err := e.cfg.Limiter.Wait(ctx, nr); err != nil {
+				return written, err
+			}
 		}
 		if er == io.EOF {
 			if fullBody {

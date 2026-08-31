@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+
+	"macdm/internal/schedule"
 )
 
 // DefaultAddr is the loopback address the daemon listens on.
@@ -14,7 +16,7 @@ const DefaultAddr = "127.0.0.1:7345"
 // Version is bumped whenever the daemon's wire behaviour changes. The menu-bar
 // app compares it against its own build and restarts a mismatched daemon so a
 // stale background macdmd never lingers after a rebuild.
-const Version = "0.6.3"
+const Version = "0.6.4"
 
 // Config is the on-disk settings file (config.json in the support dir). Every
 // field has a working default, so the file is optional.
@@ -52,10 +54,54 @@ type Config struct {
 	// yt-dlp's pick, which is by bitrate rather than language.
 	AudioLang string `json:"audio_lang,omitempty"`
 
+	// SpeedLimitBps caps the total download rate in bytes per second, across
+	// every job at once rather than per download — which is what someone
+	// sharing a line means by "limit it to 2 MB/s". 0 means no limit.
+	SpeedLimitBps int64 `json:"speed_limit_bps,omitempty"`
+
+	// Schedule confines downloading to a recurring window — the point being to
+	// move traffic to hours nobody minds. Times are "HH:MM" local; ScheduleDays
+	// holds weekday numbers (Sunday = 0) the window may begin on.
+	ScheduleEnabled bool   `json:"schedule_enabled,omitempty"`
+	ScheduleStart   string `json:"schedule_start,omitempty"`
+	ScheduleStop    string `json:"schedule_stop,omitempty"`
+	ScheduleDays    []int  `json:"schedule_days,omitempty"`
+
 	// YtDlpChannel is "nightly" (default) or "stable". yt-dlp's own guidance is
 	// that most users want nightly — site fixes (TikTok, YouTube) land there days
 	// to weeks before a stable tag.
 	YtDlpChannel string `json:"ytdlp_channel,omitempty"`
+}
+
+// ScheduleWindow builds the download window from the stored fields. Anything
+// unparseable disables the schedule rather than guessing: a mistyped time must
+// not become a window that silently blocks every download.
+func (c Config) ScheduleWindow() schedule.Window {
+	if !c.ScheduleEnabled {
+		return schedule.Window{}
+	}
+	start, err := schedule.ParseHM(c.ScheduleStart)
+	if err != nil {
+		return schedule.Window{}
+	}
+	stop, err := schedule.ParseHM(c.ScheduleStop)
+	if err != nil {
+		return schedule.Window{}
+	}
+	w := schedule.Window{Enabled: true, Start: start, Stop: stop}
+	for _, d := range c.ScheduleDays {
+		if d >= 0 && d < 7 {
+			w.Days[d] = true
+		}
+	}
+	if !w.AnyDay() {
+		// No day chosen reads as "every day"; a window that could never open is
+		// never what someone meant.
+		for i := range w.Days {
+			w.Days[i] = true
+		}
+	}
+	return w
 }
 
 // AutoUpdateYtDlpEnabled reports the effective setting (default true).

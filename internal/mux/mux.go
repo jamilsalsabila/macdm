@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"macdm/internal/subs"
 	"time"
 )
 
@@ -96,6 +98,49 @@ func (m *Muxer) Concat(ctx context.Context, inputs []string, out string, onProgr
 	}
 	return m.run(ctx, total, onProgress,
 		"-f", "concat", "-safe", "0", "-i", list.Name(), "-c", "copy", out)
+}
+
+// ExtractClosedCaptions pulls CEA-608/708 captions out of a video file into an
+// SRT at out, and reports whether any were found.
+//
+// These captions ride inside the video bitstream (H.264/H.265 SEI) rather than
+// in a track of their own, so ffmpeg only exposes them through the movie
+// filter's `subcc` output. A file without captions simply yields nothing, which
+// is not an error — most videos have none.
+func (m *Muxer) ExtractClosedCaptions(ctx context.Context, video, out string) (bool, error) {
+	if m.ffmpeg == "" {
+		return false, fmt.Errorf("ffmpeg path not set")
+	}
+	// The filter takes a filename inside a graph description, where : \ and '
+	// are syntax. Escaping keeps a path with spaces or quotes working.
+	esc := strings.NewReplacer(`\`, `\\`, `'`, `\'`, `:`, `\:`).Replace(video)
+	tmp := out + ".raw"
+	defer os.Remove(tmp)
+
+	cmd := exec.CommandContext(ctx, m.ffmpeg,
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "movie='"+esc+"'[out+subcc]",
+		// -f srt explicitly: the temp file's extension is not .srt, and ffmpeg
+		// would otherwise fail to infer a format for it.
+		"-map", "0:s:0", "-f", "srt", tmp)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		// No caption stream at all: the map fails, and that is the normal case.
+		return false, nil
+	}
+	raw, err := os.ReadFile(tmp)
+	if err != nil || len(raw) == 0 {
+		return false, nil
+	}
+	cleaned := subs.CleanSRT(raw)
+	if len(cleaned) == 0 {
+		return false, nil // captions declared but empty
+	}
+	return true, os.WriteFile(out, cleaned, 0o644)
 }
 
 func (m *Muxer) run(ctx context.Context, total time.Duration, onProgress func(Progress), args ...string) error {

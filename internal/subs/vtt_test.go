@@ -209,3 +209,54 @@ func TestParseTimestampRejectsGarbage(t *testing.T) {
 		}
 	}
 }
+
+// --- CEA-608 SRT cleanup ---
+
+// ffmpeg's 608 decoder emits ASS positioning codes that an SRT player has no
+// idea about and renders as literal text.
+func TestCleanSRTStripsPositioning(t *testing.T) {
+	in := []byte("1\n00:00:00,000 --> 00:00:01,000\n" +
+		`<font face="Monospace">{\an7}eng: hello</font>` + "\n\n" +
+		"2\n00:00:01,000 --> 00:00:02,000\n" +
+		`{\an7}<font color="#00ff00">second</font>` + "\n")
+	out := string(CleanSRT(in))
+	if strings.Contains(out, `{\an`) {
+		t.Fatalf("positioning codes survived:\n%s", out)
+	}
+	// Colour is how 608 distinguishes speakers — those tags must stay.
+	if !strings.Contains(out, `color="#00ff00"`) || !strings.Contains(out, "eng: hello") {
+		t.Fatalf("content or styling lost:\n%s", out)
+	}
+	if !strings.Contains(out, "00:00:00,000 --> 00:00:01,000") {
+		t.Fatalf("timing lost:\n%s", out)
+	}
+}
+
+// A cue whose only content was a positioning code becomes empty; keeping it
+// would leave a blank subtitle flashing on screen, and renumbering has to stay
+// contiguous or players stop at the gap.
+func TestCleanSRTDropsEmptiedCuesAndRenumbers(t *testing.T) {
+	in := []byte("1\n00:00:00,000 --> 00:00:01,000\nreal one\n\n" +
+		"2\n00:00:01,000 --> 00:00:02,000\n" + `{\an7}` + "\n\n" +
+		"3\n00:00:02,000 --> 00:00:03,000\nreal two\n")
+	out := string(CleanSRT(in))
+	if strings.Count(out, "-->") != 2 {
+		t.Fatalf("want 2 surviving cues:\n%s", out)
+	}
+	if !strings.HasPrefix(out, "1\n") || !strings.Contains(out, "\n2\n") {
+		t.Fatalf("cues not renumbered contiguously:\n%s", out)
+	}
+	if strings.Contains(out, "\n3\n") {
+		t.Fatalf("stale index kept:\n%s", out)
+	}
+}
+
+func TestCleanSRTEmptyInput(t *testing.T) {
+	if got := CleanSRT(nil); got != nil {
+		t.Errorf("nil input should yield nil, got %q", got)
+	}
+	// A file of nothing but positioning codes has no captions in it.
+	if got := CleanSRT([]byte("1\n00:00:00,000 --> 00:00:01,000\n" + `{\an7}` + "\n")); got != nil {
+		t.Errorf("all-empty cues should yield nil, got %q", got)
+	}
+}
