@@ -2,6 +2,9 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"macdm/internal/diskspace"
+	"macdm/internal/ratelimit"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -144,5 +147,100 @@ func TestRunFragmentsGap(t *testing.T) {
 	err := e.RunFragments(context.Background(), filepath.Join(t.TempDir(), "o"), nil, frags, 2, nil)
 	if err == nil {
 		t.Fatal("expected a gap error")
+	}
+}
+
+// fragServer serves one logical file as Instagram-style byte-range slices and
+// returns the fragment list describing it.
+func fragServer(t *testing.T, size, step int) (*httptest.Server, []Fragment, []byte) {
+	t.Helper()
+	full := make([]byte, size)
+	for i := range full {
+		full[i] = byte(i*11 + 5)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bs, _ := strconv.Atoi(r.URL.Query().Get("bytestart"))
+		be, _ := strconv.Atoi(r.URL.Query().Get("byteend"))
+		if bs < 0 || be >= len(full) || bs > be {
+			http.Error(w, "range", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(full[bs : be+1])
+	}))
+	t.Cleanup(srv.Close)
+	var frags []Fragment
+	for start := 0; start < size; start += step {
+		end := start + step - 1
+		if end >= size {
+			end = size - 1
+		}
+		frags = append(frags, Fragment{
+			URL:   srv.URL + "/v.mp4?bytestart=" + strconv.Itoa(start) + "&byteend=" + strconv.Itoa(end),
+			Start: int64(start), End: int64(end),
+		})
+	}
+	return srv, frags, full
+}
+
+// Fragments are a separate download loop from Run, so the disk-space guard had
+// to be repeated here — without it an Instagram video larger than the disk
+// started happily and died partway, which is the exact bug the guard exists to
+// prevent everywhere else.
+func TestRunFragmentsRefusesWhenTheDiskIsTooSmall(t *testing.T) {
+	dir := t.TempDir()
+	avail, err := diskspace.Avail(dir)
+	if err != nil {
+		t.Skip("cannot measure the volume:", err)
+	}
+	_, frags, _ := fragServer(t, 4096, 1024)
+	// Claim a total far past the free space without serving any of it: the
+	// refusal must come before a single fragment is fetched.
+	frags[len(frags)-1].End = avail * 4
+
+	e := New(Config{MaxConns: 4, Timeout: 10 * time.Second})
+	dest := filepath.Join(dir, "huge.mp4")
+	err = e.RunFragments(context.Background(), dest, nil, frags, 4, nil)
+	if err == nil {
+		t.Fatal("a fragmented download four times the size of the disk must be refused")
+	}
+	var de *diskspace.Error
+	if !errors.As(err, &de) {
+		t.Fatalf("want a *diskspace.Error, got %T: %v", err, err)
+	}
+	if _, err := os.Stat(dest + ".part"); !os.IsNotExist(err) {
+		t.Error("no .part should be left by a download that never started")
+	}
+}
+
+// Likewise the speed limit: a ceiling wired only into Run would have quietly
+// exempted every Instagram and Facebook video.
+func TestRunFragmentsRespectsTheSpeedLimit(t *testing.T) {
+	const size = 1 << 20
+	_, frags, full := fragServer(t, size, 32<<10)
+
+	run := func(t *testing.T, bps int64) time.Duration {
+		t.Helper()
+		e := New(Config{MaxConns: 6, Timeout: 10 * time.Second, Limiter: ratelimit.New(bps)})
+		dest := filepath.Join(t.TempDir(), "out.mp4")
+		start := time.Now()
+		if err := e.RunFragments(context.Background(), dest, nil, frags, 6, nil); err != nil {
+			t.Fatalf("RunFragments: %v", err)
+		}
+		el := time.Since(start)
+		got, _ := os.ReadFile(dest)
+		if sha(got) != sha(full) {
+			t.Fatal("throttling must not corrupt the assembled file")
+		}
+		return el
+	}
+
+	limited := run(t, size) // 1 MB through a 1 MB/s ceiling
+	if limited < 600*time.Millisecond {
+		t.Errorf("1 MB through a 1 MB/s ceiling took %v — the limit never reached the fragment loop", limited)
+	}
+	unlimited := run(t, 0)
+	if unlimited > limited/2 {
+		t.Errorf("unlimited run took %v vs %v limited; the comparison proves nothing", unlimited, limited)
 	}
 }

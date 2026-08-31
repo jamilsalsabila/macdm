@@ -13,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"macdm/internal/diskspace"
 )
 
 // Fragment is one byte-range slice of a media file, addressed by its own URL
@@ -79,6 +81,21 @@ func (e *Engine) RunFragments(ctx context.Context, dest string, headers map[stri
 		copy(doneMask, sc.Done)
 	}
 
+	var doneBytes atomic.Int64
+	for i, d := range doneMask {
+		if d {
+			doneBytes.Add(frags[i].End - frags[i].Start + 1)
+		}
+	}
+
+	// Same guard as Run, and for the same reason: the Truncate below looks like
+	// a reservation but APFS makes the file sparse and holds back nothing. Only
+	// the fragments still missing are counted, so a resume is not refused over
+	// space its own .part file already occupies.
+	if err := diskspace.Check(dest, total-doneBytes.Load()); err != nil {
+		return err
+	}
+
 	f, err := os.OpenFile(dest+".part", os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return err
@@ -86,13 +103,6 @@ func (e *Engine) RunFragments(ctx context.Context, dest string, headers map[stri
 	defer f.Close()
 	if err := f.Truncate(total); err != nil {
 		return err
-	}
-
-	var doneBytes atomic.Int64
-	for i, d := range doneMask {
-		if d {
-			doneBytes.Add(frags[i].End - frags[i].Start + 1)
-		}
 	}
 
 	var mu sync.Mutex
@@ -260,6 +270,12 @@ func (e *Engine) fetchFragment(ctx context.Context, f *os.File, fr Fragment, hea
 			}
 			off += int64(nr)
 			n += int64(nr)
+			// The same shared ceiling the chunked path obeys. Fragments are a
+			// separate download loop, so a limiter wired only into Run would
+			// have quietly exempted every Instagram and Facebook video.
+			if err := e.cfg.Limiter.Wait(ctx, nr); err != nil {
+				return n, err
+			}
 		}
 		if er == io.EOF {
 			return n, nil
