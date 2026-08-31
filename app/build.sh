@@ -14,20 +14,42 @@ cd "$(dirname "$0")"
 mkdir -p .build
 
 MODE="${1:-debug}"
-FLAGS=(-o .build/MacDM)
-[[ "$MODE" == "release" || "$MODE" == "bundle" ]] && FLAGS=(-O "${FLAGS[@]}")
 
-swiftc "${FLAGS[@]}" Sources/MacDM/*.swift
-echo "built .build/MacDM"
+# The two architectures a shipped bundle must carry. Debug and release builds
+# stay native so the edit-compile loop is not paying for a second slice.
+ARCHES=(x86_64 arm64)
+MACOS_MIN=12.0
+
+if [[ "$MODE" == "bundle" ]]; then
+  # Universal: build each slice separately and join them. Cross-compiling to
+  # arm64 from an Intel Mac works with the Command Line Tools alone, though the
+  # first arm64 build may pause to construct a matching standard library.
+  for a in "${ARCHES[@]}"; do
+    echo "compiling MacDM ($a)"
+    swiftc -O -target "$a-apple-macos$MACOS_MIN" -o ".build/MacDM-$a" Sources/MacDM/*.swift
+  done
+  lipo -create "${ARCHES[@]/#/.build/MacDM-}" -output .build/MacDM
+else
+  FLAGS=(-o .build/MacDM)
+  [[ "$MODE" == "release" ]] && FLAGS=(-O "${FLAGS[@]}")
+  swiftc "${FLAGS[@]}" Sources/MacDM/*.swift
+fi
+echo "built .build/MacDM ($(lipo -archs .build/MacDM))"
 
 if [[ "$MODE" == "bundle" ]]; then
   APP=.build/MacDM.app
   VER=$(grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' ../internal/config/config.go | head -1 | tr -d '"')
   VER=${VER:-0.0.0}
 
-  # Go pieces + bundled external tools.
-  ( cd .. && go build -o bin/macdmd ./cmd/macdmd \
-                     && go build -o bin/macdm-nmhost ./cmd/macdm-nmhost )
+  # Go pieces (universal too) + bundled external tools.
+  for prog in macdmd macdm-nmhost; do
+    for a in "${ARCHES[@]}"; do
+      goarch=amd64; [[ "$a" == "arm64" ]] && goarch=arm64
+      ( cd .. && GOOS=darwin GOARCH="$goarch" go build -o "bin/$prog-$a" "./cmd/$prog" )
+    done
+    ( cd .. && lipo -create "bin/$prog-x86_64" "bin/$prog-arm64" -output "bin/$prog" \
+                && rm -f "bin/$prog-x86_64" "bin/$prog-arm64" )
+  done
   ./fetch-tools.sh
 
   rm -rf "$APP"
@@ -38,6 +60,21 @@ if [[ "$MODE" == "bundle" ]]; then
   cp ../bin/macdmd        "$APP/Contents/MacOS/macdmd"
   cp ../bin/macdm-nmhost  "$APP/Contents/MacOS/macdm-nmhost"
   cp .tools/ffmpeg .tools/yt-dlp .tools/yt-dlp_macos "$APP/Contents/Resources/bin/"
+
+  # A bundle that is universal everywhere except one binary is not universal:
+  # that binary is the one that fails on the other kind of Mac. yt-dlp is the
+  # exception on purpose — it is a Python zipapp, so it has no architecture.
+  for f in "$APP/Contents/MacOS/"* "$APP/Contents/Resources/bin/ffmpeg" \
+           "$APP/Contents/Resources/bin/yt-dlp_macos"; do
+    have=$(lipo -archs "$f" 2>/dev/null || echo "?")
+    for a in "${ARCHES[@]}"; do
+      grep -qw "$a" <<<"$have" || {
+        echo "FATAL: $(basename "$f") is missing the $a slice (has: $have)" >&2
+        exit 1
+      }
+    done
+    printf '  %-16s %s\n' "$(basename "$f")" "$have"
+  done
 
   # App icon (Dock + Finder). Regenerate if the generator is newer.
   if [[ ! -f AppIcon.icns || make-icon.swift -nt AppIcon.icns ]]; then
