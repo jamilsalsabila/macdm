@@ -478,3 +478,85 @@ func TestWorkStealing(t *testing.T) {
 		t.Fatalf("work-stealing did not kick in: took %v (expected < 2.5s)", elapsed)
 	}
 }
+
+// TestWorkStealingOnResume: resuming with only ONE chunk left is exactly the
+// long-tail case stealing exists to fix. Regression guard for a worker-count
+// cap that used to start a single worker here, disabling stealing entirely.
+func TestWorkStealingOnResume(t *testing.T) {
+	const total = 8 << 20
+	body := make([]byte, total)
+	rand.New(rand.NewSource(17)).Read(body)
+
+	var inflight, peak atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := inflight.Add(1)
+		for {
+			p := peak.Load()
+			if n <= p || peak.CompareAndSwap(p, n) {
+				break
+			}
+		}
+		defer inflight.Add(-1)
+		w.Header().Set("Accept-Ranges", "bytes")
+		start, end := int64(0), int64(total-1)
+		if rg := r.Header.Get("Range"); strings.HasPrefix(rg, "bytes=") {
+			p := strings.SplitN(strings.TrimPrefix(rg, "bytes="), "-", 2)
+			start, _ = strconv.ParseInt(p[0], 10, 64)
+			if p[1] != "" {
+				end, _ = strconv.ParseInt(p[1], 10, 64)
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		seg := body[start : end+1]
+		fl, _ := w.(http.Flusher)
+		for off := 0; off < len(seg); off += 32 << 10 {
+			e := off + 32<<10
+			if e > len(seg) {
+				e = len(seg)
+			}
+			w.Write(seg[off:e])
+			if fl != nil {
+				fl.Flush()
+			}
+			time.Sleep(30 * time.Millisecond) // slow, per connection
+		}
+	}))
+	defer srv.Close()
+
+	dest := filepath.Join(t.TempDir(), "resume.bin")
+	f, err := os.Create(dest + ".part")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(total); err != nil {
+		t.Fatal(err)
+	}
+	// 8 chunks, the first 7 already finished — only the tail remains. Their real
+	// bytes must already be in the .part, or the final checksum can't match.
+	sc := newSidecar(srv.URL, &Probe{TotalBytes: total, AcceptRanges: true}, 8, 256<<10)
+	for i := 0; i < len(sc.Chunks)-1; i++ {
+		c := &sc.Chunks[i]
+		if _, err := f.WriteAt(body[c.Start:c.End+1], c.Start); err != nil {
+			t.Fatal(err)
+		}
+		c.Done = c.length()
+	}
+	f.Close()
+	if err := sc.save(dest); err != nil {
+		t.Fatal(err)
+	}
+
+	e := New(Config{MaxConns: 8, MinChunk: 256 << 10, Timeout: 30 * time.Second})
+	if _, err := e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if sha(got) != sha(body) {
+		t.Fatalf("content mismatch: %d of %d bytes", len(got), len(body))
+	}
+	if peak.Load() < 2 {
+		t.Fatalf("work-stealing never engaged on resume: peak %d concurrent request(s)", peak.Load())
+	}
+}

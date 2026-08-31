@@ -67,11 +67,30 @@ func New(cfg Config, st *store.Store) *Manager {
 		running: map[string]context.CancelFunc{},
 		hub:     newProposalHub(),
 	}
-	// Stream/extract jobs write into per-job scratch dirs under WorkDir. Nothing
-	// resumes from those (HLS/DASH/extract restart), so a crash-leftover pile is
-	// pure waste — clear it on startup.
-	_ = os.RemoveAll(cfg.WorkDir)
+	m.pruneWorkDirs()
 	return m
+}
+
+// pruneWorkDirs deletes per-job scratch dirs that no live job owns. Dirs
+// belonging to an unfinished job are kept: stream segments and yt-dlp's .part
+// files let a resume pick up where the previous run stopped, which matters most
+// exactly when the daemon restarted mid-download.
+func (m *Manager) pruneWorkDirs() {
+	entries, err := os.ReadDir(m.cfg.WorkDir)
+	if err != nil {
+		return // no scratch root yet — nothing to prune
+	}
+	keep := map[string]bool{}
+	for _, j := range m.st.List() {
+		if j.Status != store.StatusCompleted {
+			keep[j.ID] = true
+		}
+	}
+	for _, e := range entries {
+		if !keep[e.Name()] {
+			_ = os.RemoveAll(filepath.Join(m.cfg.WorkDir, e.Name()))
+		}
+	}
 }
 
 // Store exposes the underlying store for the API layer (list/get/watch).
@@ -219,9 +238,11 @@ func (m *Manager) Pause(id string) error {
 	return nil
 }
 
-// Remove pauses (if running) and deletes a job. Files on disk are left in place.
+// Remove pauses (if running) and deletes a job. The finished/partial file in the
+// download folder is left in place; the private scratch dir is not.
 func (m *Manager) Remove(id string) error {
 	_ = m.Pause(id)
+	_ = os.RemoveAll(m.workDir(id))
 	return m.st.Delete(id)
 }
 
@@ -240,6 +261,12 @@ func (m *Manager) start(id string) {
 			m.mu.Lock()
 			delete(m.running, id)
 			m.mu.Unlock()
+			// If the job was deleted while running, Remove's own cleanup raced
+			// this goroutine and may have missed files it went on to write.
+			// Now that the work has stopped, clear the scratch dir for good.
+			if _, err := m.st.Get(id); errors.Is(err, store.ErrNotFound) {
+				_ = os.RemoveAll(m.workDir(id))
+			}
 		}()
 
 		// Wait for a concurrency slot, but stay cancellable while queued.

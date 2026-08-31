@@ -432,16 +432,33 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 // fetchSegment downloads one segment to dst, streaming straight to disk so the
 // assembler never holds a whole segment (let alone conns×segments) in memory.
 // AES-128 segments are fetched to a scratch file and decrypted into dst.
+//
+// The final file only ever appears via an atomic rename, so dst existing means
+// dst is complete: a retry of a partly-assembled stream skips what it already
+// has instead of re-downloading the whole thing.
 func (c *Client) fetchSegment(ctx context.Context, seg Segment, dst string, cache *sync.Map, onBytes func(int)) error {
+	if fi, err := os.Stat(dst); err == nil && fi.Size() > 0 {
+		if onBytes != nil {
+			onBytes(int(fi.Size())) // keep byte accounting honest across a resume
+		}
+		return nil
+	}
+	tmp := dst + ".part"
 	if seg.Key == nil || strings.ToUpper(seg.Key.Method) != "AES-128" {
-		return c.fetchToFile(ctx, seg.URL, dst, onBytes)
+		if err := c.fetchToFile(ctx, seg.URL, tmp, onBytes); err != nil {
+			return err
+		}
+		return os.Rename(tmp, dst)
 	}
 	enc := dst + ".enc"
 	if err := c.fetchToFile(ctx, seg.URL, enc, onBytes); err != nil {
 		return err
 	}
 	defer os.Remove(enc)
-	return c.decryptFileAES128(ctx, seg, enc, dst, cache)
+	if err := c.decryptFileAES128(ctx, seg, enc, tmp, cache); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 // fetchToFile streams rawurl into dst, reporting each chunk via onBytes.

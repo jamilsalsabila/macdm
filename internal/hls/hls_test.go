@@ -232,3 +232,95 @@ func TestAssembleWorkerCount(t *testing.T) {
 		t.Fatalf("expected concurrent workers, peak active was %d", maxWorkers.Load())
 	}
 }
+
+// TestAssembleResumesExistingSegments: a second Assemble into the same scratch
+// dir must reuse the segments already on disk (so an automatic retry doesn't
+// re-download the whole stream) and still produce byte-identical output.
+func TestAssembleResumesExistingSegments(t *testing.T) {
+	var fetches atomic.Int64
+	mux := http.NewServeMux()
+	var want []byte
+	for i := 0; i < 6; i++ {
+		i := i
+		payload := []byte(strings.Repeat(string(rune('A'+i)), 1024))
+		want = append(want, payload...)
+		mux.HandleFunc(fmt.Sprintf("/s%d.ts", i), func(w http.ResponseWriter, r *http.Request) {
+			fetches.Add(1)
+			w.Write(payload)
+		})
+	}
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	var pl strings.Builder
+	pl.WriteString("#EXTM3U\n#EXT-X-TARGETDURATION:2\n")
+	for i := 0; i < 6; i++ {
+		fmt.Fprintf(&pl, "#EXTINF:2.0,\n%s/s%d.ts\n", srv.URL, i)
+	}
+	pl.WriteString("#EXT-X-ENDLIST\n")
+	mux.HandleFunc("/i.m3u8", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, pl.String()) })
+
+	c := NewClient(srv.Client(), nil)
+	p, err := c.Parse(context.Background(), srv.URL+"/i.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scratch := t.TempDir()
+	out1 := filepath.Join(t.TempDir(), "a.ts")
+	if err := c.Assemble(context.Background(), p, AssembleOptions{Dir: scratch, OutFile: out1, Conns: 3}, nil); err != nil {
+		t.Fatal(err)
+	}
+	first := fetches.Load()
+	if first != 6 {
+		t.Fatalf("first pass fetched %d segments, want 6", first)
+	}
+
+	// Second pass over the same scratch dir: every segment is already there.
+	out2 := filepath.Join(t.TempDir(), "b.ts")
+	if err := c.Assemble(context.Background(), p, AssembleOptions{Dir: scratch, OutFile: out2, Conns: 3}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if extra := fetches.Load() - first; extra != 0 {
+		t.Fatalf("resume re-downloaded %d segments — reuse is broken", extra)
+	}
+
+	got1, _ := os.ReadFile(out1)
+	got2, _ := os.ReadFile(out2)
+	if string(got1) != string(want) {
+		t.Fatalf("first pass content wrong (%d bytes)", len(got1))
+	}
+	if string(got2) != string(want) {
+		t.Fatalf("resumed pass content wrong (%d bytes)", len(got2))
+	}
+}
+
+// A half-written segment must never be mistaken for a complete one: only an
+// atomic rename publishes the final name, so a stray .part is ignored.
+func TestAssembleIgnoresPartialSegmentFile(t *testing.T) {
+	mux := http.NewServeMux()
+	payload := []byte(strings.Repeat("Z", 2048))
+	mux.HandleFunc("/s0.ts", func(w http.ResponseWriter, r *http.Request) { w.Write(payload) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	pl := fmt.Sprintf("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2.0,\n%s/s0.ts\n#EXT-X-ENDLIST\n", srv.URL)
+	mux.HandleFunc("/i.m3u8", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, pl) })
+
+	c := NewClient(srv.Client(), nil)
+	p, err := c.Parse(context.Background(), srv.URL+"/i.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scratch := t.TempDir()
+	// simulate a crash mid-segment: the temp file exists, the final name does not
+	if err := os.WriteFile(filepath.Join(scratch, "seg-000000.part"), []byte("truncated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "o.ts")
+	if err := c.Assemble(context.Background(), p, AssembleOptions{Dir: scratch, OutFile: out, Conns: 1}, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != string(payload) {
+		t.Fatalf("partial scratch file corrupted the output: %d bytes", len(got))
+	}
+}
