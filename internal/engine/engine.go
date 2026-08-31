@@ -214,6 +214,8 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 	case multi && sc.Conns != conns:
 		// connection count changed since last run — re-split the missing bytes
 		sc.replanConns(conns, e.cfg.MinChunk)
+	default:
+		sc.reserveSteal(conns) // resuming an earlier plan — keep stealing headroom
 	}
 
 	f, err := os.OpenFile(spec.Dest+".part", os.O_RDWR|os.O_CREATE, 0o644)
@@ -325,15 +327,84 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 		}
 	}()
 
-	// fetch every not-yet-complete chunk, at most `conns` in flight
-	g := newGroup(conns)
-	for i := range sc.Chunks {
-		c := &sc.Chunks[i]
-		if c.remaining() <= 0 {
-			continue
+	// Work-stealing pool: `conns` workers, each pulls the next unstarted chunk;
+	// once every chunk is claimed, an idle worker splits the biggest in-flight
+	// chunk and takes its second half, so one slow connection can't leave a long
+	// tail while the others sit idle.
+	minChunk := e.cfg.MinChunk
+	if minChunk < 1 {
+		minChunk = 1 << 20
+	}
+	var stealMu sync.Mutex
+	next := func() *chunk {
+		if ctx.Err() != nil {
+			return nil
 		}
+		stealMu.Lock()
+		defer stealMu.Unlock()
+		scMu.Lock()
+		defer scMu.Unlock()
+
+		// 1. a chunk nobody has started yet
+		for i := range sc.Chunks {
+			c := &sc.Chunks[i]
+			if c.Status == "" && c.remaining() > 0 {
+				c.Status = "connecting" // claim it
+				return c
+			}
+		}
+		// 2. otherwise split the biggest range still in flight
+		if len(sc.Chunks) >= cap(sc.Chunks) {
+			return nil
+		}
+		var best *chunk
+		var bestLeft int64
+		for i := range sc.Chunks {
+			c := &sc.Chunks[i]
+			if c.End < 0 || c.Status == "done" {
+				continue
+			}
+			if left := c.End - (c.Start + c.Done) + 1; left > bestLeft {
+				bestLeft, best = left, c
+			}
+		}
+		if best == nil || bestLeft < 2*minChunk {
+			return nil
+		}
+		mid := best.Start + best.Done + bestLeft/2
+		origEnd := best.End
+		best.End = mid - 1 // the owner notices via the re-read in fetchChunkOnce
+		sc.Chunks = append(sc.Chunks, chunk{
+			Index: len(sc.Chunks), Start: mid, End: origEnd, Status: "connecting",
+		})
+		return &sc.Chunks[len(sc.Chunks)-1]
+	}
+
+	scMu.Lock()
+	pending := 0
+	for i := range sc.Chunks {
+		if sc.Chunks[i].remaining() > 0 {
+			pending++
+		}
+	}
+	scMu.Unlock()
+	workers := conns
+	if workers > pending {
+		workers = pending
+	}
+
+	g := newGroup(conns)
+	for w := 0; w < workers; w++ {
 		g.go_(func() error {
-			return e.fetchChunk(ctx, spec, f, c, &scMu, &done)
+			for {
+				c := next()
+				if c == nil {
+					return nil
+				}
+				if err := e.fetchChunk(ctx, spec, f, c, &scMu, &done); err != nil {
+					return err
+				}
+			}
 		})
 	}
 	err = g.wait()
@@ -480,15 +551,18 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 		}
 	}
 
+	scMu.Lock()
 	start := c.Start + c.Done
+	chunkEnd := c.End
+	scMu.Unlock()
 	setChunkStatus(scMu, c, "connecting")
 	r, err := e.req(rctx, http.MethodGet, spec.URL, spec.Headers)
 	if err != nil {
 		return 0, err
 	}
-	single := c.Start == 0 && c.End < 0
+	single := c.Start == 0 && chunkEnd < 0
 	if !single {
-		r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, c.End))
+		r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, chunkEnd))
 	}
 
 	resp, err := e.client.Do(r)
@@ -519,23 +593,30 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 	buf := make([]byte, 128*1024)
 	var written int64
 	off := start
-	limit := int64(-1)
-	maxAttempt := int64(-1) // bytes this ranged attempt may still write
-	if !single && !fullBody {
-		limit = c.length()
-		maxAttempt = c.End - start + 1
-	}
+	ranged := !single && !fullBody
 	for {
 		nr, er := resp.Body.Read(buf)
+
+		// Re-read the chunk end every iteration: work-stealing may have shrunk
+		// it (another worker took the tail), and a compliant 206 never
+		// over-delivers but a broken server might — either way, one byte past
+		// the boundary corrupts the neighbouring range.
+		endNow := int64(-1)
+		if ranged {
+			scMu.Lock()
+			endNow = c.End
+			scMu.Unlock()
+		}
+
 		if nr > 0 {
-			// A compliant 206 never over-delivers, but clamp anyway: one wrong
-			// byte past c.End would corrupt the neighbouring chunk's region
-			// (fatal for archives/disk images, not just video).
-			if maxAttempt >= 0 && written+int64(nr) > maxAttempt {
-				nr = int(maxAttempt - written)
-			}
-			if nr <= 0 {
-				return written, nil
+			if endNow >= 0 {
+				room := endNow - off + 1
+				if room <= 0 {
+					return written, nil // range fully taken — nothing left to do
+				}
+				if int64(nr) > room {
+					nr = int(room)
+				}
 			}
 			lastRead.Store(time.Now().UnixNano())
 			if _, ew := f.WriteAt(buf[:nr], off); ew != nil {
@@ -552,11 +633,10 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 			if fullBody {
 				return written, errRangeIgnored // Run: mark siblings done, we have it all
 			}
-			// A ranged chunk that hit EOF before its last byte is a truncated
-			// response (server dropped the connection cleanly). Marking it "done"
-			// here would rename a corrupt .part to the final file. Treat it as a
-			// stall so fetchChunk retries and resumes from c.Done.
-			if limit >= 0 && c.Done < limit {
+			// EOF before the (possibly shrunk) end means the server dropped the
+			// connection early. Marking it "done" would rename a corrupt .part;
+			// return errStalled so fetchChunk retries and resumes from c.Done.
+			if endNow >= 0 && off <= endNow {
 				return written, errStalled
 			}
 			return written, nil
@@ -567,8 +647,8 @@ func (e *Engine) fetchChunkOnce(ctx context.Context, spec DownloadSpec, f *os.Fi
 			}
 			return written, er
 		}
-		if limit >= 0 && c.Done >= limit {
-			return written, nil
+		if endNow >= 0 && off > endNow {
+			return written, nil // chunk complete
 		}
 	}
 }

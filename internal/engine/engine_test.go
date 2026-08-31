@@ -418,3 +418,63 @@ func TestFlakyHostManyDrops(t *testing.T) {
 		t.Fatalf("expected many resume attempts, got %d", hits.Load())
 	}
 }
+
+// TestWorkStealing: the first 2 MiB of the file is served at ~512 KiB/s *per
+// connection*; the rest is instant. With a fixed chunk-per-connection split the
+// download is gated by that one slow 2 MiB chunk (~4s). Work-stealing lets the
+// finished workers pile onto the slow range so it completes in ~1s.
+func TestWorkStealing(t *testing.T) {
+	const total = 8 << 20
+	const slow = 2 << 20
+	body := make([]byte, total)
+	rand.New(rand.NewSource(5)).Read(body)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		start, end := int64(0), int64(total-1)
+		if rg := r.Header.Get("Range"); strings.HasPrefix(rg, "bytes=") {
+			p := strings.SplitN(strings.TrimPrefix(rg, "bytes="), "-", 2)
+			start, _ = strconv.ParseInt(p[0], 10, 64)
+			if p[1] != "" {
+				end, _ = strconv.ParseInt(p[1], 10, 64)
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, total))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		seg := body[start : end+1]
+		fl, _ := w.(http.Flusher)
+		if start < slow {
+			for off := 0; off < len(seg); off += 32 << 10 {
+				e := off + 32<<10
+				if e > len(seg) {
+					e = len(seg)
+				}
+				w.Write(seg[off:e])
+				if fl != nil {
+					fl.Flush()
+				}
+				time.Sleep(60 * time.Millisecond) // ~512 KiB/s per connection
+			}
+			return
+		}
+		w.Write(seg)
+	}))
+	defer srv.Close()
+
+	e := New(Config{MaxConns: 4, MinChunk: 256 << 10, Timeout: 30 * time.Second})
+	dest := filepath.Join(t.TempDir(), "big.bin")
+	t0 := time.Now()
+	if _, err := e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	elapsed := time.Since(t0)
+	got, _ := os.ReadFile(dest)
+	if sha(got) != sha(body) {
+		t.Fatalf("content mismatch: %d of %d bytes", len(got), len(body))
+	}
+	t.Logf("work-stealing download took %v", elapsed)
+	if elapsed > 2500*time.Millisecond {
+		t.Fatalf("work-stealing did not kick in: took %v (expected < 2.5s)", elapsed)
+	}
+}
