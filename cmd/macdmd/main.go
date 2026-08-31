@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,8 +29,19 @@ func main() {
 	dir := flag.String("dir", cfg.DownloadDir, "download directory")
 	flag.Parse()
 
+	// Claim the port FIRST. ResumeAll below restarts every unfinished job, and
+	// binding only inside the serving goroutine meant a second macdmd would
+	// resume all of them — racing the running daemon on the same .part files and
+	// jobs.json — before discovering the address was taken and dying via
+	// log.Fatalf, which skips every deferred cleanup.
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatalf("cannot listen on %s: %v (is another macdmd already running?)", *addr, err)
+	}
+
 	st, err := store.Open(config.StorePath())
 	if err != nil {
+		_ = ln.Close()
 		log.Fatalf("open store: %v", err)
 	}
 	defer st.Close() // final flush of any pending progress write
@@ -59,20 +71,23 @@ func main() {
 	go tools.AutoUpdateLoop(bgCtx, cfg)
 
 	srv := &http.Server{
-		Addr:              *addr,
 		Handler:           api.New(mgr),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
 	go func() {
 		log.Printf("macdmd listening on http://%s  (downloads -> %s)", *addr, *dir)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
+		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			// Not Fatalf: that calls os.Exit and would skip st.Close()'s final
+			// flush and the manager shutdown.
+			log.Printf("serve: %v", err)
+			sig <- syscall.SIGTERM
 		}
 	}()
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Print("shutting down")
 	bgCancel()

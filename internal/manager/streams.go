@@ -208,11 +208,28 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 		return err
 	}
 
-	if err := mx.Remux(ctx, assembled, dest, muxProg("Finalising")); err != nil {
+	// Mux into the scratch dir and move the finished file into place, rather
+	// than pointing ffmpeg at the user's Downloads folder: a cancelled or failed
+	// mux would otherwise leave a truncated .mp4 sitting there under the final
+	// name, indistinguishable from a completed download. Same guarantee the
+	// HTTP engine gets from .part + rename.
+	muxed := filepath.Join(wd, "muxed"+extOr(dest, ".mp4"))
+	if err := mx.Remux(ctx, assembled, muxed, muxProg("Finalising")); err != nil {
+		return err
+	}
+	if err := moveFile(muxed, dest); err != nil {
 		return err
 	}
 	_ = os.RemoveAll(wd) // assembled successfully — scratch segments no longer needed
 	return finalize(m, id, dest)
+}
+
+// extOr returns path's extension, or fallback when it has none.
+func extOr(path, fallback string) string {
+	if e := filepath.Ext(path); e != "" {
+		return e
+	}
+	return fallback
 }
 
 func (m *Manager) execDASH(ctx context.Context, id string, j *store.Job, wd, dest string, mx *mux.Muxer, prog segProgFn, muxProg muxProgFn) error {
@@ -265,22 +282,30 @@ func (m *Manager) execDASH(ctx context.Context, id string, j *store.Job, wd, des
 		}
 	}
 
+	// As in execHLS: mux into the scratch dir, then move into place, so a failed
+	// or cancelled mux never leaves a truncated file under the final name.
+	// The extension drives ffmpeg's choice of muxer, so it has to be carried.
+	muxed := filepath.Join(wd, "muxed.mp4")
 	switch {
 	case vFile != "" && aFile != "":
-		if err := mx.Combine(ctx, vFile, aFile, dest, muxProg("Merging video + audio")); err != nil {
+		if err := mx.Combine(ctx, vFile, aFile, muxed, muxProg("Merging video + audio")); err != nil {
 			return err
 		}
 	case vFile != "":
-		if err := mx.Remux(ctx, vFile, dest, muxProg("Finalising")); err != nil {
+		if err := mx.Remux(ctx, vFile, muxed, muxProg("Finalising")); err != nil {
 			return err
 		}
 	case aFile != "":
 		dest = ensureExt(dest, ".m4a")
-		if err := mx.Remux(ctx, aFile, dest, muxProg("Finalising")); err != nil {
+		muxed = filepath.Join(wd, "muxed.m4a")
+		if err := mx.Remux(ctx, aFile, muxed, muxProg("Finalising")); err != nil {
 			return err
 		}
 	default:
 		return fmt.Errorf("no tracks to assemble")
+	}
+	if err := moveFile(muxed, dest); err != nil {
+		return err
 	}
 	_ = os.RemoveAll(wd) // assembled successfully — scratch segments no longer needed
 	return finalize(m, id, dest)

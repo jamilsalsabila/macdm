@@ -92,21 +92,30 @@ func cmdAdd(args []string) error {
 	var url string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
-		case "-o":
+		case "-o", "-n", "-H":
+			// A trailing flag with no value used to run off the end of args and
+			// panic with an index-out-of-range.
+			flag := args[i]
 			i++
-			body["filename"] = args[i]
-		case "-n":
-			i++
-			var n int
-			fmt.Sscan(args[i], &n)
-			body["conns"] = n
-		case "-H":
-			i++
-			k, v, ok := strings.Cut(args[i], ":")
-			if !ok {
-				return fmt.Errorf("bad -H %q (want \"Key: value\")", args[i])
+			if i >= len(args) {
+				return fmt.Errorf("%s needs a value", flag)
 			}
-			headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
+			switch flag {
+			case "-o":
+				body["filename"] = args[i]
+			case "-n":
+				var n int
+				if _, err := fmt.Sscan(args[i], &n); err != nil || n < 1 || n > 64 {
+					return fmt.Errorf("bad -n %q (want 1–64)", args[i])
+				}
+				body["conns"] = n
+			case "-H":
+				k, v, ok := strings.Cut(args[i], ":")
+				if !ok {
+					return fmt.Errorf("bad -H %q (want \"Key: value\")", args[i])
+				}
+				headers[strings.TrimSpace(k)] = strings.TrimSpace(v)
+			}
 		default:
 			url = args[i]
 		}
