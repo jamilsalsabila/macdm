@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ note: Notification) {
         FirstRunSetup.run()
+        Notifier.configure()
         DaemonClient.shared.configure(addr: addr)
 
         NSApp.mainMenu = MainMenu.build(target: self,

@@ -144,6 +144,10 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     var onProposal: ((Proposal) -> Void)?
 
     private(set) var jobs: [String: Job] = [:]
+    /// When the current SSE stream connected. The daemon replays every existing
+    /// job (old completed ones included) right after connect; we suppress
+    /// "download complete" notifications for a moment so that backlog is silent.
+    private var streamConnectedAt = Date.distantPast
     private var sseTask: URLSessionDataTask?
     private lazy var session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
     private var buffer = Data()
@@ -276,7 +280,14 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
         guard let t = try? JSONDecoder().decode(TypeOnly.self, from: json) else { return }
         switch t.type {
         case "job":
-            if let e = try? JSONDecoder().decode(JobEnvelope.self, from: json) { jobs[e.job.id] = e.job }
+            if let e = try? JSONDecoder().decode(JobEnvelope.self, from: json) {
+                let prev = jobs[e.job.id]
+                jobs[e.job.id] = e.job
+                if e.job.status == "completed", prev?.status != "completed",
+                   Date().timeIntervalSince(streamConnectedAt) > 3 {
+                    DispatchQueue.main.async { Notifier.downloadFinished(e.job) }
+                }
+            }
         case "delete":
             if let e = try? JSONDecoder().decode(JobEnvelope.self, from: json) { jobs.removeValue(forKey: e.job.id) }
         case "proposal":
@@ -295,6 +306,7 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     func urlSession(_ s: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         if let h = response as? HTTPURLResponse, h.statusCode == 200 {
+            streamConnectedAt = Date()
             DispatchQueue.main.async { self.onConnection?(true) }
         }
         completionHandler(.allow)
