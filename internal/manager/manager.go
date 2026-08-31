@@ -107,6 +107,8 @@ type AddOptions struct {
 	Dest      string // full path override
 	FormatID  string // quality selector (yt-dlp -f expr | HLS variant URL | "hNNN")
 	Quality   string // human label for display
+	AudioLang string // dubbed soundtrack language ("id"); "" => Settings default
+	SubLangs  string // yt-dlp --sub-langs expression; "" => Settings default
 	Formats   []store.FormatChoice
 	Fragments []store.Fragment // byte-range slices to assemble (Instagram/FB)
 }
@@ -148,19 +150,21 @@ func (m *Manager) Add(rawurl string, opt AddOptions) (*store.Job, error) {
 	}
 
 	j := &store.Job{
-		ID:          newID(),
-		Kind:        kind,
-		URL:         rawurl,
-		Dest:        dest,
-		Filename:    filepath.Base(dest),
-		Headers:     opt.Headers,
-		Status:      store.StatusQueued,
-		Connections: opt.Conns,
-		FormatID:    opt.FormatID,
-		Quality:     opt.Quality,
-		Formats:     opt.Formats,
-		Fragments:   opt.Fragments,
-		CreatedAt:   time.Now(),
+		ID:            newID(),
+		Kind:          kind,
+		URL:           rawurl,
+		Dest:          dest,
+		Filename:      filepath.Base(dest),
+		Headers:       opt.Headers,
+		AudioLang:     opt.AudioLang,
+		SubtitleLangs: opt.SubLangs,
+		Status:        store.StatusQueued,
+		Connections:   opt.Conns,
+		FormatID:      opt.FormatID,
+		Quality:       opt.Quality,
+		Formats:       opt.Formats,
+		Fragments:     opt.Fragments,
+		CreatedAt:     time.Now(),
 	}
 	if err := m.st.Put(j); err != nil {
 		return nil, err

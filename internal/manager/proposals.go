@@ -42,6 +42,9 @@ type AcceptOptions struct {
 	Conns    int
 	FormatID string // selector/variant-url/height token from the chosen FormatChoice
 	Quality  string // human label, for display
+	// Extractor-path overrides; empty falls back to the Settings default.
+	AudioLang string
+	SubLangs  string
 }
 
 // Notice is a manager-level event (proposals, etc.) delivered over SSE
@@ -271,13 +274,15 @@ func (m *Manager) Accept(id string, opt AcceptOptions) (*store.Job, error) {
 	}
 
 	j, err := m.Add(p.URL, AddOptions{
-		Headers:  p.Headers,
-		Filename: name,
-		Dest:     dest,
-		Conns:    opt.Conns,
-		FormatID: opt.FormatID,
-		Quality:  opt.Quality,
-		Formats:  p.Formats,
+		Headers:   p.Headers,
+		Filename:  name,
+		Dest:      dest,
+		Conns:     opt.Conns,
+		FormatID:  opt.FormatID,
+		AudioLang: opt.AudioLang,
+		SubLangs:  opt.SubLangs,
+		Quality:   opt.Quality,
+		Formats:   p.Formats,
 	})
 	if err != nil {
 		return nil, err

@@ -18,6 +18,9 @@ final class SettingsWindowController: NSWindowController {
     private let updateBtn = NSButton(title: "Update now", target: nil, action: nil)
     private let channelPop = NSPopUpButton(frame: .zero, pullsDown: false)
     private let cookiesPop = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let subLangsField = NSTextField()
+    private let autoSubsBox = NSButton(checkboxWithTitle: "Also accept auto-generated captions", target: nil, action: nil)
+    private let audioLangField = NSTextField()
 
     private let cookieBrowsers = ["none", "firefox", "chrome", "brave", "edge", "safari", "chromium", "vivaldi", "opera"]
 
@@ -90,8 +93,24 @@ final class SettingsWindowController: NSWindowController {
         let cookiesHint = NSTextField(labelWithString: "(use your login for YouTube / Instagram / private videos)")
         cookiesHint.textColor = .tertiaryLabelColor
         cookiesHint.font = .systemFont(ofSize: 10)
+        subLangsField.placeholderString = "e.g. id,en — blank for none"
+        subLangsField.target = self
+        subLangsField.action = #selector(subtitleSettingsChanged)
+        subLangsField.widthAnchor.constraint(equalToConstant: 200).isActive = true
+        autoSubsBox.target = self
+        autoSubsBox.action = #selector(subtitleSettingsChanged)
+
+        audioLangField.placeholderString = "e.g. id — blank for default"
+        audioLangField.target = self
+        audioLangField.action = #selector(audioLangChanged)
+        audioLangField.widthAnchor.constraint(equalToConstant: 200).isActive = true
+
+        let subsRow = NSStackView(views: [NSTextField(labelWithString: "Subtitle languages:"), subLangsField])
+        let autoRow = NSStackView(views: [NSTextField(labelWithString: ""), autoSubsBox])
+        let audioRow = NSStackView(views: [NSTextField(labelWithString: "Audio language:"), audioLangField])
         let cookiesRow = NSStackView(views: [NSTextField(labelWithString: "Cookies from browser:"), cookiesPop])
         cookiesRow.spacing = 6
+        for r in [subsRow, autoRow, audioRow] { r.spacing = 6 }
 
         let sep = NSBox()
         sep.boxType = .separator
@@ -101,6 +120,9 @@ final class SettingsWindowController: NSWindowController {
             NSStackView(views: [autoUpdate, updateBtn]),
             channelRow,
             cookiesRow,
+            subsRow,
+            autoRow,
+            audioRow,
             cookiesHint,
             ffmpegLabel,
         ])
@@ -160,6 +182,9 @@ final class SettingsWindowController: NSWindowController {
             self.ffmpegLabel.stringValue = "ffmpeg: " + (info.ffmpeg.version.isEmpty ? "not found" : info.ffmpeg.version)
             self.autoUpdate.state = info.auto_update ? .on : .off
             self.channelPop.selectItem(at: (yt.channel == "stable") ? 1 : 0)
+            self.subLangsField.stringValue = info.subtitle_langs ?? ""
+            self.autoSubsBox.state = (info.auto_subs ?? false) ? .on : .off
+            self.audioLangField.stringValue = info.audio_lang ?? ""
             let cf = (info.cookies_from ?? "").lowercased()
             self.cookiesPop.selectItem(at: max(0, self.cookieBrowsers.firstIndex(of: cf.isEmpty ? "none" : cf) ?? 0))
         }
@@ -173,6 +198,19 @@ final class SettingsWindowController: NSWindowController {
 
     @objc private func channelChanged() {
         DaemonClient.shared.setConfig(["ytdlp_channel": channelPop.indexOfSelectedItem == 1 ? "stable" : "nightly"])
+    }
+
+    @objc private func subtitleSettingsChanged() {
+        DaemonClient.shared.setConfig([
+            "subtitle_langs": subLangsField.stringValue.trimmingCharacters(in: .whitespaces),
+            "auto_subs": autoSubsBox.state == .on,
+        ])
+    }
+
+    @objc private func audioLangChanged() {
+        DaemonClient.shared.setConfig([
+            "audio_lang": audioLangField.stringValue.trimmingCharacters(in: .whitespaces),
+        ])
     }
 
     @objc private func cookiesChanged() {

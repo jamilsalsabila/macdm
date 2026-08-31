@@ -65,9 +65,12 @@ type Job struct {
 	Conns []ConnStat `json:"conns,omitempty"`
 
 	// Video/quality selection (extractor & adaptive streams).
-	Quality  string         `json:"quality,omitempty"`
-	FormatID string         `json:"format_id,omitempty"`
-	Formats  []FormatChoice `json:"formats,omitempty"`
+	Quality  string `json:"quality,omitempty"`
+	FormatID string `json:"format_id,omitempty"`
+	// Per-job overrides for the extractor path; empty falls back to Settings.
+	AudioLang     string         `json:"audio_lang,omitempty"`
+	SubtitleLangs string         `json:"subtitle_langs,omitempty"`
+	Formats       []FormatChoice `json:"formats,omitempty"`
 
 	// Fragments: byte-range slices of one file, each with its own URL
 	// (Instagram/Facebook). Present => assemble them instead of a plain GET.

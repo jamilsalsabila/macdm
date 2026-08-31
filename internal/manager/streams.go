@@ -303,6 +303,45 @@ func (m *Manager) fetchHLSSubtitles(ctx context.Context, c *hls.Client, id, dest
 	m.writeSubtitles(id, dest, lang, ".vtt", data)
 }
 
+// moveSubtitleSidecars carries the .srt/.vtt files yt-dlp wrote beside the
+// video in the scratch dir over to the final location, renaming them onto the
+// final stem so "<video>.<lang>.srt" still lines up after uniqueDest picked a
+// different name. Best-effort: the video is already in place.
+func moveSubtitleSidecars(scratchVideo, finalVideo, outDir string) {
+	oldStem := strings.TrimSuffix(filepath.Base(scratchVideo), filepath.Ext(scratchVideo))
+	newStem := strings.TrimSuffix(finalVideo, filepath.Ext(finalVideo))
+
+	entries, err := os.ReadDir(outDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		ext := strings.ToLower(filepath.Ext(name))
+		if ext != ".srt" && ext != ".vtt" && ext != ".ass" {
+			continue
+		}
+		// yt-dlp names them "<video stem>.<lang>.<ext>" — keep the tail.
+		tail := strings.TrimPrefix(name, oldStem)
+		if tail == name { // not ours
+			continue
+		}
+		if err := moveFile(filepath.Join(outDir, name), newStem+tail); err != nil {
+			log.Printf("macdm: subtitle sidecar %s: %v", name, err)
+		}
+	}
+}
+
+// firstNonBlank returns the first argument that is not empty after trimming.
+func firstNonBlank(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
 // writeSubtitles saves a subtitle track next to the video as
 // "<name>.<lang>.vtt". Subtitles are a bonus: every failure here is logged into
 // the job note and swallowed, because losing them must never fail a download
@@ -492,11 +531,15 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		}
 	}()
 
+	cfg := config.Load() // fresh — Settings can change these without a restart
 	res, err := ex.Download(wdCtx, j.URL, extractor.DownloadOptions{
 		OutDir:         outDir,
-		FormatSelector: j.FormatID,                // "" => extractor's 1080p-capped default
-		CookiesFrom:    config.Load().CookiesFrom, // fresh — Settings can change it without a restart
+		FormatSelector: j.FormatID, // "" => extractor's 1080p-capped default
+		CookiesFrom:    cfg.CookiesFrom,
 		MergeFormat:    "mp4",
+		AudioLang:      firstNonBlank(j.AudioLang, cfg.AudioLang),
+		SubLangs:       firstNonBlank(j.SubtitleLangs, cfg.SubtitleLangs),
+		AutoSubs:       cfg.AutoSubs,
 	}, func(p extractor.Progress) {
 		select {
 		case started <- struct{}{}: // first callback — extraction got somewhere
@@ -546,6 +589,7 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 	if err := moveFile(res.Path, final); err != nil {
 		return err
 	}
+	moveSubtitleSidecars(res.Path, final, outDir)
 	_ = os.RemoveAll(outDir)
 	return finalize(m, id, final)
 }

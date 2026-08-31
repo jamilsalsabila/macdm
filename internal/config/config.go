@@ -14,7 +14,7 @@ const DefaultAddr = "127.0.0.1:7345"
 // Version is bumped whenever the daemon's wire behaviour changes. The menu-bar
 // app compares it against its own build and restarts a mismatched daemon so a
 // stale background macdmd never lingers after a rebuild.
-const Version = "0.5.9"
+const Version = "0.6.0"
 
 // Config is the on-disk settings file (config.json in the support dir). Every
 // field has a working default, so the file is optional.
@@ -42,6 +42,15 @@ type Config struct {
 	// check). Pointer so an absent key means "not set" — Load defaults it to
 	// true, since a stale yt-dlp is the usual reason YouTube stops working.
 	AutoUpdateYtDlp *bool `json:"auto_update_ytdlp,omitempty"`
+
+	// SubtitleLangs is a yt-dlp --sub-langs expression ("id,en"); empty means
+	// no subtitles. AutoSubs also accepts machine-generated captions when a
+	// language has no channel-provided subtitles.
+	SubtitleLangs string `json:"subtitle_langs,omitempty"`
+	AutoSubs      bool   `json:"auto_subs,omitempty"`
+	// AudioLang prefers a dubbed soundtrack by language tag ("id"). Empty keeps
+	// yt-dlp's pick, which is by bitrate rather than language.
+	AudioLang string `json:"audio_lang,omitempty"`
 
 	// YtDlpChannel is "nightly" (default) or "stable". yt-dlp's own guidance is
 	// that most users want nightly — site fixes (TikTok, YouTube) land there days

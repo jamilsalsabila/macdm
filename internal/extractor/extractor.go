@@ -40,6 +40,7 @@ type Format struct {
 	TBR          float64 `json:"tbr"`
 	Protocol     string  `json:"protocol"`
 	Note         string  `json:"format_note"`
+	Language     string  `json:"language"`
 }
 
 // HasVideo / HasAudio interpret yt-dlp's "none" sentinel.
@@ -62,8 +63,51 @@ type Info struct {
 	Thumbnail string   `json:"thumbnail"`
 	IsLive    bool     `json:"is_live"`
 	Formats   []Format `json:"formats"`
+	// Subtitles are uploaded by the channel; AutomaticCaptions are machine
+	// generated (and machine translated). Keyed by language tag.
+	Subtitles         map[string][]subFormat `json:"subtitles"`
+	AutomaticCaptions map[string][]subFormat `json:"automatic_captions"`
 	// DRM-protected entries set this; MacDM refuses those.
 	HasDRMField bool `json:"_has_drm"`
+}
+
+type subFormat struct {
+	Ext string `json:"ext"`
+	URL string `json:"url"`
+}
+
+// AudioLanguages lists the languages the site offers as separate audio tracks,
+// in a stable order. YouTube's multi-language dubbing shows up here; a video
+// with a single soundtrack returns nothing.
+func (in *Info) AudioLanguages() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, f := range in.Formats {
+		if !f.HasAudio() || f.HasVideo() || f.Language == "" {
+			continue
+		}
+		if !seen[f.Language] {
+			seen[f.Language] = true
+			out = append(out, f.Language)
+		}
+	}
+	if len(out) < 2 {
+		return nil // nothing to choose between
+	}
+	sort.Strings(out)
+	return out
+}
+
+// SubtitleLanguages lists languages with real, channel-provided subtitles.
+// Automatic captions are excluded: every video has ~150 machine-translated
+// ones, which would swamp a picker and are much lower quality.
+func (in *Info) SubtitleLanguages() []string {
+	out := make([]string, 0, len(in.Subtitles))
+	for k := range in.Subtitles {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // QualityChoices collapses yt-dlp's format list into the handful of user-facing
@@ -188,12 +232,60 @@ func (e *Extractor) Probe(ctx context.Context, pageURL, cookiesFrom string) (*In
 	return &info, nil
 }
 
+// iso6392 converts the two-letter language tag yt-dlp reports into the
+// three-letter code an MP4 language field requires. An unknown or already
+// three-letter value is passed through unchanged.
+func iso6392(tag string) string {
+	t := strings.ToLower(strings.TrimSpace(tag))
+	if i := strings.IndexAny(t, "-_"); i > 0 {
+		t = t[:i] // "id-ID" -> "id"
+	}
+	if m, ok := map[string]string{
+		"ar": "ara", "bn": "ben", "cs": "ces", "de": "deu", "el": "ell",
+		"en": "eng", "es": "spa", "fa": "fas", "fi": "fin", "fr": "fra",
+		"he": "heb", "hi": "hin", "hu": "hun", "id": "ind", "it": "ita",
+		"ja": "jpn", "ko": "kor", "ms": "msa", "nl": "nld", "no": "nor",
+		"pl": "pol", "pt": "por", "ro": "ron", "ru": "rus", "sv": "swe",
+		"ta": "tam", "te": "tel", "th": "tha", "tr": "tur", "uk": "ukr",
+		"ur": "urd", "vi": "vie", "zh": "zho",
+	}[t]; ok {
+		return m
+	}
+	return t
+}
+
+// withAudioLang rewrites a format selector so its audio comes from a specific
+// language, falling back to the original selector when that language is absent.
+//
+// This matters because "ba" means *best bitrate*, not *original language*: on a
+// video with dubbed soundtracks yt-dlp will happily hand back whichever dub
+// encodes highest, so the language has to be asked for explicitly.
+func withAudioLang(sel, lang string) string {
+	lang = strings.TrimSpace(lang)
+	if lang == "" || !strings.Contains(sel, "ba") {
+		return sel
+	}
+	// [language^=id] matches "id" as well as regional tags like "id-ID".
+	filtered := strings.ReplaceAll(sel, "ba", fmt.Sprintf("ba[language^=%s]", lang))
+	return filtered + "/" + sel
+}
+
 // DownloadOptions steers a download.
 type DownloadOptions struct {
 	FormatSelector string // yt-dlp -f expression; "" => "bv*+ba/b"
 	OutDir         string
 	CookiesFrom    string // browser name for --cookies-from-browser; "" => none
 	MergeFormat    string // container for merged output; "" => "mp4"
+	// AudioLang picks a dubbed soundtrack by language tag ("id", "es"). Empty
+	// keeps yt-dlp's default, which is whichever audio has the best bitrate —
+	// not necessarily the original language.
+	AudioLang string
+	// SubLangs is a yt-dlp --sub-langs expression ("id,en" or "all"). Empty
+	// downloads no subtitles.
+	SubLangs string
+	// AutoSubs also accepts machine-generated captions when a requested
+	// language has no channel-provided subtitles.
+	AutoSubs bool
 }
 
 // Result reports the finished file.
@@ -220,6 +312,7 @@ func (e *Extractor) Download(ctx context.Context, pageURL string, opt DownloadOp
 		// multi-GB files on sites that offer them.
 		sel = "bv*[height<=?1080]+ba/b[height<=?1080]/bv*+ba/b"
 	}
+	sel = withAudioLang(sel, opt.AudioLang)
 	merge := opt.MergeFormat
 	if merge == "" {
 		merge = "mp4"
@@ -252,6 +345,22 @@ func (e *Extractor) Download(ctx context.Context, pageURL string, opt DownloadOp
 	}
 	if opt.CookiesFrom != "" {
 		args = append(args, "--cookies-from-browser", opt.CookiesFrom)
+	}
+	if opt.AudioLang != "" {
+		// yt-dlp copies the audio stream without a language tag, so the merged
+		// file claims "eng" whatever dub is inside — a player then shows the
+		// wrong language and the download looks like it ignored the setting.
+		args = append(args, "--postprocessor-args",
+			"Merger:-metadata:s:a:0 language="+iso6392(opt.AudioLang))
+	}
+	if opt.SubLangs != "" {
+		// Sidecar files, not muxed: a subtitle codec the container rejects
+		// would otherwise fail the whole download.
+		args = append(args, "--write-subs", "--sub-langs", opt.SubLangs,
+			"--sub-format", "vtt/srt/best", "--convert-subs", "srt")
+		if opt.AutoSubs {
+			args = append(args, "--write-auto-subs")
+		}
 	}
 	args = append(args, "--", pageURL) // stop option parsing — a URL can start with "-"
 

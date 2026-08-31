@@ -87,8 +87,11 @@ func (s *Server) getTools(w http.ResponseWriter, r *http.Request) {
 			"channel":          yt.Channel,
 			"update_available": yt.UpdateAvailable,
 		},
-		"auto_update":  cfg.AutoUpdateYtDlpEnabled(),
-		"cookies_from": cfg.CookiesFrom,
+		"auto_update":    cfg.AutoUpdateYtDlpEnabled(),
+		"cookies_from":   cfg.CookiesFrom,
+		"subtitle_langs": cfg.SubtitleLangs,
+		"auto_subs":      cfg.AutoSubs,
+		"audio_lang":     cfg.AudioLang,
 	})
 }
 
@@ -106,6 +109,9 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 		AutoUpdateYtDlp *bool   `json:"auto_update_ytdlp"`
 		CookiesFrom     *string `json:"cookies_from"`
 		YtDlpChannel    *string `json:"ytdlp_channel"`
+		SubtitleLangs   *string `json:"subtitle_langs"`
+		AutoSubs        *bool   `json:"auto_subs"`
+		AudioLang       *string `json:"audio_lang"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -117,6 +123,15 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CookiesFrom != nil {
 		c.CookiesFrom = *req.CookiesFrom
+	}
+	if req.SubtitleLangs != nil {
+		c.SubtitleLangs = *req.SubtitleLangs
+	}
+	if req.AutoSubs != nil {
+		c.AutoSubs = *req.AutoSubs
+	}
+	if req.AudioLang != nil {
+		c.AudioLang = *req.AudioLang
 	}
 	if req.YtDlpChannel != nil && (*req.YtDlpChannel == "stable" || *req.YtDlpChannel == "nightly") {
 		c.YtDlpChannel = *req.YtDlpChannel
@@ -163,16 +178,19 @@ func (s *Server) createProposal(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) acceptProposal(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Dest     string `json:"dest"`
-		Filename string `json:"filename"`
-		Conns    int    `json:"conns"`
-		FormatID string `json:"format_id"`
-		Quality  string `json:"quality"`
+		Dest          string `json:"dest"`
+		Filename      string `json:"filename"`
+		AudioLang     string `json:"audio_lang"`
+		SubtitleLangs string `json:"subtitle_langs"`
+		Conns         int    `json:"conns"`
+		FormatID      string `json:"format_id"`
+		Quality       string `json:"quality"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
 	j, err := s.mgr.Accept(r.PathValue("id"), manager.AcceptOptions{
 		Dest: req.Dest, Filename: req.Filename, Conns: req.Conns,
 		FormatID: req.FormatID, Quality: req.Quality,
+		AudioLang: req.AudioLang, SubLangs: req.SubtitleLangs,
 	})
 	if err != nil {
 		writeErr(w, http.StatusNotFound, err)
@@ -224,6 +242,9 @@ type createReq struct {
 	FormatID  string            `json:"format_id"`
 	Quality   string            `json:"quality"`
 	Fragments []store.Fragment  `json:"fragments"`
+	// Extractor-path overrides; empty falls back to the Settings default.
+	AudioLang     string `json:"audio_lang"`
+	SubtitleLangs string `json:"subtitle_langs"`
 }
 
 func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
@@ -239,6 +260,8 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		Dest:      req.Dest,
 		FormatID:  req.FormatID,
 		Quality:   req.Quality,
+		AudioLang: req.AudioLang,
+		SubLangs:  req.SubtitleLangs,
 		Fragments: req.Fragments,
 	})
 	if err != nil {

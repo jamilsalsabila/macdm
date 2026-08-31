@@ -111,6 +111,9 @@ struct ToolsInfo: Codable {
     var ytdlp: YtDlp
     var auto_update: Bool
     var cookies_from: String?
+    var subtitle_langs: String?
+    var auto_subs: Bool?
+    var audio_lang: String?
 }
 
 private struct UpdateResult: Codable { var ok: Bool; var from: String; var to: String }

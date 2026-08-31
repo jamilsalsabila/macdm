@@ -93,7 +93,12 @@ These are design choices, not bugs — MacDM stops where a download manager shou
   with ffmpeg's concat demuxer so the differing timelines are re-timed).
   Byte-range addressing (`SegmentURL@mediaRange`, `SegmentBase`-index-only) is
   refused rather than mis-assembled.
-- **Subtitles** are saved as a sidecar `.vtt` next to the video (named
+- **Extractor (yt-dlp) downloads** can pick a dubbed audio track and write
+  subtitles: set *Audio language* and *Subtitle languages* in Settings (e.g.
+  `id` and `id,en`). Subtitles land as `.srt` sidecars, and the merged audio is
+  tagged with its real language. Left blank, yt-dlp picks audio by bitrate —
+  which on a multi-language video is not necessarily the original.
+- **Subtitles** from HLS/DASH are saved as a sidecar `.vtt` next to the video (named
   `<video>.<lang>.vtt`), not muxed into the container. HLS `TYPE=SUBTITLES`
   renditions are merged across segments with their `X-TIMESTAMP-MAP` applied;
   DASH text AdaptationSets are fetched as one file or merged when segmented.
