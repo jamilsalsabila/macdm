@@ -60,11 +60,20 @@ async function refresh() {
             ? `video${it.size ? " · " + fmtSize(it.size) : ""}`
             : `video · ${it.count} fragments${it.size ? " · " + fmtSize(it.size) : ""}`)
         : `${it.kind}${it.size ? " · " + fmtSize(it.size) : ""}`;
-      div.innerHTML = `
-        <div class="k">${label}</div>
-        <div class="u">${it.url}</div>
-        <button>Download</button>`;
-      div.querySelector("button").addEventListener("click", async (e) => {
+      // Built with textContent, never innerHTML: it.url comes off the network.
+      // Chrome percent-encodes < and > in a URL's path/query so today's input is
+      // inert, but this popup can reach the native host — it must not depend on
+      // another layer's escaping to stay safe.
+      const k = document.createElement("div");
+      k.className = "k";
+      k.textContent = label;
+      const u = document.createElement("div");
+      u.className = "u";
+      u.textContent = it.url;
+      const dlBtn = document.createElement("button");
+      dlBtn.textContent = "Download";
+      div.append(k, u, dlBtn);
+      dlBtn.addEventListener("click", async (e) => {
         e.target.textContent = "queuing…";
         const payload = { url: it.url, headers: it.headers, referer: tab.url, title: tab.title };
         if (it.fragmentGroup) payload.fragments = it.fragments;

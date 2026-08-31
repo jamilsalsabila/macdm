@@ -620,12 +620,16 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  let r = null;
   if (info.menuItemId === "macdm-link") {
     const url = info.linkUrl || info.srcUrl;
-    if (url) await startDownload({ url, referer: tab?.url, title: tab?.title });
+    if (url) r = await startDownload({ url, referer: tab?.url, title: tab?.title });
   } else if (info.menuItemId === "macdm-page") {
-    await startDownload({ url: tab.url, referer: tab.url, title: tab.title });
+    r = await startDownload({ url: tab.url, referer: tab.url, title: tab.title });
   }
+  // The context menu has no other way to report back — a silent failure looked
+  // exactly like a silent success.
+  if (r) flashBadge(r.ok ? "✓" : "!", r.ok ? "#0a84ff" : "#d70015");
 });
 
 // --- opt-in: take over browser downloads (default OFF) ---
@@ -635,8 +639,28 @@ chrome.storage.local.get("takeOverDownloads", (r) => { takeOver = !!r.takeOverDo
 chrome.storage.onChanged.addListener((c) => {
   if (c.takeOverDownloads) takeOver = !!c.takeOverDownloads.newValue;
 });
-chrome.downloads.onCreated.addListener((item) => {
+// Flash the toolbar badge — the only feedback channel available without asking
+// for the "notifications" permission.
+function flashBadge(text, color) {
+  try {
+    chrome.action.setBadgeBackgroundColor({ color });
+    chrome.action.setBadgeText({ text });
+    setTimeout(() => chrome.action.setBadgeText({ text: "" }), 4000);
+  } catch {}
+}
+
+chrome.downloads.onCreated.addListener(async (item) => {
   if (!takeOver || !item.url || item.url.startsWith("blob:") || item.url.startsWith("data:")) return;
-  chrome.downloads.cancel(item.id, () => chrome.downloads.erase({ id: item.id }));
-  startDownload({ url: item.finalUrl || item.url, referer: item.referrer || "" });
+  // Hand off FIRST, cancel only once MacDM has actually accepted the job.
+  // Cancelling up front meant that with the daemon down the download was
+  // killed and never restarted anywhere — the file just vanished.
+  const r = await startDownload({ url: item.finalUrl || item.url, referer: item.referrer || "" });
+  if (!r || !r.ok) {
+    flashBadge("!", "#d70015"); // let the browser's own download carry on
+    return;
+  }
+  chrome.downloads.cancel(item.id, () => {
+    if (chrome.runtime.lastError) return; // already finished/cancelled
+    chrome.downloads.erase({ id: item.id }, () => void chrome.runtime.lastError);
+  });
 });
