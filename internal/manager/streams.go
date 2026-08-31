@@ -16,6 +16,7 @@ import (
 
 	"macdm/internal/config"
 	"macdm/internal/dash"
+	"macdm/internal/engine"
 	"macdm/internal/extractor"
 	"macdm/internal/hls"
 	"macdm/internal/mux"
@@ -303,6 +304,139 @@ func (m *Manager) fetchHLSSubtitles(ctx context.Context, c *hls.Client, id, dest
 	m.writeSubtitles(id, dest, lang, ".vtt", data)
 }
 
+// execExtractDirect is the fast path: yt-dlp resolves the media URLs, MacDM's
+// own engine transfers them, ffmpeg merges. yt-dlp downloads a format over one
+// connection and YouTube throttles that hard — measured on one file, 1.3 MB/s
+// through yt-dlp against 6.2 MB/s for the same URL over eight connections.
+//
+// Reports ErrNoDirectPath when the page cannot be fetched this way (a manifest,
+// DRM, live, an expired or rejected URL); the caller then runs yt-dlp normally.
+func (m *Manager) execExtractDirect(ctx context.Context, id string, j *store.Job,
+	ex *extractor.Extractor, opt extractor.DownloadOptions, outDir, finalDir string,
+	mx *mux.Muxer, prog segProgFn, muxProg muxProgFn) error {
+
+	plan, err := ex.ResolveDirect(ctx, j.URL, opt)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errNoDirectPath, err)
+	}
+
+	name := sanitize(plan.Title)
+	if name == "" || looksGeneric(name) {
+		name = strings.TrimSuffix(filepath.Base(j.Dest), filepath.Ext(j.Dest))
+	}
+
+	// Total bytes across the streams, so one progress bar covers them all.
+	var total int64
+	for _, med := range []*extractor.DirectMedia{plan.Video, plan.Audio, plan.Muxed} {
+		if med != nil {
+			total += med.Size
+		}
+	}
+	var doneBase int64
+	fetch := func(med *extractor.DirectMedia, file string) error {
+		_, err := m.eng.Run(ctx, engine.DownloadSpec{
+			URL: med.URL, Dest: file, Headers: med.Headers, Conns: j.Connections,
+		}, func(p engine.Progress) {
+			prog(streamProg{
+				doneSeg: 0, totalSeg: 0,
+				bytes: doneBase + p.DoneBytes,
+				conns: engineConns(p.Conns),
+			})
+			_, _ = m.st.Update(id, func(jj *store.Job) {
+				jj.TotalBytes = total
+				jj.DoneBytes = doneBase + p.DoneBytes
+				jj.SpeedBps = p.SpeedBps
+			})
+		})
+		if err == nil {
+			if fi, e := os.Stat(file); e == nil {
+				doneBase += fi.Size()
+			}
+		}
+		return err
+	}
+
+	var vFile, aFile, muxedIn string
+	switch {
+	case plan.Muxed != nil:
+		muxedIn = filepath.Join(outDir, "media."+extOrPlain(plan.Muxed.Ext, "mp4"))
+		if err := fetch(plan.Muxed, muxedIn); err != nil {
+			return fmt.Errorf("%w: %v", errNoDirectPath, err)
+		}
+	default:
+		vFile = filepath.Join(outDir, "video."+extOrPlain(plan.Video.Ext, "mp4"))
+		if err := fetch(plan.Video, vFile); err != nil {
+			return fmt.Errorf("%w: %v", errNoDirectPath, err)
+		}
+		aFile = filepath.Join(outDir, "audio."+extOrPlain(plan.Audio.Ext, "m4a"))
+		if err := fetch(plan.Audio, aFile); err != nil {
+			return fmt.Errorf("%w: %v", errNoDirectPath, err)
+		}
+	}
+
+	// Past this point the bytes are ours: a mux failure is a real error, not a
+	// reason to re-download everything through yt-dlp.
+	muxed := filepath.Join(outDir, "muxed.mp4")
+	if muxedIn != "" {
+		if err := mx.Remux(ctx, muxedIn, muxed, muxProg("Finalising")); err != nil {
+			return err
+		}
+	} else if err := mx.CombineLang(ctx, vFile, aFile, muxed,
+		extractor.ISO6392(opt.AudioLang), muxProg("Merging video + audio")); err != nil {
+		return err
+	}
+
+	final := m.uniqueDest(id, filepath.Join(finalDir, name+".mp4"))
+	if err := moveFile(muxed, final); err != nil {
+		return err
+	}
+	for _, sub := range plan.Subtitles {
+		data, err := fetchURL(ctx, sub.URL, opt.CookiesFrom == "", plan.Video)
+		if err != nil {
+			log.Printf("macdm: subtitle %s: %v", sub.Lang, err)
+			continue
+		}
+		m.writeSubtitles(id, final, sub.Lang, "."+extOrPlain(sub.Ext, "srt"), data)
+	}
+	_ = os.RemoveAll(outDir)
+	return finalize(m, id, final)
+}
+
+// errNoDirectPath marks a page the fast path cannot handle; the caller retries
+// with yt-dlp doing the download.
+var errNoDirectPath = errors.New("no direct download path")
+
+func extOrPlain(ext, fallback string) string {
+	ext = strings.TrimPrefix(strings.TrimSpace(ext), ".")
+	if ext == "" {
+		return fallback
+	}
+	return ext
+}
+
+// fetchURL grabs a small resource (a subtitle file), reusing the media headers
+// so a host that checks User-Agent or Referer still answers.
+func fetchURL(ctx context.Context, url string, _ bool, like *extractor.DirectMedia) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if like != nil {
+		for k, v := range like.Headers {
+			req.Header.Set(k, v)
+		}
+	}
+	resp, err := streamHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+}
+
 // moveSubtitleSidecars carries the .srt/.vtt files yt-dlp wrote beside the
 // video in the scratch dir over to the final location, renaming them onto the
 // final stem so "<video>.<lang>.srt" still lines up after uniqueDest picked a
@@ -532,6 +666,53 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 	}()
 
 	cfg := config.Load() // fresh — Settings can change these without a restart
+	opt := extractor.DownloadOptions{
+		OutDir:         outDir,
+		FormatSelector: j.FormatID,
+		CookiesFrom:    cfg.CookiesFrom,
+		MergeFormat:    "mp4",
+		AudioLang:      firstNonBlank(j.AudioLang, cfg.AudioLang),
+		SubLangs:       firstNonBlank(j.SubtitleLangs, cfg.SubtitleLangs),
+		AutoSubs:       cfg.AutoSubs,
+	}
+
+	// Fast path: let yt-dlp resolve the URLs and download them ourselves, over
+	// many connections. Falls through to yt-dlp's own downloader for anything it
+	// cannot address — a manifest, DRM, live, or a URL the host rejects.
+	mx := mux.New(m.cfg.Tools.Ffmpeg)
+	muxProg := func(stage string) func(mux.Progress) {
+		return func(p mux.Progress) {
+			_, _ = m.st.Update(id, func(jj *store.Job) {
+				jj.SpeedBps = 0
+				jj.Conns = []store.ConnStat{{
+					Status: "receiving",
+					Info:   fmt.Sprintf("%s (ffmpeg) — %d%%", stage, int(p.Fraction*100)),
+				}}
+			})
+		}
+	}
+	segProg := func(sp streamProg) {
+		_, _ = m.st.Update(id, func(jj *store.Job) {
+			jj.Status = store.StatusDownloading
+			jj.Conns = sp.conns
+		})
+	}
+	if m.cfg.Tools.Ffmpeg != "" {
+		err := m.execExtractDirect(wdCtx, id, j, ex, opt, outDir, finalDir, mx, segProg, muxProg)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, errNoDirectPath) {
+			return err
+		}
+		log.Printf("macdm: direct download unavailable (%v) — falling back to yt-dlp", err)
+		// Start yt-dlp from a clean slate: partial engine output would confuse it.
+		_ = os.RemoveAll(outDir)
+		if e := os.MkdirAll(outDir, 0o755); e != nil {
+			return e
+		}
+	}
+
 	res, err := ex.Download(wdCtx, j.URL, extractor.DownloadOptions{
 		OutDir:         outDir,
 		FormatSelector: j.FormatID, // "" => extractor's 1080p-capped default

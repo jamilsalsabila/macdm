@@ -157,3 +157,39 @@ func TestNoFfmpegPathIsAnError(t *testing.T) {
 		t.Fatal("expected an error when ffmpeg is not configured")
 	}
 }
+
+// A dubbed track muxed without a language tag keeps whatever the source
+// claimed, so players show the wrong language — the download then looks like
+// it ignored the audio-language setting.
+func TestCombineLangTagsAudio(t *testing.T) {
+	ff := findFfmpeg(t)
+	dir := t.TempDir()
+	clip := filepath.Join(dir, "clip.mp4")
+	makeClip(t, ff, clip, "1")
+
+	v := filepath.Join(dir, "v.mp4")
+	a := filepath.Join(dir, "a.m4a")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	for _, args := range [][]string{
+		{"-i", clip, "-c", "copy", "-an", v},
+		{"-i", clip, "-c", "copy", "-vn", a},
+	} {
+		full := append([]string{"-hide_banner", "-loglevel", "error", "-y"}, args...)
+		if out, err := exec.CommandContext(ctx, ff, full...).CombinedOutput(); err != nil {
+			t.Skipf("cannot split the clip (%v): %s", err, out)
+		}
+	}
+
+	out := filepath.Join(dir, "out.mp4")
+	if err := New(ff).CombineLang(ctx, v, a, out, "ind", nil); err != nil {
+		t.Fatalf("CombineLang: %v", err)
+	}
+	probe := New(ff).Probe(ctx, out)
+	if !strings.Contains(probe, "Audio:") {
+		t.Fatalf("no audio track:\n%s", probe)
+	}
+	if !strings.Contains(probe, "(ind)") {
+		t.Fatalf("audio not tagged 'ind':\n%s", probe)
+	}
+}

@@ -193,8 +193,8 @@ func TestISO6392(t *testing.T) {
 		"xx":  "xx", // unknown: pass through rather than guess
 	}
 	for in, want := range cases {
-		if got := iso6392(in); got != want {
-			t.Errorf("iso6392(%q) = %q, want %q", in, got, want)
+		if got := ISO6392(in); got != want {
+			t.Errorf("ISO6392(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

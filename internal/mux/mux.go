@@ -43,10 +43,21 @@ func (m *Muxer) Remux(ctx context.Context, in, out string, onProgress func(Progr
 
 // Combine muxes a video-only file and an audio-only file into out.
 func (m *Muxer) Combine(ctx context.Context, video, audio, out string, onProgress func(Progress)) error {
+	return m.CombineLang(ctx, video, audio, out, "", onProgress)
+}
+
+// CombineLang is Combine with an explicit audio language tag (an ISO 639-2
+// code). Without it the container keeps whatever the source claimed, so a
+// dubbed track ends up labelled with the wrong language and players show it
+// that way.
+func (m *Muxer) CombineLang(ctx context.Context, video, audio, out, lang string, onProgress func(Progress)) error {
 	dur := m.durationOf(ctx, video)
-	return m.run(ctx, dur, onProgress,
-		"-i", video, "-i", audio, "-c", "copy",
-		"-map", "0:v:0", "-map", "1:a:0", out)
+	args := []string{"-i", video, "-i", audio, "-c", "copy",
+		"-map", "0:v:0", "-map", "1:a:0"}
+	if lang != "" {
+		args = append(args, "-metadata:s:a:0", "language="+lang)
+	}
+	return m.run(ctx, dur, onProgress, append(args, out)...)
 }
 
 // Concat joins already-muxed files end to end with the concat demuxer, which

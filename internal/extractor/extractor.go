@@ -232,10 +232,10 @@ func (e *Extractor) Probe(ctx context.Context, pageURL, cookiesFrom string) (*In
 	return &info, nil
 }
 
-// iso6392 converts the two-letter language tag yt-dlp reports into the
+// ISO6392 converts the two-letter language tag yt-dlp reports into the
 // three-letter code an MP4 language field requires. An unknown or already
 // three-letter value is passed through unchanged.
-func iso6392(tag string) string {
+func ISO6392(tag string) string {
 	t := strings.ToLower(strings.TrimSpace(tag))
 	if i := strings.IndexAny(t, "-_"); i > 0 {
 		t = t[:i] // "id-ID" -> "id"
@@ -351,7 +351,7 @@ func (e *Extractor) Download(ctx context.Context, pageURL string, opt DownloadOp
 		// file claims "eng" whatever dub is inside — a player then shows the
 		// wrong language and the download looks like it ignored the setting.
 		args = append(args, "--postprocessor-args",
-			"Merger:-metadata:s:a:0 language="+iso6392(opt.AudioLang))
+			"Merger:-metadata:s:a:0 language="+ISO6392(opt.AudioLang))
 	}
 	if opt.SubLangs != "" {
 		// Sidecar files, not muxed: a subtitle codec the container rejects
