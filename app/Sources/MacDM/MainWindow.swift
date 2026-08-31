@@ -28,6 +28,10 @@ final class JobsTableView: NSTableView {
 }
 
 final class MainWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+    /// The one instance AppDelegate keeps alive, so the New Download dialog can
+    /// open a progress window without being handed a reference.
+    private(set) static weak var shared: MainWindowController?
+
     private let table = JobsTableView()
     private var jobs: [Job] = []
     private var details: [String: DownloadDetailWindowController] = [:]
@@ -41,6 +45,7 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
         win.center()
         win.setFrameAutosaveName("MacDMMain")
         self.init(window: win)
+        Self.shared = self
         buildUI()
 
         DaemonClient.shared.onJobs { [weak self] jobs in self?.apply(jobs) }
@@ -165,6 +170,11 @@ final class MainWindowController: NSWindowController, NSTableViewDataSource, NST
             existing.show()
         }
     }
+
+    /// Opens the progress window for a job we already hold. Used right after the
+    /// daemon creates one: the job has not reached us over SSE yet, so the
+    /// jobID lookup above would find nothing and silently do nothing.
+    func showDetail(job: Job) { presentDetail(for: job) }
 
     private func presentDetail(for j: Job) {
         if let existing = details[j.id] { existing.show(); return }

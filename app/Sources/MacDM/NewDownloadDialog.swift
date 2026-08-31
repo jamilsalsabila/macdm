@@ -258,17 +258,28 @@ final class NewDownloadDialog: NSWindowController, NSWindowDelegate {
 
         let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let f = chosenFormat()
+        // Pressing Download should land you on the IDM-style progress window.
+        // Both paths used to discard the job the daemon returned, so nothing
+        // opened and the download ran invisibly until you found it in the list.
+        let showProgress: (Job?) -> Void = { job in
+            guard let job else { return }
+            MainWindowController.shared?.showDetail(job: job)
+        }
+
         if isManual {
             // The File Name field is editable in this dialog too — it used to be
             // collected here and then dropped, so a rename silently did nothing.
             DaemonClient.shared.add(url: latest.url, dest: folder, conns: connStepper.integerValue,
                                     formatID: f?.id, quality: f?.label,
-                                    filename: name.isEmpty ? nil : name)
+                                    filename: name.isEmpty ? nil : name) { result in
+                showProgress(try? result.get())
+            }
         } else {
             DaemonClient.shared.accept(latest.id, dest: folder,
                                        filename: name.isEmpty ? nil : name,
                                        conns: connStepper.integerValue,
-                                       formatID: f?.id, quality: f?.label)
+                                       formatID: f?.id, quality: f?.label,
+                                       completion: showProgress)
         }
         dismiss()
     }
