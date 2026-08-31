@@ -403,11 +403,34 @@ func (m *Manager) Pause(id string) error {
 	return errors.New("job is not running")
 }
 
-// Remove pauses (if running) and deletes a job. The finished/partial file in the
-// download folder is left in place; the private scratch dir is not.
+// Remove pauses (if running) and deletes a job.
+//
+// A finished download is the user's file and stays where it is. The half-built
+// one does not: dropping the job leaves its .part and .macdm sidecar owned by
+// nothing, with no job left to explain them, and the .part reports its full
+// final size because it was created sparse — so abandoning a 100 MB download
+// left what looks like a 100 MB mystery file in the download folder. Only those
+// two are removed, never the finished file, which is safe because completing a
+// download renames the .part away and deletes the sidecar.
 func (m *Manager) Remove(id string) error {
+	j, getErr := m.st.Get(id)
 	_ = m.Pause(id)
 	_ = os.RemoveAll(m.workDir(id))
+	if getErr == nil && j.Dest != "" && j.Status != store.StatusCompleted {
+		// Give the download goroutine a moment to let go of the file first;
+		// removing it underneath a running write would be worse than litter.
+		m.mu.Lock()
+		_, stillRunning := m.running[id]
+		m.mu.Unlock()
+		for i := 0; stillRunning && i < 40; i++ {
+			time.Sleep(50 * time.Millisecond)
+			m.mu.Lock()
+			_, stillRunning = m.running[id]
+			m.mu.Unlock()
+		}
+		_ = os.Remove(j.Dest + ".part")
+		_ = os.Remove(j.Dest + ".macdm")
+	}
 	return m.st.Delete(id)
 }
 
@@ -576,6 +599,17 @@ func (m *Manager) execHTTP(ctx context.Context, id string, j *store.Job) error {
 			_, _ = m.st.Update(id, func(jj *store.Job) { jj.Kind = store.KindExtract })
 			jj, _ := m.st.Get(id)
 			return m.execExtract(ctx, id, jj)
+		}
+		// A manifest the URL did not advertise. Kinds are guessed from the path
+		// suffix, but plenty of CDNs serve HLS and DASH from an extensionless
+		// path or behind a signed query, and saving those as a file hands the
+		// user a few hundred bytes of playlist text named like a video — with
+		// the job reported as completed. The response says what it really is.
+		if hit, ok := sniff.ClassifyResponse(j.URL, pr.ContentType, "", pr.TotalBytes); ok &&
+			(hit.Kind == store.KindHLS || hit.Kind == store.KindDASH) {
+			_, _ = m.st.Update(id, func(jj *store.Job) { jj.Kind = hit.Kind })
+			jj, _ := m.st.Get(id)
+			return m.execStream(ctx, id, jj)
 		}
 		if looksGeneric(filepath.Base(dest)) && pr.NamedByServer && pr.Filename != "" {
 			dest = filepath.Join(filepath.Dir(dest), sanitize(pr.Filename))
@@ -850,7 +884,9 @@ func safeName(s string) string {
 	}
 	s = strings.Trim(s, ". ")
 	if len(s) > 200 {
-		s = s[:200]
+		// Whole characters, not bytes: half a character is not valid UTF-8 and
+		// makes a filename Finder renders as mangled text.
+		s = strings.Trim(strings.ToValidUTF8(s[:200], ""), ". ")
 	}
 	if s == "" || s == "_" {
 		return ""

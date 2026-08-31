@@ -9,9 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"bytes"
 	"macdm/internal/engine"
 	"macdm/internal/schedule"
 	"macdm/internal/store"
+	"os"
+	"path/filepath"
+	"sync/atomic"
 )
 
 // shutWindow is a window that is certainly closed now: it opens and closes in
@@ -291,5 +295,119 @@ func TestOpeningTheWindowDoesNotRestartCompletedJobs(t *testing.T) {
 	}
 	if after.ScheduledHold {
 		t.Error("a completed job should not stay marked as held")
+	}
+}
+
+// Dropping a half-finished download must not leave its .part and sidecar
+// behind. They are owned by nothing once the job is gone, and the .part is
+// created sparse — so it reports the full final size, leaving what looks like
+// a 100 MB mystery file in the download folder.
+func TestRemoveClearsAnUnfinishedDownload(t *testing.T) {
+	srv := slowServer(t, 1<<16)
+	m := newManager(t, openWindow(t))
+
+	j, err := m.Add(srv.URL+"/f.bin", AddOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running := waitFor(t, m, j.ID, func(jj *store.Job) bool {
+		return jj.Status == store.StatusDownloading && jj.DoneBytes > 0
+	}, "the download to start")
+	dest := running.Dest
+	if _, err := os.Stat(dest + ".part"); err != nil {
+		t.Fatalf("expected a .part file while downloading: %v", err)
+	}
+
+	if err := m.Remove(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, leftover := range []string{dest + ".part", dest + ".macdm"} {
+		if _, err := os.Stat(leftover); !os.IsNotExist(err) {
+			t.Errorf("%s survived the job that owned it", filepath.Base(leftover))
+		}
+	}
+}
+
+// The finished file is the user's, and must survive removing the job from the
+// list — that is the whole point of a download manager.
+func TestRemoveKeepsAFinishedFile(t *testing.T) {
+	srv := slowServer(t, 2048)
+	m := newManager(t, openWindow(t))
+
+	j, err := m.Add(srv.URL+"/f.bin", AddOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitFor(t, m, j.ID, func(jj *store.Job) bool {
+		return jj.Status == store.StatusCompleted
+	}, "completion")
+
+	if err := m.Remove(j.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(done.Dest); err != nil {
+		t.Errorf("the finished download was deleted with the job: %v", err)
+	}
+}
+
+// Kinds are guessed from the URL's path suffix, but plenty of CDNs serve HLS
+// and DASH from an extensionless path or behind a signed query. Saving those as
+// a plain file handed the user a few hundred bytes of playlist text named like
+// a video — and reported the job completed. The response's Content-Type says
+// what it really is.
+func TestManifestWithoutAnExtensionIsRecognised(t *testing.T) {
+	var segHits atomic.Int64
+	mux := http.NewServeMux()
+	seg := bytes.Repeat([]byte{0x47}, 1880)
+	for i := 0; i < 3; i++ {
+		mux.HandleFunc(fmt.Sprintf("/s%d.ts", i), func(w http.ResponseWriter, r *http.Request) {
+			segHits.Add(1)
+			w.Header().Set("Content-Type", "video/mp2t")
+			w.Write(seg)
+		})
+	}
+	var base string
+	// No ".m3u8" anywhere in the path — only the Content-Type gives it away.
+	mux.HandleFunc("/playlist", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		body := "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-VERSION:3\n"
+		for i := 0; i < 3; i++ {
+			body += fmt.Sprintf("#EXTINF:2.0,\n%s/s%d.ts\n", base, i)
+		}
+		body += "#EXT-X-ENDLIST\n"
+		fmt.Fprint(w, body)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	base = srv.URL
+
+	m := newManager(t, openWindow(t))
+	j, err := m.Add(srv.URL+"/playlist", AddOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// It is classified as a plain file up front — that is the whole point.
+	if j.Kind != store.KindHTTP {
+		t.Fatalf("setup: expected the URL to look like a plain file, got kind %q", j.Kind)
+	}
+
+	// The assertion is the correction itself: the kind flips to HLS and the
+	// segments get fetched. Whether synthetic segments then survive muxing is
+	// beside the point and depends on ffmpeg being present.
+	corrected := waitFor(t, m, j.ID, func(jj *store.Job) bool {
+		return jj.Kind == store.KindHLS
+	}, "the manifest to be recognised despite its URL")
+
+	if corrected.Kind != store.KindHLS {
+		t.Fatalf("kind = %q, want %q", corrected.Kind, store.KindHLS)
+	}
+	// Segment fetching needs ffmpeg on the box for the stream path to get that
+	// far, so it is verified live rather than here.
+	t.Logf("segments fetched in this environment: %d", segHits.Load())
+
+	// What must never happen, with or without ffmpeg: the playlist text saved
+	// as if it were the video.
+	if fi, err := os.Stat(corrected.Dest); err == nil && fi.Size() > 0 && fi.Size() < 1000 {
+		t.Errorf("the saved file is %d bytes — that is the playlist text, not the video", fi.Size())
 	}
 }

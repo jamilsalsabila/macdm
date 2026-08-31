@@ -1010,7 +1010,8 @@ func pageTitle(ctx context.Context, refererURL string) string {
 		}
 	}
 	if len(title) > 120 {
-		title = title[:120]
+		// Same reasoning as sanitize: cut whole characters, not bytes.
+		title = strings.TrimSpace(strings.ToValidUTF8(title[:120], ""))
 	}
 	return title
 }

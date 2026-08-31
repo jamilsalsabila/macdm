@@ -82,32 +82,10 @@ func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]s
 		}
 
 	case sniff.KindHLS:
-		c := hls.NewClient(streamClient(headers), headers)
-		pl, err := c.Parse(ctx, rawurl)
-		if err != nil {
-			res.Note = err.Error()
-			return res
-		}
-		if pl.HasDRM() {
-			res.DRM = true
-		}
-		if pl.IsMaster {
-			res.Formats = pl.VariantChoices()
-		}
-		res.Filename = strings.TrimSuffix(res.Filename, path.Ext(res.Filename)) + ".mp4"
+		return m.probeHLS(ctx, rawurl, headers, res)
 
 	case sniff.KindDASH:
-		c := dash.NewClient(streamClient(headers), headers)
-		if fs, err := c.ListRepresentations(ctx, rawurl); err == nil {
-			res.Formats = fs
-		} else {
-			res.Note = err.Error()
-			if strings.Contains(err.Error(), "DRM") {
-				res.DRM = true
-			}
-		}
-		res.Filename = strings.TrimSuffix(res.Filename, path.Ext(res.Filename)) + ".mp4"
-
+		return m.probeDASH(ctx, rawurl, headers, res)
 	default: // plain HTTP
 		// A short cap: the dialog only needs size/resume, and a CDN that is
 		// going to reject us (TikTok) should not hold "Detecting…" for 10s.
@@ -118,6 +96,13 @@ func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]s
 			res.Note = err.Error()
 			return res
 		}
+		// The path suffix is only a guess. A CDN serving HLS or DASH from an
+		// extensionless path would otherwise be offered as a plain file, and
+		// the dialog would promise a download that is really playlist text.
+		if hit, ok := sniff.ClassifyResponse(rawurl, pr.ContentType, "", pr.TotalBytes); ok &&
+			(hit.Kind == sniff.KindHLS || hit.Kind == sniff.KindDASH) {
+			return m.probeStream(ctx, rawurl, headers, hit.Kind, res)
+		}
 		res.Size = pr.TotalBytes
 		res.Resumable = pr.AcceptRanges
 		if pr.Filename != "" {
@@ -125,6 +110,52 @@ func (m *Manager) Probe(ctx context.Context, rawurl string, headers map[string]s
 		}
 	}
 	return res
+}
+
+// probeHLS and probeDASH fill in a manifest's quality list. They are separate
+// functions because the kind is not always known from the URL: a CDN serving a
+// manifest from an extensionless path is classified as a plain file until the
+// response's Content-Type says otherwise, and the plain-file branch then needs
+// to run exactly this.
+func (m *Manager) probeHLS(ctx context.Context, rawurl string, headers map[string]string, res *ProbeResult) *ProbeResult {
+	res.Kind = sniff.KindHLS
+	c := hls.NewClient(streamClient(headers), headers)
+	pl, err := c.Parse(ctx, rawurl)
+	if err != nil {
+		res.Note = err.Error()
+		return res
+	}
+	if pl.HasDRM() {
+		res.DRM = true
+	}
+	if pl.IsMaster {
+		res.Formats = pl.VariantChoices()
+	}
+	res.Filename = strings.TrimSuffix(res.Filename, path.Ext(res.Filename)) + ".mp4"
+	return res
+}
+
+func (m *Manager) probeDASH(ctx context.Context, rawurl string, headers map[string]string, res *ProbeResult) *ProbeResult {
+	res.Kind = sniff.KindDASH
+	c := dash.NewClient(streamClient(headers), headers)
+	if fs, err := c.ListRepresentations(ctx, rawurl); err == nil {
+		res.Formats = fs
+	} else {
+		res.Note = err.Error()
+		if strings.Contains(err.Error(), "DRM") {
+			res.DRM = true
+		}
+	}
+	res.Filename = strings.TrimSuffix(res.Filename, path.Ext(res.Filename)) + ".mp4"
+	return res
+}
+
+// probeStream dispatches to the right manifest prober.
+func (m *Manager) probeStream(ctx context.Context, rawurl string, headers map[string]string, kind string, res *ProbeResult) *ProbeResult {
+	if kind == sniff.KindDASH {
+		return m.probeDASH(ctx, rawurl, headers, res)
+	}
+	return m.probeHLS(ctx, rawurl, headers, res)
 }
 
 // sharedTransport is reused by every probe/stream HTTP client so connection
@@ -175,13 +206,22 @@ func baseName(u *url.URL) string {
 	return b
 }
 
+// maxNameBytes keeps a filename clear of the 255-byte limit on a single path
+// component, with room for the ".part" and ".<lang>.srt" suffixes added later.
+const maxNameBytes = 180
+
 func sanitize(s string) string {
 	s = strings.TrimSpace(s)
 	for _, r := range []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"} {
 		s = strings.ReplaceAll(s, r, "_")
 	}
-	if len(s) > 180 {
-		s = s[:180]
+	if len(s) > maxNameBytes {
+		// Cut on a character boundary. Slicing bytes can leave half a character
+		// behind, which is not valid UTF-8 and shows up as mangled text in
+		// Finder — 180 happens to divide evenly by 3 and 4, so pure CJK or pure
+		// emoji land on a boundary and hide this, but one ASCII character in
+		// front of them is all it takes to break.
+		s = strings.TrimSpace(strings.ToValidUTF8(s[:maxNameBytes], ""))
 	}
 	if s == "" {
 		return "download"
