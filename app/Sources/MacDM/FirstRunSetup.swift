@@ -46,36 +46,40 @@ enum FirstRunSetup {
         }
     }
 
-    private static func chromiumManifest(host: String) -> String {
-        """
-        {
-          "name": "\(hostName)",
-          "description": "MacDM native messaging host",
-          "path": "\(host)",
-          "type": "stdio",
-          "allowed_origins": ["chrome-extension://\(extensionID)/"]
-        }
-        """
+    // Built with JSONSerialization, not string interpolation: `host` is the
+    // app's own bundle path, and macOS allows " and \ in a folder name. A user
+    // who put MacDM under, say, My "Apps" would otherwise get a malformed
+    // manifest and a silently dead native-messaging channel.
+    private static func chromiumManifest(host: String) -> Data? {
+        manifestData(host: host, extra: [
+            "allowed_origins": ["chrome-extension://\(extensionID)/"],
+        ])
     }
 
-    private static func firefoxManifest(host: String) -> String {
-        """
-        {
-          "name": "\(hostName)",
-          "description": "MacDM native messaging host",
-          "path": "\(host)",
-          "type": "stdio",
-          "allowed_extensions": ["macdm@example.invalid"]
-        }
-        """
+    private static func firefoxManifest(host: String) -> Data? {
+        manifestData(host: host, extra: [
+            "allowed_extensions": ["macdm@example.invalid"],
+        ])
     }
 
-    private static func writeManifest(dir: String, json: String) {
+    private static func manifestData(host: String, extra: [String: Any]) -> Data? {
+        var obj: [String: Any] = [
+            "name": hostName,
+            "description": "MacDM native messaging host",
+            "path": host,
+            "type": "stdio",
+        ]
+        for (k, v) in extra { obj[k] = v }
+        return try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted])
+    }
+
+    private static func writeManifest(dir: String, json: Data?) {
+        guard let json else { return }
         let hostsDir = dir + "/NativeMessagingHosts"
         try? FileManager.default.createDirectory(
             atPath: hostsDir, withIntermediateDirectories: true)
         let path = hostsDir + "/\(hostName).json"
-        try? json.write(toFile: path, atomically: true, encoding: .utf8)
+        try? json.write(to: URL(fileURLWithPath: path), options: .atomic)
     }
 
     private static func dirExists(_ p: String) -> Bool {

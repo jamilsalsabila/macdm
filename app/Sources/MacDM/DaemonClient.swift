@@ -132,18 +132,29 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     private var jobListeners: [([Job]) -> Void] = []
     func onJobs(_ h: @escaping ([Job]) -> Void) {
         jobListeners.append(h)
-        h(jobs.values.sorted { $0.filename < $1.filename }) // prime with current
+        h(snapshotJobs()) // prime with current
     }
     private func emitJobs() {
-        let snap = jobs.values.sorted { $0.filename < $1.filename }
+        let snap = snapshotJobs()
         DispatchQueue.main.async { self.jobListeners.forEach { $0(snap) } }
+    }
+
+    /// `jobs` is written on the URLSession delegate queue and read from the main
+    /// thread (onJobs primes a new listener), so every access takes the lock —
+    /// concurrent use of a Swift Dictionary is undefined behaviour, not just a
+    /// stale read.
+    private func snapshotJobs() -> [Job] {
+        jobsLock.lock()
+        defer { jobsLock.unlock() }
+        return jobs.values.sorted { $0.filename < $1.filename }
     }
 
     var onConnection: ((Bool) -> Void)?
     /// Raised on the main thread when a new proposal needs the dialog.
     var onProposal: ((Proposal) -> Void)?
 
-    private(set) var jobs: [String: Job] = [:]
+    private let jobsLock = NSLock()
+    private var jobs: [String: Job] = [:] // guarded by jobsLock
     /// When the current SSE stream connected. The daemon replays every existing
     /// job (old completed ones included) right after connect; we suppress
     /// "download complete" notifications for a moment so that backlog is silent.
@@ -169,20 +180,31 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
     }
 
     func add(url: String, dest: String? = nil, conns: Int? = nil, formatID: String? = nil,
-             quality: String? = nil, completion: ((Result<Job, Error>) -> Void)? = nil) {
+             quality: String? = nil, filename: String? = nil,
+             completion: ((Result<Job, Error>) -> Void)? = nil) {
         var body: [String: Any] = ["url": url]
+        if let n = filename, !n.isEmpty { body["filename"] = n }
         if let d = dest { body["dest"] = d }
         if let c = conns { body["conns"] = c }
         if let f = formatID { body["format_id"] = f }
         if let q = quality { body["quality"] = q }
         post("api/jobs", body) { data, code in
-            guard let data = data else { completion?(.failure(Err.empty)); return }
-            if code >= 300 {
-                let msg = (try? JSONDecoder().decode([String: String].self, from: data))?["error"] ?? "HTTP \(code)"
-                completion?(.failure(Err.server(msg)))
-                return
+            // Hop to main like every other completion here: callers open windows
+            // from this, and AppKit off the main thread is undefined behaviour.
+            let result: Result<Job, Error>
+            if let data = data {
+                if code >= 300 {
+                    let msg = (try? JSONDecoder().decode([String: String].self, from: data))?["error"] ?? "HTTP \(code)"
+                    result = .failure(Err.server(msg))
+                } else if let job = try? JSONDecoder().decode(Job.self, from: data) {
+                    result = .success(job)
+                } else {
+                    result = .failure(Err.server("unreadable response"))
+                }
+            } else {
+                result = .failure(Err.empty)
             }
-            if let job = try? JSONDecoder().decode(Job.self, from: data) { completion?(.success(job)) }
+            DispatchQueue.main.async { completion?(result) }
         }
     }
 
@@ -203,14 +225,21 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
         }
     }
 
+    /// Accepts a proposal. The daemon replies 201 with the job it created —
+    /// `completion` receives it so the caller can open the progress window
+    /// straight away instead of waiting for it to turn up over SSE.
     func accept(_ proposalID: String, dest: String?, filename: String?, conns: Int,
-                formatID: String?, quality: String?) {
+                formatID: String?, quality: String?,
+                completion: ((Job?) -> Void)? = nil) {
         var body: [String: Any] = ["conns": conns]
         if let d = dest { body["dest"] = d }
         if let f = filename { body["filename"] = f }
         if let fid = formatID { body["format_id"] = fid }
         if let q = quality { body["quality"] = q }
-        post("api/proposals/\(proposalID)/accept", body)
+        post("api/proposals/\(proposalID)/accept", body) { data, code in
+            let job = (code < 300) ? data.flatMap { try? JSONDecoder().decode(Job.self, from: $0) } : nil
+            DispatchQueue.main.async { completion?(job) }
+        }
     }
 
     func reject(_ proposalID: String) { post("api/proposals/\(proposalID)/reject", [:]) }
@@ -281,15 +310,21 @@ final class DaemonClient: NSObject, URLSessionDataDelegate {
         switch t.type {
         case "job":
             if let e = try? JSONDecoder().decode(JobEnvelope.self, from: json) {
+                jobsLock.lock()
                 let prev = jobs[e.job.id]
                 jobs[e.job.id] = e.job
+                jobsLock.unlock()
                 if e.job.status == "completed", prev?.status != "completed",
                    Date().timeIntervalSince(streamConnectedAt) > 3 {
                     DispatchQueue.main.async { Notifier.downloadFinished(e.job) }
                 }
             }
         case "delete":
-            if let e = try? JSONDecoder().decode(JobEnvelope.self, from: json) { jobs.removeValue(forKey: e.job.id) }
+            if let e = try? JSONDecoder().decode(JobEnvelope.self, from: json) {
+                jobsLock.lock()
+                jobs.removeValue(forKey: e.job.id)
+                jobsLock.unlock()
+            }
         case "proposal":
             if let e = try? JSONDecoder().decode(ProposalEnvelope.self, from: json) {
                 DispatchQueue.main.async { self.onProposal?(e.proposal) }

@@ -14,7 +14,7 @@ const DefaultAddr = "127.0.0.1:7345"
 // Version is bumped whenever the daemon's wire behaviour changes. The menu-bar
 // app compares it against its own build and restarts a mismatched daemon so a
 // stale background macdmd never lingers after a rebuild.
-const Version = "0.5.8"
+const Version = "0.5.9"
 
 // Config is the on-disk settings file (config.json in the support dir). Every
 // field has a working default, so the file is optional.
@@ -89,11 +89,18 @@ func Load() Config {
 		home, _ := os.UserHomeDir()
 		c.DownloadDir = filepath.Join(home, "Downloads", "MacDM")
 	}
+	// Clamp, don't just default: these come from a hand-editable file and drive
+	// goroutine and socket counts. /api/jobs/{id}/conns already enforces 1–64,
+	// so config.json should not be a way around it.
 	if c.MaxConns <= 0 {
 		c.MaxConns = 8
+	} else if c.MaxConns > 64 {
+		c.MaxConns = 64
 	}
 	if c.MaxActive <= 0 {
 		c.MaxActive = 4
+	} else if c.MaxActive > 32 {
+		c.MaxActive = 32
 	}
 	if c.PromptTimeoutSec <= 0 {
 		c.PromptTimeoutSec = 8

@@ -380,21 +380,13 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 		return &sc.Chunks[len(sc.Chunks)-1]
 	}
 
-	scMu.Lock()
-	pending := 0
-	for i := range sc.Chunks {
-		if sc.Chunks[i].remaining() > 0 {
-			pending++
-		}
-	}
-	scMu.Unlock()
-	workers := conns
-	if workers > pending {
-		workers = pending
-	}
-
+	// Always start `conns` workers, even when fewer chunks remain: a worker with
+	// no unclaimed chunk immediately splits one instead, which is exactly the
+	// long-tail case (a resume with one chunk left) stealing exists to fix.
+	// next() returns nil when there is genuinely nothing to do, so surplus
+	// workers just exit.
 	g := newGroup(conns)
-	for w := 0; w < workers; w++ {
+	for w := 0; w < conns; w++ {
 		g.go_(func() error {
 			for {
 				c := next()

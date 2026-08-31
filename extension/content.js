@@ -112,32 +112,6 @@
     return location.href;
   }
 
-  // TikTok's <video> plays a session-locked DASH URL (chain_token / btag) that
-  // 403s outside the browser. The page embeds the real progressive URL in a
-  // JSON <script> — that's what Neat DM / yt-dlp use. Read it straight from the
-  // DOM (works in the content-script world; no page-context access needed).
-  function deepFindURL(obj, keys, depth) {
-    if (!obj || typeof obj !== "object" || depth > 9) return null;
-    const good = (s) =>
-      typeof s === "string" && /^https?:\/\/[^ ]+\/video\//.test(s) && !/chain_token/.test(s);
-    for (const k of keys) {
-      const v = obj[k];
-      if (good(v)) return v;
-      if (v && typeof v === "object") {
-        const list = v.UrlList || v.url_list;
-        if (Array.isArray(list)) {
-          const hit = list.find(good) || [...list].reverse().find((s) => /^https?:/.test(s));
-          if (hit) return hit;
-        }
-      }
-    }
-    for (const v of Array.isArray(obj) ? obj : Object.values(obj)) {
-      const r = deepFindURL(v, keys, depth + 1);
-      if (r) return r;
-    }
-    return null;
-  }
-
   // tiktok-main.js runs in the PAGE context and posts the real progressive URLs
   // (playAddr / downloadAddr / bitrateInfo) here — the isolated content script
   // can't reach those window globals itself.

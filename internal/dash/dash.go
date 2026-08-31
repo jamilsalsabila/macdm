@@ -132,6 +132,23 @@ func (c *Client) get(ctx context.Context, u string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }
 
+// fetchSegment downloads one segment, publishing dst only via an atomic rename
+// so dst existing means dst is complete — a retry of a partly-assembled track
+// skips what it already has instead of re-fetching everything.
+func (c *Client) fetchSegment(ctx context.Context, u, dst string, onBytes func(int)) error {
+	if fi, err := os.Stat(dst); err == nil && fi.Size() > 0 {
+		if onBytes != nil {
+			onBytes(int(fi.Size())) // keep byte accounting honest across a resume
+		}
+		return nil
+	}
+	tmp := dst + ".part"
+	if err := c.fetchToFile(ctx, u, tmp, onBytes); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
+}
+
 // fetchToFile streams u straight into dst (reporting each chunk via onBytes) so
 // assembly never holds a whole segment in memory — a DASH on-demand "segment"
 // can be an entire multi-GB track file.
@@ -540,7 +557,7 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 				emit()
 				var lastEmit time.Time
 				fn := filepath.Join(opt.Dir, fmt.Sprintf("%s-%06d", t.Kind, i))
-				err := c.fetchToFile(ctx, t.Segments[i], fn, func(n int) {
+				err := c.fetchSegment(ctx, t.Segments[i], fn, func(n int) {
 					doneBytes.Add(int64(n))
 					mu.Lock()
 					states[w].Bytes += int64(n)

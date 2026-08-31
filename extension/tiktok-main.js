@@ -69,11 +69,30 @@
   }
 
   let lastKey = "";
+  // videoForId() deep-walks the page state when there is no direct ItemModule
+  // hit — on the home feed that walk finds nothing and, at 600ms forever, burned
+  // CPU for the life of the tab. Once a clip is resolved, or after enough misses
+  // on the same id, stop re-walking until the id actually changes.
+  let lastId = null;
+  let misses = 0;
+  const MAX_MISSES = 12; // ~7s of polling before we give up on this id
+
   function announce() {
     const id = currentId();
+    if (id !== lastId) {
+      lastId = id;
+      misses = 0;
+    } else if (misses >= MAX_MISSES) {
+      return; // nothing here; wait for a navigation
+    }
     const urls = urlsFor(videoForId(id));
+    if (!urls.length) {
+      misses++;
+      return;
+    }
+    misses = MAX_MISSES; // resolved — no need to keep walking this clip
     const key = id + "|" + urls.join(",");
-    if (!urls.length || key === lastKey) return;
+    if (key === lastKey) return;
     lastKey = key;
     window.postMessage({ __macdm_tiktok: 1, id: id, urls: urls, page: location.href }, location.origin);
   }

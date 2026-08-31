@@ -146,6 +146,7 @@ type Store struct {
 	dirty    bool          // a progress update is waiting to be flushed
 	flushReq chan struct{} // wake the flush loop for an immediate write
 	stop     chan struct{}
+	done     chan struct{} // closed once the flush loop has written and exited
 }
 
 // Event is broadcast to watchers whenever a job is created or changes.
@@ -165,6 +166,7 @@ func Open(path string) (*Store, error) {
 		watchers: map[int]chan Event{},
 		flushReq: make(chan struct{}, 1),
 		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -195,6 +197,7 @@ func Open(path string) (*Store, error) {
 func (s *Store) flushLoop() {
 	t := time.NewTicker(1 * time.Second)
 	defer t.Stop()
+	defer close(s.done)
 	for {
 		select {
 		case <-s.stop:
@@ -225,12 +228,18 @@ func (s *Store) flush() {
 	}
 }
 
-// Close flushes any pending write and stops the flush loop.
+// Close stops the flush loop and blocks until its final write has landed —
+// otherwise the daemon can exit with the last progress/status update still
+// only in memory. Safe to call more than once.
 func (s *Store) Close() {
 	select {
 	case <-s.stop:
 	default:
 		close(s.stop)
+	}
+	select {
+	case <-s.done:
+	case <-time.After(3 * time.Second): // never hang shutdown on a stuck disk
 	}
 }
 
