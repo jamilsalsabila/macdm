@@ -667,3 +667,75 @@ func TestAssembleByteRangeRefusesIgnoredRange(t *testing.T) {
 		t.Fatalf("error should name the cause: %v", err)
 	}
 }
+
+// #EXT-X-I-FRAME-STREAM-INF advertises a trick-play stream of keyframes only —
+// useless as a download. It carries its URI as an attribute rather than on the
+// next line, so it must never become a variant.
+func TestIFrameVariantsAreNotDownloadable(t *testing.T) {
+	m := `#EXTM3U
+#EXT-X-INDEPENDENT-SEGMENTS
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=99000,RESOLUTION=640x360,URI="iframe_360.m3u8"
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=9900000,RESOLUTION=1920x1080,URI="iframe_1080.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+v360.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720
+v720.m3u8
+`
+	p, err := parse(m, mustURL("https://x/y/master.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Variants) != 2 {
+		t.Fatalf("want 2 playable variants, got %d: %+v", len(p.Variants), p.Variants)
+	}
+	for _, v := range p.Variants {
+		if strings.Contains(v.URL, "iframe") {
+			t.Fatalf("an I-frame playlist became a variant: %s", v.URL)
+		}
+	}
+	// The 9.9 Mbps I-frame entry must not win on bandwidth.
+	best, ok := p.BestVariant()
+	if !ok || !strings.HasSuffix(best.URL, "/v720.m3u8") {
+		t.Fatalf("best variant = %+v", best)
+	}
+}
+
+// A master offering nothing but I-frame streams has nothing to download, and
+// should say so rather than picking one.
+func TestOnlyIFrameVariantsIsAnError(t *testing.T) {
+	p, err := parse(`#EXTM3U
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=99000,URI="i.m3u8"
+`, mustURL("https://x/y/m.m3u8"))
+	if err == nil {
+		if _, ok := p.BestVariant(); ok {
+			t.Fatal("an I-frame-only master must not yield a variant")
+		}
+	}
+}
+
+// #EXT-X-DATERANGE carries ad markers (SCTE-35). Its segments are ordinary and
+// must download like any other; the tag itself is metadata we ignore.
+func TestDaterangeMarkersDoNotDisturbSegments(t *testing.T) {
+	p, err := parse(`#EXTM3U
+#EXT-X-TARGETDURATION:6
+#EXT-X-DATERANGE:ID="ad1",START-DATE="2026-01-01T00:00:00Z",DURATION=30,SCTE35-OUT=0xFC30
+#EXTINF:6.0,
+a.ts
+#EXT-X-DATERANGE:ID="ad1",END-DATE="2026-01-01T00:00:30Z"
+#EXTINF:6.0,
+b.ts
+#EXT-X-ENDLIST
+`, mustURL("https://x/y/i.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.IsMaster || p.Live {
+		t.Fatalf("misclassified: master=%v live=%v", p.IsMaster, p.Live)
+	}
+	if len(p.Segments) != 2 {
+		t.Fatalf("want 2 segments, got %d", len(p.Segments))
+	}
+	if !strings.HasSuffix(p.Segments[0].URL, "/a.ts") || !strings.HasSuffix(p.Segments[1].URL, "/b.ts") {
+		t.Fatalf("segment URLs wrong: %+v", p.Segments)
+	}
+}

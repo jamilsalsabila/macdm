@@ -85,8 +85,10 @@ These are design choices, not bugs — MacDM stops where a download manager shou
 - **HLS** handles alternate audio and subtitle renditions
   (`#EXT-X-MEDIA`), `#EXT-X-BYTERANGE` segments (including a byte-range
   `#EXT-X-MAP`), and `#EXT-X-DISCONTINUITY` — the remux regenerates timestamps
-  across the join. Not handled: I-frame-only playlists and
-  `#EXT-X-DATERANGE`/SCTE-35 ad markers (their segments download like any other).
+  across the join. `#EXT-X-I-FRAME-STREAM-INF` trick-play streams are ignored
+  (they are keyframes only, not a downloadable rendition) and
+  `#EXT-X-DATERANGE`/SCTE-35 ad markers are metadata — their segments download
+  like any other.
 - **DASH** supports `SegmentTemplate` (with `SegmentTimeline`), `SegmentList`
   addressed by `media` URLs, single-file `BaseURL`, and multi-`Period`
   presentations (each period is assembled and muxed separately, then joined
@@ -103,7 +105,10 @@ These are design choices, not bugs — MacDM stops where a download manager shou
   `<video>.<lang>.vtt`), not muxed into the container. HLS `TYPE=SUBTITLES`
   renditions are merged across segments with their `X-TIMESTAMP-MAP` applied;
   DASH text AdaptationSets are fetched as one file or merged when segmented.
-  In-band CEA-608/708 captions and segmented TTML are not handled, and a
+  Not extracted to a sidecar: in-band CEA-608/708 captions (they ride inside the
+  video stream and survive the remux, so a player that decodes them still shows
+  them) and segmented TTML (ffmpeg has no TTML decoder, and gluing XML documents
+  end to end parses as nothing — it is refused rather than mis-assembled). A
   subtitle failure never fails the video download.
 - **MV3 header visibility.** Chrome does not reliably expose `Cookie`,
   `User-Agent`, or `Authorization` on caught requests, so a *direct* media
