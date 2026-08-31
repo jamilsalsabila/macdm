@@ -31,20 +31,25 @@ if [[ ! -x "$TOOLS/ffmpeg" ]]; then
 fi
 
 # --- yt-dlp (nightly: site fixes land here first; MacDM auto-updates it too) ---
-# Prefer the tiny `yt-dlp` zipapp (needs python3) — the `yt-dlp_macos`
-# PyInstaller build re-extracts ~40 MB and gets Gatekeeper-assessed on EVERY
-# run, which is 50s+ per invocation on Intel / older macOS.
+# BOTH builds are bundled, because which one works is a property of the *user's*
+# Mac, not the build machine:
+#   yt-dlp        the tiny zipapp — fast, but needs a working python3
+#   yt-dlp_macos  self-contained — works with no python3 at all, but the
+#                 PyInstaller build re-extracts ~40 MB per run (50s+ on Intel)
+# tools.YtDlpInvocation prefers the zipapp and falls back to the standalone.
+# Shipping only the zipapp meant every extractor download failed on a Mac
+# without the Command Line Tools.
 if [[ ! -x "$TOOLS/yt-dlp" ]]; then
-  if command -v python3 >/dev/null && python3 -c 'import sys' 2>/dev/null; then
-    echo "yt-dlp: downloading yt-dlp zipapp (nightly)"
-    curl -fSL "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp" \
-      -o "$TOOLS/yt-dlp"
-  else
-    echo "yt-dlp: no python3 — downloading yt-dlp_macos (nightly, slower)"
-    curl -fSL "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_macos" \
-      -o "$TOOLS/yt-dlp"
-  fi
+  echo "yt-dlp: downloading yt-dlp zipapp (nightly)"
+  curl -fSL "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp" \
+    -o "$TOOLS/yt-dlp"
   chmod +x "$TOOLS/yt-dlp"
+fi
+if [[ ! -x "$TOOLS/yt-dlp_macos" ]]; then
+  echo "yt-dlp: downloading yt-dlp_macos (nightly, python3-free fallback)"
+  curl -fSL "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_macos" \
+    -o "$TOOLS/yt-dlp_macos"
+  chmod +x "$TOOLS/yt-dlp_macos"
 fi
 
 echo "tools ready:"

@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"macdm/internal/config"
@@ -124,25 +125,57 @@ func YtDlpInvocation(ytdlpPath string) []string {
 	// explicit interpreter because a GUI-launched daemon's PATH lacks
 	// /usr/local/bin, so `env` can't resolve python3.
 	if strings.HasPrefix(firstLine, "#!") && strings.Contains(firstLine, "python") {
-		if py := findPython3(); py != "" {
+		if py := python3Locator(); py != "" {
 			return []string{py, ytdlpPath}
+		}
+		// No usable python3. The bundle ships the self-contained build next to
+		// the zipapp for exactly this case — a Mac without the Command Line
+		// Tools would otherwise fail every extractor download.
+		if alt := filepath.Join(filepath.Dir(ytdlpPath), "yt-dlp_macos"); isExec(alt) {
+			return []string{alt}
 		}
 	}
 	return []string{ytdlpPath}
 }
 
+// python3Locator is findPython3, indirected so a test can simulate a Mac with
+// no usable python3 — the case that matters most and cannot otherwise be
+// exercised on a developer machine.
+var python3Locator = findPython3
+
+var python3Once struct {
+	sync.Once
+	path string
+}
+
+// findPython3 returns a python3 that actually runs, or "".
+//
+// Being executable is not enough: on a Mac without the Command Line Tools,
+// /usr/bin/python3 is a stub that only prompts to install them, and a
+// GUI-launched daemon just gets a failure. So each candidate is executed once
+// and the answer cached.
 func findPython3() string {
-	for _, c := range []string{
-		"/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/usr/bin/python3",
-	} {
-		if isExec(c) {
-			return c
+	python3Once.Do(func() {
+		cands := []string{
+			"/usr/local/bin/python3", "/opt/homebrew/bin/python3", "/usr/bin/python3",
 		}
-	}
-	if p, err := exec.LookPath("python3"); err == nil {
-		return p
-	}
-	return ""
+		if p, err := exec.LookPath("python3"); err == nil {
+			cands = append(cands, p)
+		}
+		for _, c := range cands {
+			if !isExec(c) {
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := exec.CommandContext(ctx, c, "-c", "import sys").Run()
+			cancel()
+			if err == nil {
+				python3Once.path = c
+				return
+			}
+		}
+	})
+	return python3Once.path
 }
 
 func isExec(p string) bool {

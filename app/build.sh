@@ -37,7 +37,7 @@ if [[ "$MODE" == "bundle" ]]; then
   # filesystem, and the app spawns the daemon itself so it isn't needed.
   cp ../bin/macdmd        "$APP/Contents/MacOS/macdmd"
   cp ../bin/macdm-nmhost  "$APP/Contents/MacOS/macdm-nmhost"
-  cp .tools/ffmpeg .tools/yt-dlp "$APP/Contents/Resources/bin/"
+  cp .tools/ffmpeg .tools/yt-dlp .tools/yt-dlp_macos "$APP/Contents/Resources/bin/"
 
   # App icon (Dock + Finder). Regenerate if the generator is newer.
   if [[ ! -f AppIcon.icns || make-icon.swift -nt AppIcon.icns ]]; then
@@ -77,6 +77,7 @@ PLIST
   codesign --force --timestamp=none -s - \
     "$APP/Contents/Resources/bin/ffmpeg" \
     "$APP/Contents/Resources/bin/yt-dlp" \
+    "$APP/Contents/Resources/bin/yt-dlp_macos" \
     "$APP/Contents/MacOS/macdmd" \
     "$APP/Contents/MacOS/macdm-nmhost"
   codesign --force --timestamp=none -s - "$APP"

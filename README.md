@@ -109,6 +109,10 @@ These are design choices, not bugs — MacDM stops where a download manager shou
   catch from a login-walled site may 403. Use the extractor + cookies path
   there.
 - **Safari** is not supported (it needs an Xcode-wrapped App Extension).
+- **yt-dlp needs no Python.** The app bundles both the zipapp (fast, needs a
+  working `python3`) and the self-contained `yt-dlp_macos`, and falls back to
+  the latter automatically — a Mac without the Command Line Tools has only a
+  `python3` stub that cannot run.
 - **Unsigned dev builds.** Gatekeeper will block the native-messaging host
   until the app is codesigned and notarised (see [Packaging](#packaging-for-distribution-not-done-in-this-repo)).
 - **Loopback / single user.** The daemon listens only on `127.0.0.1`. No remote
