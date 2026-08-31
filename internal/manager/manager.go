@@ -263,17 +263,45 @@ func (m *Manager) start(id string) {
 		if j.Status == store.StatusCompleted {
 			return // e.g. a SetConns bounce that raced with completion
 		}
-		m.setStatus(id, store.StatusProbing, "")
 
-		switch {
-		case len(j.Fragments) > 0:
-			err = m.execFragments(ctx, id, j)
-		case j.Kind == store.KindHLS, j.Kind == store.KindDASH:
-			err = m.execStream(ctx, id, j)
-		case j.Kind == store.KindExtract:
-			err = m.execExtract(ctx, id, j)
-		default:
-			err = m.execHTTP(ctx, id, j)
+		runOnce := func() error {
+			jj, e := m.st.Get(id)
+			if e != nil {
+				return e
+			}
+			m.setStatus(id, store.StatusProbing, "")
+			switch {
+			case len(jj.Fragments) > 0:
+				return m.execFragments(ctx, id, jj)
+			case jj.Kind == store.KindHLS, jj.Kind == store.KindDASH:
+				return m.execStream(ctx, id, jj)
+			case jj.Kind == store.KindExtract:
+				return m.execExtract(ctx, id, jj)
+			default:
+				return m.execHTTP(ctx, id, jj)
+			}
+		}
+
+		// A dropped connection or a flaky host shouldn't need a manual Resume
+		// click. Retry the whole job a few times — every exec path re-probes and
+		// resumes from the .part / sidecar, so completed bytes are kept.
+		const maxAutoResumes = 4
+		for attempt := 0; ; attempt++ {
+			err = runOnce()
+			if err == nil || attempt >= maxAutoResumes || !transientErr(err) {
+				break
+			}
+			wait := time.Duration(attempt+1) * autoResumeBackoff
+			m.setStatus(id, store.StatusProbing,
+				fmt.Sprintf("connection lost — retrying (%d/%d)", attempt+1, maxAutoResumes))
+			select {
+			case <-ctx.Done():
+				err = context.Canceled
+			case <-time.After(wait):
+			}
+			if errors.Is(err, context.Canceled) {
+				break
+			}
 		}
 
 		switch {
@@ -496,6 +524,35 @@ func engineConns(cs []engine.ConnProgress) []store.ConnStat {
 		}
 	}
 	return out
+}
+
+// autoResumeBackoff is the base wait between automatic job retries (grows
+// linearly per attempt). A var so tests can shorten it.
+var autoResumeBackoff = 3 * time.Second
+
+// transientErr reports whether an exec failure is worth an automatic retry.
+// It's a denylist: retry anything that isn't obviously permanent (bad URL,
+// DRM, auth/not-found, or a user cancel).
+func transientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, errDRM) {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	permanent := []string{
+		"drm", "unsupported url", "byte-range fragment", "not a downloadable",
+		"http 400", "http 401", "http 403", "http 404", "http 410",
+		" 400 ", " 401 ", " 403 ", " 404 ", " 410 ",
+		"no fragments", "playlist has no segments", "no downloadable tracks",
+	}
+	for _, p := range permanent {
+		if strings.Contains(s, p) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) setStatus(id, status, msg string) {

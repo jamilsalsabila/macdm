@@ -273,6 +273,11 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 			defer t.Stop()
 			last := done.Load()
 			lastT := time.Now()
+			// Exponential moving average over the 250ms samples (~a few seconds
+			// of memory). Without it the rate jumps to 0 whenever a tick lands
+			// between bursts — common when connections are mid-retry.
+			var avg float64
+			seeded := false
 			for {
 				select {
 				case <-progCtx.Done():
@@ -280,13 +285,18 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 				case now := <-t.C:
 					cur := done.Load()
 					dt := now.Sub(lastT).Seconds()
-					var sp int64
+					var inst float64
 					if dt > 0 {
-						sp = int64(float64(cur-last) / dt)
+						inst = float64(cur-last) / dt
 					}
 					last, lastT = cur, now
+					if !seeded && inst > 0 {
+						avg, seeded = inst, true
+					} else {
+						avg += 0.15 * (inst - avg)
+					}
 					onProgress(Progress{
-						DoneBytes: cur, TotalBytes: pr.TotalBytes, SpeedBps: sp,
+						DoneBytes: cur, TotalBytes: pr.TotalBytes, SpeedBps: int64(avg),
 						NumConns: conns, Resumable: pr.AcceptRanges, Conns: snapshotConns(),
 					})
 				}
@@ -375,28 +385,30 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 }
 
 func (e *Engine) fetchChunk(ctx context.Context, spec DownloadSpec, f *os.File, c *chunk, scMu *sync.Mutex, done *atomic.Int64) error {
-	const maxTries = 5
+	// Give up only after this many attempts in a row moved *zero* bytes. An
+	// attempt that transferred something resets the counter — a flaky link that
+	// drops every few MB still finishes instead of failing the whole job at 5.
+	const maxDeadTries = 6
+	// Absolute ceiling for a pathological "1 byte then drop" server.
+	const maxTries = 200
 	var lastErr error
+	dead := 0
 	for try := 0; try < maxTries; try++ {
-		if try > 0 {
+		if dead > 0 {
+			back := time.Duration(dead*dead) * 500 * time.Millisecond
+			if back > 15*time.Second {
+				back = 15 * time.Second
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(time.Duration(try*try) * 500 * time.Millisecond):
+			case <-time.After(back):
 			}
 		}
 		n, err := e.fetchChunkOnce(ctx, spec, f, c, scMu, done)
-		_ = n
 		if err == nil {
 			setChunkStatus(scMu, c, "done")
 			return nil
-		}
-		if errors.Is(err, errStalled) {
-			// A dead/stalled connection — retryable, and c.Done kept the bytes
-			// we did get, so the retry resumes from there.
-			lastErr = err
-			setChunkStatus(scMu, c, "error")
-			continue
 		}
 		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 			setChunkStatus(scMu, c, "idle")
@@ -408,8 +420,15 @@ func (e *Engine) fetchChunk(ctx context.Context, spec DownloadSpec, f *os.File, 
 			setChunkStatus(scMu, c, "done")
 			return err
 		}
+		// errStalled and ordinary network errors land here. c.Done kept whatever
+		// bytes arrived, so the next attempt resumes from there.
 		lastErr = err
 		setChunkStatus(scMu, c, "error")
+		if n > 0 {
+			dead = 0
+		} else if dead++; dead >= maxDeadTries {
+			break
+		}
 	}
 	return fmt.Errorf("chunk %d: %w", c.Index, lastErr)
 }

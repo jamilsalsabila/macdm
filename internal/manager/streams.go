@@ -73,12 +73,19 @@ func (m *Manager) execStream(ctx context.Context, id string, j *store.Job) error
 	var lastBytes int64
 	var lastT = time.Now()
 	var estTotal int64
+	var avgBps float64 // EWMA so the rate doesn't snap to 0 between segments
 	segProgress := func(sp streamProg) {
 		now := time.Now()
 		var bps int64
 		if dt := now.Sub(lastT).Seconds(); dt > 0.4 {
-			bps = int64(float64(sp.bytes-lastBytes) / dt)
+			inst := float64(sp.bytes-lastBytes) / dt
 			lastBytes, lastT = sp.bytes, now
+			if avgBps == 0 && inst > 0 {
+				avgBps = inst
+			} else {
+				avgBps += 0.25 * (inst - avgBps)
+			}
+			bps = int64(avgBps)
 		}
 		// Estimate the whole size from bytes-so-far vs segments-so-far so the %
 		// bar advances continuously instead of jumping one segment at a time.

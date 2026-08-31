@@ -366,3 +366,55 @@ func TestTruncatedRangeResponseRetries(t *testing.T) {
 		t.Fatalf("content mismatch after truncated-range retry: %d of %d bytes", len(got), len(body))
 	}
 }
+
+// TestFlakyHostManyDrops: the server kills every connection after ~12KB, so a
+// 400KB chunk needs ~35 resume attempts — far past the old fixed cap of 5.
+// Because each attempt still makes progress the no-progress budget resets and
+// the download completes.
+func TestFlakyHostManyDrops(t *testing.T) {
+	body := make([]byte, 400<<10)
+	rand.New(rand.NewSource(99)).Read(body)
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Accept-Ranges", "bytes")
+		start := int64(0)
+		if rg := r.Header.Get("Range"); strings.HasPrefix(rg, "bytes=") {
+			p := strings.SplitN(strings.TrimPrefix(rg, "bytes="), "-", 2)
+			start, _ = strconv.ParseInt(p[0], 10, 64)
+		}
+		seg := body[start:]
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(body)-1, len(body)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(seg)))
+		w.WriteHeader(http.StatusPartialContent)
+		n := 12 << 10
+		if n > len(seg) {
+			n = len(seg)
+		}
+		w.Write(seg[:n])
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if n < len(seg) {
+			if hj, ok := w.(http.Hijacker); ok {
+				if c, _, err := hj.Hijack(); err == nil {
+					_ = c.Close()
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	e := New(Config{MaxConns: 1, MinChunk: 1 << 20, Timeout: 10 * time.Second})
+	dest := filepath.Join(t.TempDir(), "flaky.bin")
+	if _, err := e.Run(context.Background(), DownloadSpec{URL: srv.URL, Dest: dest}, nil); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if sha(got) != sha(body) {
+		t.Fatalf("content mismatch: %d of %d bytes", len(got), len(body))
+	}
+	if hits.Load() < 10 {
+		t.Fatalf("expected many resume attempts, got %d", hits.Load())
+	}
+}

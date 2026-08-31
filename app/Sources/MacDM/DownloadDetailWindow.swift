@@ -180,7 +180,11 @@ final class DownloadDetailWindowController: NSWindowController, NSTableViewDataS
     private func statusText(_ j: Job) -> String {
         switch j.status {
         case "downloading": return "Receiving data…"
-        case "probing": return "Resolving…"
+        case "probing":
+            // the manager parks a "connection lost — retrying (n/m)" note here
+            // between automatic resume attempts
+            if let n = j.error, !n.isEmpty { return n }
+            return "Resolving…"
         case "queued": return "Queued"
         case "paused": return "Paused"
         case "completed": return "Complete"
