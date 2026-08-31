@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -46,6 +47,44 @@ func (m *Muxer) Combine(ctx context.Context, video, audio, out string, onProgres
 	return m.run(ctx, dur, onProgress,
 		"-i", video, "-i", audio, "-c", "copy",
 		"-map", "0:v:0", "-map", "1:a:0", out)
+}
+
+// Concat joins already-muxed files end to end with the concat demuxer, which
+// re-times each input — that is what makes it correct across DASH periods, where
+// every period has its own init segment and its own timeline.
+//
+// It is still a stream copy, so the inputs must share codecs and parameters.
+// When they do not, ffmpeg fails and the error is surfaced rather than a
+// silently broken file being produced.
+func (m *Muxer) Concat(ctx context.Context, inputs []string, out string, onProgress func(Progress)) error {
+	if len(inputs) == 0 {
+		return fmt.Errorf("nothing to concatenate")
+	}
+	if len(inputs) == 1 {
+		return m.Remux(ctx, inputs[0], out, onProgress)
+	}
+	list, err := os.CreateTemp(filepath.Dir(out), "concat-*.txt")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(list.Name())
+	for _, in := range inputs {
+		// The demuxer's own quoting: single quotes, with ' written as '\''.
+		if _, err := fmt.Fprintf(list, "file '%s'\n", strings.ReplaceAll(in, "'", `'\''`)); err != nil {
+			list.Close()
+			return err
+		}
+	}
+	if err := list.Close(); err != nil {
+		return err
+	}
+
+	var total time.Duration
+	for _, in := range inputs {
+		total += m.durationOf(ctx, in)
+	}
+	return m.run(ctx, total, onProgress,
+		"-f", "concat", "-safe", "0", "-i", list.Name(), "-c", "copy", out)
 }
 
 func (m *Muxer) run(ctx context.Context, total time.Duration, onProgress func(Progress), args ...string) error {

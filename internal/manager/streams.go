@@ -346,64 +346,100 @@ func (m *Manager) execDASH(ctx context.Context, id string, j *store.Job, wd, des
 		return err
 	}
 
+	// Every period counts towards one progress bar. Downloading only the first
+	// period used to silently truncate the video and still report success.
 	total := 0
-	if man.Video != nil {
-		total += len(man.Video.Segments)
+	for _, pd := range man.Periods {
+		if pd.Video != nil {
+			total += len(pd.Video.Segments)
+		}
+		if pd.Audio != nil {
+			total += len(pd.Audio.Segments)
+		}
 	}
-	if man.Audio != nil {
-		total += len(man.Audio.Segments)
-	}
-	var prevTrackBytes, prevTrackSeg int64
+	var doneSegBase, doneBytesBase int64
 	step := func(p dash.Progress) {
 		prog(streamProg{
-			doneSeg:  int(prevTrackSeg) + p.Segment,
+			doneSeg:  int(doneSegBase) + p.Segment,
 			totalSeg: total,
-			bytes:    prevTrackBytes + p.DoneBytes,
+			bytes:    doneBytesBase + p.DoneBytes,
 			conns:    dashConns(p.Workers),
 		})
 	}
 
-	var vFile, aFile string
-	if man.Video != nil {
-		vFile = filepath.Join(wd, "video.m4s")
-		if err := c.AssembleTrack(ctx, man.Video, vFile, dash.DownloadOptions{Dir: wd, Conns: m.cfg.Engine.MaxConns}, step); err != nil {
+	audioOnly := true
+	var periodFiles []string
+	for i, pd := range man.Periods {
+		// Each period gets its own scratch dir: tracks name segments
+		// "<kind>-NNNNNN", which would collide between periods.
+		pdir := filepath.Join(wd, fmt.Sprintf("p%03d", i))
+		if err := os.MkdirAll(pdir, 0o755); err != nil {
 			return err
 		}
-		if fi, e := os.Stat(vFile); e == nil {
-			prevTrackBytes = fi.Size()
-		}
-		prevTrackSeg = int64(len(man.Video.Segments))
-	}
-	if man.Audio != nil {
-		aFile = filepath.Join(wd, "audio.m4s")
-		if err := c.AssembleTrack(ctx, man.Audio, aFile, dash.DownloadOptions{Dir: wd, Conns: m.cfg.Engine.MaxConns}, step); err != nil {
-			return err
-		}
-	}
+		opts := dash.DownloadOptions{Dir: pdir, Conns: m.cfg.Engine.MaxConns}
 
-	// As in execHLS: mux into the scratch dir, then move into place, so a failed
-	// or cancelled mux never leaves a truncated file under the final name.
-	// The extension drives ffmpeg's choice of muxer, so it has to be carried.
-	muxed := filepath.Join(wd, "muxed.mp4")
-	switch {
-	case vFile != "" && aFile != "":
-		if err := mx.Combine(ctx, vFile, aFile, muxed, muxProg("Merging video + audio")); err != nil {
-			return err
+		var vFile, aFile string
+		if pd.Video != nil {
+			audioOnly = false
+			vFile = filepath.Join(pdir, "video.m4s")
+			if err := c.AssembleTrack(ctx, pd.Video, vFile, opts, step); err != nil {
+				return err
+			}
+			if fi, e := os.Stat(vFile); e == nil {
+				doneBytesBase += fi.Size()
+			}
+			doneSegBase += int64(len(pd.Video.Segments))
 		}
-	case vFile != "":
-		if err := mx.Remux(ctx, vFile, muxed, muxProg("Finalising")); err != nil {
-			return err
+		if pd.Audio != nil {
+			aFile = filepath.Join(pdir, "audio.m4s")
+			if err := c.AssembleTrack(ctx, pd.Audio, aFile, opts, step); err != nil {
+				return err
+			}
+			if fi, e := os.Stat(aFile); e == nil {
+				doneBytesBase += fi.Size()
+			}
+			doneSegBase += int64(len(pd.Audio.Segments))
 		}
-	case aFile != "":
-		dest = ensureExt(dest, ".m4a")
-		muxed = filepath.Join(wd, "muxed.m4a")
-		if err := mx.Remux(ctx, aFile, muxed, muxProg("Finalising")); err != nil {
-			return err
+
+		stage := "Finalising"
+		if len(man.Periods) > 1 {
+			stage = fmt.Sprintf("Finalising part %d of %d", i+1, len(man.Periods))
 		}
-	default:
+		muxed := filepath.Join(pdir, "muxed.mp4")
+		switch {
+		case vFile != "" && aFile != "":
+			if err := mx.Combine(ctx, vFile, aFile, muxed, muxProg("Merging video + audio")); err != nil {
+				return err
+			}
+		case vFile != "":
+			if err := mx.Remux(ctx, vFile, muxed, muxProg(stage)); err != nil {
+				return err
+			}
+		case aFile != "":
+			muxed = filepath.Join(pdir, "muxed.m4a")
+			if err := mx.Remux(ctx, aFile, muxed, muxProg(stage)); err != nil {
+				return err
+			}
+		default:
+			continue
+		}
+		periodFiles = append(periodFiles, muxed)
+	}
+	if len(periodFiles) == 0 {
 		return fmt.Errorf("no tracks to assemble")
 	}
-	if err := moveFile(muxed, dest); err != nil {
+	if audioOnly {
+		dest = ensureExt(dest, ".m4a")
+	}
+
+	// Concat re-times each input, which is what makes joining periods correct:
+	// every period has its own init segment and its own timeline. A single
+	// period takes the plain remux path inside Concat.
+	final := filepath.Join(wd, "muxed"+extOr(dest, ".mp4"))
+	if err := mx.Concat(ctx, periodFiles, final, muxProg("Joining parts")); err != nil {
+		return err
+	}
+	if err := moveFile(final, dest); err != nil {
 		return err
 	}
 	if man.Subtitle != nil {
@@ -417,8 +453,6 @@ func (m *Manager) execDASH(ctx context.Context, id string, j *store.Job, wd, des
 	return finalize(m, id, dest)
 }
 
-// execExtract handles KindExtract: hand the page URL to yt-dlp, which resolves
-// the real media (running the site's cipher logic) and merges with ffmpeg.
 func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) error {
 	ex, err := extractor.New(m.cfg.Tools)
 	if err != nil {

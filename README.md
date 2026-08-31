@@ -82,14 +82,17 @@ These are design choices, not bugs — MacDM stops where a download manager shou
 
 - **Live streams** are refused: DASH `type="dynamic"`, live/event HLS, and
   low-latency HLS. No DVR-window assembly.
-- **HLS** alternate *audio* renditions (`#EXT-X-MEDIA:TYPE=AUDIO`) are fetched
-  and muxed in, so a video-only variant no longer downloads silent. Alternate
-  *subtitle* renditions are still not merged, and `#EXT-X-BYTERANGE` and
-  re-timing across `#EXT-X-DISCONTINUITY` are not handled.
+- **HLS** handles alternate audio and subtitle renditions
+  (`#EXT-X-MEDIA`), `#EXT-X-BYTERANGE` segments (including a byte-range
+  `#EXT-X-MAP`), and `#EXT-X-DISCONTINUITY` — the remux regenerates timestamps
+  across the join. Not handled: I-frame-only playlists and
+  `#EXT-X-DATERANGE`/SCTE-35 ad markers (their segments download like any other).
 - **DASH** supports `SegmentTemplate` (with `SegmentTimeline`), `SegmentList`
-  addressed by `media` URLs, and single-file `BaseURL`. Byte-range addressing
-  (`SegmentURL@mediaRange`, `SegmentBase`-index-only) is refused rather than
-  mis-assembled, and multi-`Period` concatenation is not supported.
+  addressed by `media` URLs, single-file `BaseURL`, and multi-`Period`
+  presentations (each period is assembled and muxed separately, then joined
+  with ffmpeg's concat demuxer so the differing timelines are re-timed).
+  Byte-range addressing (`SegmentURL@mediaRange`, `SegmentBase`-index-only) is
+  refused rather than mis-assembled.
 - **Subtitles** are saved as a sidecar `.vtt` next to the video (named
   `<video>.<lang>.vtt`), not muxed into the container. HLS `TYPE=SUBTITLES`
   renditions are merged across segments with their `X-TIMESTAMP-MAP` applied;

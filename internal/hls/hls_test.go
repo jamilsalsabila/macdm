@@ -514,3 +514,156 @@ func TestSubtitlesForNoGroup(t *testing.T) {
 		t.Fatalf("no SUBTITLES attribute should mean no rendition, got %+v", r)
 	}
 }
+
+// --- #EXT-X-BYTERANGE ---
+
+func TestParseByteRangeOffsets(t *testing.T) {
+	pl := `#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXT-X-MAP:URI="all.mp4",BYTERANGE="600@0"
+#EXTINF:2.0,
+#EXT-X-BYTERANGE:1000@600
+all.mp4
+#EXTINF:2.0,
+#EXT-X-BYTERANGE:500
+all.mp4
+#EXTINF:2.0,
+#EXT-X-BYTERANGE:250@5000
+all.mp4
+#EXT-X-ENDLIST
+`
+	p, err := parse(pl, mustURL("https://x/y/i.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.InitLength != 600 || p.InitOffset != 0 {
+		t.Errorf("EXT-X-MAP BYTERANGE: got %d@%d", p.InitLength, p.InitOffset)
+	}
+	want := []struct{ off, length int64 }{
+		{600, 1000},
+		{1600, 500}, // offset omitted => continues from the previous end
+		{5000, 250}, // explicit offset resets the run
+	}
+	if len(p.Segments) != len(want) {
+		t.Fatalf("want %d segments, got %d", len(want), len(p.Segments))
+	}
+	for i, w := range want {
+		if p.Segments[i].Offset != w.off || p.Segments[i].Length != w.length {
+			t.Errorf("segment %d: got %d@%d, want %d@%d",
+				i, p.Segments[i].Length, p.Segments[i].Offset, w.length, w.off)
+		}
+	}
+	// Every segment shares one URL — that is the whole point of the tag.
+	for i, s := range p.Segments {
+		if s.URL != "https://x/y/all.mp4" {
+			t.Errorf("segment %d URL = %s", i, s.URL)
+		}
+	}
+}
+
+func TestParseByteRangeGarbageIsIgnored(t *testing.T) {
+	p, err := parse(`#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXTINF:2.0,
+#EXT-X-BYTERANGE:notanumber
+s.ts
+#EXT-X-ENDLIST
+`, mustURL("https://x/y/i.m3u8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Segments[0].Length != 0 {
+		t.Fatalf("garbage byterange should leave the segment whole-file, got %d@%d",
+			p.Segments[0].Length, p.Segments[0].Offset)
+	}
+}
+
+// The real test: assembling a playlist whose segments are ranges of one file
+// must reproduce that file, and must send actual Range requests.
+func TestAssembleByteRangeSegments(t *testing.T) {
+	whole := []byte(strings.Repeat("A", 500) + strings.Repeat("B", 500) + strings.Repeat("C", 300))
+	var ranged, plain atomic.Int64
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/all.bin", func(w http.ResponseWriter, r *http.Request) {
+		rg := r.Header.Get("Range")
+		if rg == "" {
+			plain.Add(1)
+			w.Write(whole)
+			return
+		}
+		ranged.Add(1)
+		var start, end int64
+		fmt.Sscanf(rg, "bytes=%d-%d", &start, &end)
+		if end >= int64(len(whole)) {
+			end = int64(len(whole)) - 1
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(whole)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(whole[start : end+1])
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	mux.HandleFunc("/i.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `#EXTM3U
+#EXT-X-TARGETDURATION:1
+#EXTINF:1.0,
+#EXT-X-BYTERANGE:500@0
+%s/all.bin
+#EXTINF:1.0,
+#EXT-X-BYTERANGE:500
+%s/all.bin
+#EXTINF:1.0,
+#EXT-X-BYTERANGE:300
+%s/all.bin
+#EXT-X-ENDLIST
+`, srv.URL, srv.URL, srv.URL)
+	})
+
+	c := NewClient(srv.Client(), nil)
+	p, err := c.Parse(context.Background(), srv.URL+"/i.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "out.ts")
+	if err := c.Assemble(context.Background(), p,
+		AssembleOptions{Dir: t.TempDir(), OutFile: out, Conns: 2}, nil); err != nil {
+		t.Fatalf("assemble: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != string(whole) {
+		t.Fatalf("reassembled %d bytes, want %d", len(got), len(whole))
+	}
+	if ranged.Load() != 3 {
+		t.Errorf("want 3 Range requests, got %d", ranged.Load())
+	}
+	if plain.Load() != 0 {
+		t.Errorf("%d segments were fetched without a Range header", plain.Load())
+	}
+}
+
+// A server that ignores Range would otherwise write the whole file for every
+// segment, tripling the output.
+func TestAssembleByteRangeRefusesIgnoredRange(t *testing.T) {
+	whole := []byte(strings.Repeat("Z", 900))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/all.bin", func(w http.ResponseWriter, r *http.Request) { w.Write(whole) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	mux.HandleFunc("/i.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\n#EXT-X-BYTERANGE:300@0\n%s/all.bin\n#EXT-X-ENDLIST\n", srv.URL)
+	})
+	c := NewClient(srv.Client(), nil)
+	p, err := c.Parse(context.Background(), srv.URL+"/i.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = c.Assemble(context.Background(), p,
+		AssembleOptions{Dir: t.TempDir(), OutFile: filepath.Join(t.TempDir(), "o.ts"), Conns: 1}, nil)
+	if err == nil {
+		t.Fatal("a server ignoring Range must be an error, not a corrupt file")
+	}
+	if !strings.Contains(err.Error(), "Range") {
+		t.Fatalf("error should name the cause: %v", err)
+	}
+}

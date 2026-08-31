@@ -116,10 +116,24 @@ type Track struct {
 
 // Manifest is the useful result of parsing an MPD.
 type Manifest struct {
+	// Video/Audio/Subtitle are the first period's tracks. Kept as the simple
+	// case most callers want; a multi-period presentation needs Periods.
 	Video *Track
 	Audio *Track
 	// Subtitle is a text track (WebVTT or TTML), when the MPD offers one.
 	// Optional: its absence never fails a download.
+	Subtitle *Track
+
+	// Periods holds every period in order. A presentation split across periods
+	// (ad insertion is the usual reason) is only complete if all of them are
+	// downloaded — using just the first silently truncates the video.
+	Periods []PeriodTracks
+}
+
+// PeriodTracks are the resolved tracks of one <Period>.
+type PeriodTracks struct {
+	Video    *Track
+	Audio    *Track
 	Subtitle *Track
 }
 
@@ -332,12 +346,32 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 	base = resolveBase(base, m.BaseURL)
 
 	out := &Manifest{}
-	p := m.Periods[0]
+	for _, p := range m.Periods {
+		pt, err := resolvePeriod(base, p, preferHeight)
+		if err != nil {
+			return nil, err
+		}
+		if pt.Video == nil && pt.Audio == nil {
+			continue // an empty period (or one we cannot address) adds nothing
+		}
+		out.Periods = append(out.Periods, pt)
+	}
+	if len(out.Periods) == 0 {
+		return nil, fmt.Errorf("no downloadable tracks (unsupported segment addressing?)")
+	}
+	out.Video, out.Audio, out.Subtitle = out.Periods[0].Video, out.Periods[0].Audio, out.Periods[0].Subtitle
+	return out, nil
+}
+
+// resolvePeriod picks the best video/audio/subtitle representation of a single
+// <Period>.
+func resolvePeriod(base *url.URL, p period, preferHeight int) (PeriodTracks, error) {
+	var out PeriodTracks
 	pbase := resolveBase(base, p.BaseURL)
 
 	for _, as := range p.AdaptationSets {
 		if hasProtection(as.ContentProtection) {
-			return nil, fmt.Errorf("stream is DRM-protected (ContentProtection present)")
+			return out, fmt.Errorf("stream is DRM-protected (ContentProtection present)")
 		}
 		asbase := resolveBase(pbase, as.BaseURL)
 
@@ -364,7 +398,7 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 			// Representation; check both.
 			kind := trackKind(firstNonEmpty(as.MimeType, rep.MimeType), as.ContentType)
 			if hasProtection(rep.ContentProtection) {
-				return nil, fmt.Errorf("stream is DRM-protected")
+				return out, fmt.Errorf("stream is DRM-protected")
 			}
 			st := rep.SegmentTemplate
 			if st == nil {
@@ -381,13 +415,13 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 				rbase := resolveBase(asbase, rep.BaseURL)
 				var err error
 				if t, err = expandTemplate(rbase, rep, st); err != nil {
-					return nil, err
+					return out, err
 				}
 			case sl != nil:
 				rbase := resolveBase(asbase, rep.BaseURL)
 				var err error
 				if t, err = expandList(rbase, rep, sl); err != nil {
-					return nil, err
+					return out, err
 				}
 			case rep.BaseURL != "":
 				// isoff-on-demand profile: the whole track is a single file
@@ -423,9 +457,6 @@ func (c *Client) ParseQuality(ctx context.Context, rawurl string, preferHeight i
 			}
 			break
 		}
-	}
-	if out.Video == nil && out.Audio == nil {
-		return nil, fmt.Errorf("no downloadable tracks (unsupported segment addressing?)")
 	}
 	return out, nil
 }

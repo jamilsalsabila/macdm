@@ -79,6 +79,10 @@ type Segment struct {
 	Duration float64
 	Key      *Key
 	Seq      int
+	// ByteRange addressing (#EXT-X-BYTERANGE): several segments share one URL
+	// and are distinguished by offset. Length 0 means "whole resource".
+	Offset int64
+	Length int64
 }
 
 // Playlist is either a master (Variants set) or a media playlist (Segments set).
@@ -89,7 +93,10 @@ type Playlist struct {
 	Media    []Rendition // #EXT-X-MEDIA entries (master playlists)
 	Segments []Segment
 	InitURL  string // EXT-X-MAP:URI, if any
-	Key      *Key   // playlist-level key (may be overridden per segment)
+	// EXT-X-MAP may itself be a byte range of a larger resource.
+	InitOffset int64
+	InitLength int64
+	Key        *Key // playlist-level key (may be overridden per segment)
 }
 
 // SubtitlesFor returns the subtitle rendition to download for v, or nil when
@@ -254,13 +261,39 @@ func (c *Client) FetchSubtitles(ctx context.Context, p *Playlist) ([]byte, error
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		b, err := c.get(ctx, seg.URL)
+		b, err := c.getRange(ctx, seg.URL, seg.Offset, seg.Length)
 		if err != nil {
 			return nil, err
 		}
 		parts = append(parts, b)
 	}
 	return subs.MergeVTT(parts), nil
+}
+
+// getRange fetches a resource, or one byte range of it when length > 0.
+// Used for small pieces (the EXT-X-MAP init segment, subtitle segments);
+// media segments stream to disk via fetchToFile.
+func (c *Client) getRange(ctx context.Context, rawurl string, offset, length int64) ([]byte, error) {
+	if length <= 0 {
+		return c.get(ctx, rawurl)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range c.headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+length-1))
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusPartialContent {
+		return nil, fmt.Errorf("GET %s: %s (byte range not honoured)", rawurl, resp.Status)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, length))
 }
 
 // Parse fetches rawurl and returns the playlist it describes.
@@ -282,6 +315,9 @@ func parse(text string, base *url.URL) (*Playlist, error) {
 	p := &Playlist{}
 	var (
 		pendingDur  float64
+		pendingLen  int64
+		pendingOff  int64
+		lastEnd     int64 // end of the previous EXT-X-BYTERANGE segment
 		pendingVar  *Variant
 		curKey      *Key
 		seq         int
@@ -356,6 +392,9 @@ func parse(text string, base *url.URL) (*Playlist, error) {
 			if u := strings.Trim(attrs["URI"], `"`); u != "" {
 				p.InitURL = resolve(u)
 			}
+			if br := strings.Trim(attrs["BYTERANGE"], `"`); br != "" {
+				p.InitLength, p.InitOffset = parseByteRange(br, 0)
+			}
 
 		case ln == "#EXT-X-ENDLIST":
 			sawEndList = true
@@ -364,6 +403,11 @@ func parse(text string, base *url.URL) (*Playlist, error) {
 			v := after(ln, ":")
 			v = strings.SplitN(v, ",", 2)[0]
 			pendingDur, _ = strconv.ParseFloat(strings.TrimSpace(v), 64)
+
+		case strings.HasPrefix(ln, "#EXT-X-BYTERANGE:"):
+			// "<length>[@<offset>]". With the offset omitted the segment starts
+			// where the previous one in the same resource ended.
+			pendingLen, pendingOff = parseByteRange(after(ln, ":"), lastEnd)
 
 		case strings.HasPrefix(ln, "#EXT"):
 			// other tags: ignore
@@ -376,9 +420,15 @@ func parse(text string, base *url.URL) (*Playlist, error) {
 				pendingVar = nil
 				continue
 			}
-			s := Segment{URL: resolve(ln), Duration: pendingDur, Key: curKey, Seq: seq}
+			s := Segment{URL: resolve(ln), Duration: pendingDur, Key: curKey, Seq: seq,
+				Offset: pendingOff, Length: pendingLen}
 			p.Segments = append(p.Segments, s)
-			pendingDur = 0
+			if pendingLen > 0 {
+				lastEnd = pendingOff + pendingLen
+			} else {
+				lastEnd = 0 // a whole-resource segment resets the running offset
+			}
+			pendingDur, pendingLen, pendingOff = 0, 0, 0
 			seq++
 		}
 	}
@@ -536,7 +586,7 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 	defer out.Close()
 
 	if p.InitURL != "" {
-		initData, err := c.get(ctx, p.InitURL)
+		initData, err := c.getRange(ctx, p.InitURL, p.InitOffset, p.InitLength)
 		if err != nil {
 			return fmt.Errorf("init segment: %w", err)
 		}
@@ -576,13 +626,13 @@ func (c *Client) fetchSegment(ctx context.Context, seg Segment, dst string, cach
 	}
 	tmp := dst + ".part"
 	if seg.Key == nil || strings.ToUpper(seg.Key.Method) != "AES-128" {
-		if err := c.fetchToFile(ctx, seg.URL, tmp, onBytes); err != nil {
+		if err := c.fetchToFile(ctx, seg.URL, tmp, seg, onBytes); err != nil {
 			return err
 		}
 		return os.Rename(tmp, dst)
 	}
 	enc := dst + ".enc"
-	if err := c.fetchToFile(ctx, seg.URL, enc, onBytes); err != nil {
+	if err := c.fetchToFile(ctx, seg.URL, enc, seg, onBytes); err != nil {
 		return err
 	}
 	defer os.Remove(enc)
@@ -593,7 +643,7 @@ func (c *Client) fetchSegment(ctx context.Context, seg Segment, dst string, cach
 }
 
 // fetchToFile streams rawurl into dst, reporting each chunk via onBytes.
-func (c *Client) fetchToFile(ctx context.Context, rawurl, dst string, onBytes func(int)) error {
+func (c *Client) fetchToFile(ctx context.Context, rawurl, dst string, seg Segment, onBytes func(int)) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawurl, nil)
 	if err != nil {
 		return err
@@ -601,12 +651,25 @@ func (c *Client) fetchToFile(ctx context.Context, rawurl, dst string, onBytes fu
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
+	// #EXT-X-BYTERANGE: several segments share one URL and are told apart by
+	// offset, so this segment is a Range request rather than a whole GET.
+	ranged := seg.Length > 0
+	if ranged {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", seg.Offset, seg.Offset+seg.Length-1))
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case ranged && resp.StatusCode == http.StatusPartialContent:
+	case ranged && resp.StatusCode == http.StatusOK:
+		// The server ignored Range and sent the whole file. Writing all of it
+		// would repeat the entire resource for every segment.
+		return fmt.Errorf("GET %s: server ignored the Range header for a byte-range segment", rawurl)
+	case !ranged && resp.StatusCode == http.StatusOK:
+	default:
 		return fmt.Errorf("GET %s: %s", rawurl, resp.Status)
 	}
 	f, err := os.Create(dst)
@@ -709,6 +772,24 @@ func (c *Client) decryptFileAES128(ctx context.Context, seg Segment, src, dst st
 		}
 	}
 	return out.Close()
+}
+
+// parseByteRange reads an EXT-X-BYTERANGE value, "<length>[@<offset>]".
+// A missing offset continues from prevEnd, per the HLS spec.
+func parseByteRange(v string, prevEnd int64) (length, offset int64) {
+	lenStr, offStr, hasOff := strings.Cut(strings.TrimSpace(v), "@")
+	length, err := strconv.ParseInt(strings.TrimSpace(lenStr), 10, 64)
+	if err != nil || length <= 0 {
+		return 0, 0
+	}
+	if !hasOff {
+		return length, prevEnd
+	}
+	offset, err = strconv.ParseInt(strings.TrimSpace(offStr), 10, 64)
+	if err != nil || offset < 0 {
+		return length, prevEnd
+	}
+	return length, offset
 }
 
 // --- tiny attribute-list parser for #EXT-X-* lines ---
