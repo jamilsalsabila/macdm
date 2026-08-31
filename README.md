@@ -18,14 +18,19 @@ deliberately will not do, and the current rough edges.
 
 ## Install
 
-Build the disk image (`dist/MacDM-<version>.dmg`):
+**[Download the latest release](https://github.com/jamilsalsabila/macdm/releases/latest)**
+(`MacDM-<version>.dmg`) — everything is inside the bundle, so there is nothing
+to install alongside it.
 
-```bash
-scripts/make-dmg.sh
-```
+The disk image holds a self-contained `MacDM.app` (daemon, engine, **ffmpeg and
+yt-dlp bundled**), both browser extensions, and `INSTALL.txt`. All binaries are
+universal, so it runs on Intel and Apple Silicon — though only the Intel side
+has been exercised on real hardware so far.
 
-It contains a self-contained `MacDM.app` (daemon, engine, **ffmpeg and yt-dlp
-bundled**), the unpacked browser extension, and `INSTALL.txt`. To install:
+Prefer to build it yourself? `scripts/make-dmg.sh` produces the same
+`dist/MacDM-<version>.dmg`.
+
+To install:
 
 1. **Drag `MacDM.app` onto Applications.**
 2. **First launch:** right-click `MacDM.app` → **Open** → **Open** (the app is
@@ -120,7 +125,7 @@ These are design choices, not bugs — MacDM stops where a download manager shou
   the latter automatically — a Mac without the Command Line Tools has only a
   `python3` stub that cannot run.
 - **Unsigned dev builds.** Gatekeeper will block the native-messaging host
-  until the app is codesigned and notarised (see [Packaging](#packaging-for-distribution-not-done-in-this-repo)).
+  until the app is codesigned and notarised (see [Packaging](#packaging-for-distribution)).
 - **Loopback / single user.** The daemon listens only on `127.0.0.1`. No remote
   control, no multi-user.
 
@@ -325,20 +330,36 @@ manifests are refused.
 
 ---
 
-## Packaging for distribution (not done in this repo)
+## Packaging for distribution
 
-The runnable pieces above are unsigned/dev builds. A shipped MacDM would need:
+`scripts/make-dmg.sh` builds what the [releases](https://github.com/jamilsalsabila/macdm/releases)
+carry, and `scripts/ship.sh` additionally replaces the installed copy in
+`/Applications`. What that already does:
 
 - **`MacDM.app` bundle** — `Contents/MacOS/{MacDM,macdmd,macdm-nmhost}`,
-  `Contents/Resources/bin/{ffmpeg,yt-dlp}`, an `Info.plist` with
+  `Contents/Resources/bin/{ffmpeg,yt-dlp,yt-dlp_macos}`, an `Info.plist` with
   `LSUIElement=true`.
-- **Codesign + notarize** — Developer ID cert, Hardened Runtime, `codesign
-  --deep --options runtime`, `notarytool submit`, `stapler staple`. Without this
-  Gatekeeper blocks the native-messaging host.
+- **Universal binaries** — every executable carries x86_64 and arm64. ffmpeg is
+  assembled from two single-architecture static builds, because nobody
+  publishes a universal one; the build fails outright if any binary is missing
+  a slice.
+- **Ad-hoc codesign** — enough for the app to run after the one-time
+  right-click → Open, and enough for Chrome to launch the native-messaging
+  host once the app clears its own quarantine flag on first launch.
+
+What a properly distributed build would still need:
+
+- **Notarization** — Developer ID cert, Hardened Runtime, `notarytool submit`,
+  `stapler staple`. Needs a paid Apple Developer account; without it Gatekeeper
+  demands the right-click → Open step.
+- **Apple Silicon verification** — the arm64 slices are built and valid, but
+  have not been run on real hardware.
 - **Daemon as a LaunchAgent** — `~/Library/LaunchAgents/com.macdm.daemon.plist`
   with `RunAtLoad` + `KeepAlive`, instead of the app spawning a child.
 - **Extension** — publish to the Chrome Web Store / AMO so the host manifest can
   pin a stable ID; the install script currently takes the unpacked dev ID.
+  Firefox refuses unsigned add-ons outright, so the `.xpi` is temporary-only
+  until AMO signs it.
 - **ffmpeg licensing** — ship an LGPL build (or provide source) and include
   `COPYING` for ffmpeg and yt-dlp (Unlicense).
 - **Safari** — would need an Xcode App-wrapped Web Extension target; out of scope
