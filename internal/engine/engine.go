@@ -182,6 +182,11 @@ type DownloadSpec struct {
 	Dest    string // absolute path of the final file
 	Headers map[string]string
 	Conns   int // 0 = use engine default
+	// Identity names the resource independently of its URL, for hosts that
+	// hand out a freshly signed URL every time (googlevideo, most CDNs). The
+	// sidecar matches on this instead, so a resume continues rather than
+	// starting over. Empty keeps the default URL match.
+	Identity string
 }
 
 // Run downloads spec.URL to spec.Dest, resuming from a sidecar if one is present.
@@ -209,8 +214,8 @@ func (e *Engine) Run(ctx context.Context, spec DownloadSpec, onProgress func(Pro
 
 	sc := loadSidecar(spec.Dest)
 	switch {
-	case sc == nil || !sc.matches(spec.URL, pr):
-		sc = newSidecar(spec.URL, pr, conns, e.cfg.MinChunk)
+	case sc == nil || !sc.matches(spec.URL, spec.Identity, pr):
+		sc = newSidecar(spec.URL, spec.Identity, pr, conns, e.cfg.MinChunk)
 	case multi && sc.Conns != conns:
 		// connection count changed since last run — re-split the missing bytes
 		sc.replanConns(conns, e.cfg.MinChunk)

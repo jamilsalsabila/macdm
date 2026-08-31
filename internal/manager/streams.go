@@ -315,9 +315,19 @@ func (m *Manager) execExtractDirect(ctx context.Context, id string, j *store.Job
 	ex *extractor.Extractor, opt extractor.DownloadOptions, outDir, finalDir string,
 	mx *mux.Muxer, prog segProgFn, muxProg muxProgFn) error {
 
+	// A pause or shutdown is not "this page cannot be fetched directly": wrapping
+	// it would make the caller wipe the scratch dir and restart through yt-dlp,
+	// throwing away everything downloaded so far on every pause.
+	noDirect := func(err error) error {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return context.Canceled
+		}
+		return fmt.Errorf("%w: %v", errNoDirectPath, err)
+	}
+
 	plan, err := ex.ResolveDirect(ctx, j.URL, opt)
 	if err != nil {
-		return fmt.Errorf("%w: %v", errNoDirectPath, err)
+		return noDirect(err)
 	}
 
 	name := sanitize(plan.Title)
@@ -334,8 +344,12 @@ func (m *Manager) execExtractDirect(ctx context.Context, id string, j *store.Job
 	}
 	var doneBase int64
 	fetch := func(med *extractor.DirectMedia, file string) error {
+		// The resolver hands back a freshly signed URL every time, so the sidecar
+		// must key on something stable or every resume would restart from zero.
+		ident := fmt.Sprintf("%s|%s|%d", j.URL, med.Kind, med.Size)
 		_, err := m.eng.Run(ctx, engine.DownloadSpec{
 			URL: med.URL, Dest: file, Headers: med.Headers, Conns: j.Connections,
+			Identity: ident,
 		}, func(p engine.Progress) {
 			prog(streamProg{
 				doneSeg: 0, totalSeg: 0,
@@ -361,16 +375,16 @@ func (m *Manager) execExtractDirect(ctx context.Context, id string, j *store.Job
 	case plan.Muxed != nil:
 		muxedIn = filepath.Join(outDir, "media."+extOrPlain(plan.Muxed.Ext, "mp4"))
 		if err := fetch(plan.Muxed, muxedIn); err != nil {
-			return fmt.Errorf("%w: %v", errNoDirectPath, err)
+			return noDirect(err)
 		}
 	default:
 		vFile = filepath.Join(outDir, "video."+extOrPlain(plan.Video.Ext, "mp4"))
 		if err := fetch(plan.Video, vFile); err != nil {
-			return fmt.Errorf("%w: %v", errNoDirectPath, err)
+			return noDirect(err)
 		}
 		aFile = filepath.Join(outDir, "audio."+extOrPlain(plan.Audio.Ext, "m4a"))
 		if err := fetch(plan.Audio, aFile); err != nil {
-			return fmt.Errorf("%w: %v", errNoDirectPath, err)
+			return noDirect(err)
 		}
 	}
 

@@ -46,6 +46,7 @@ type iv struct {
 
 type sidecar struct {
 	URL        string  `json:"url"`
+	Identity   string  `json:"identity,omitempty"`
 	ETag       string  `json:"etag,omitempty"`
 	TotalBytes int64   `json:"total_bytes"`
 	Conns      int     `json:"conns"`          // planned connection count
@@ -81,8 +82,17 @@ func (sc *sidecar) save(dest string) error {
 
 // matches reports whether a saved sidecar still describes the same resource, so
 // resuming onto the existing .part file is safe.
-func (sc *sidecar) matches(url string, p *Probe) bool {
-	if sc.URL != url || sc.TotalBytes != p.TotalBytes {
+func (sc *sidecar) matches(url, identity string, p *Probe) bool {
+	if sc.TotalBytes != p.TotalBytes {
+		return false
+	}
+	// With an identity the URL is expected to differ between runs — that is the
+	// whole point. Without one, the URL is all we have to go on.
+	if identity != "" || sc.Identity != "" {
+		if sc.Identity != identity {
+			return false
+		}
+	} else if sc.URL != url {
 		return false
 	}
 	if sc.ETag != "" && p.ETag != "" && sc.ETag != p.ETag {
@@ -104,8 +114,8 @@ func (sc *sidecar) completedBytes() int64 {
 	return n
 }
 
-func newSidecar(url string, p *Probe, conns int, minChunk int64) *sidecar {
-	sc := &sidecar{URL: url, ETag: p.ETag, TotalBytes: p.TotalBytes, Conns: conns}
+func newSidecar(url, identity string, p *Probe, conns int, minChunk int64) *sidecar {
+	sc := &sidecar{URL: url, Identity: identity, ETag: p.ETag, TotalBytes: p.TotalBytes, Conns: conns}
 
 	if !p.AcceptRanges || p.TotalBytes <= 0 {
 		sc.Chunks = []chunk{{Index: 0, Start: 0, End: -1}}

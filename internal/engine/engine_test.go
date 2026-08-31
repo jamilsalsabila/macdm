@@ -142,7 +142,7 @@ func TestPauseThenResume(t *testing.T) {
 
 func TestNewSidecarSplit(t *testing.T) {
 	p := &Probe{TotalBytes: 10 << 20, AcceptRanges: true}
-	sc := newSidecar("u", p, 4, 1<<20)
+	sc := newSidecar("u", "", p, 4, 1<<20)
 	if len(sc.Chunks) != 4 {
 		t.Fatalf("want 4 chunks, got %d", len(sc.Chunks))
 	}
@@ -159,7 +159,7 @@ func TestNewSidecarSplit(t *testing.T) {
 }
 
 func TestNewSidecarNoRanges(t *testing.T) {
-	sc := newSidecar("u", &Probe{TotalBytes: 999, AcceptRanges: false}, 8, 1<<20)
+	sc := newSidecar("u", "", &Probe{TotalBytes: 999, AcceptRanges: false}, 8, 1<<20)
 	if len(sc.Chunks) != 1 || sc.Chunks[0].End != -1 {
 		t.Fatalf("no-range download should be one open-ended chunk, got %+v", sc.Chunks)
 	}
@@ -200,7 +200,7 @@ func (s *slowWriter) Write(p []byte) (int, error) {
 func TestReplanConns(t *testing.T) {
 	// 10 MiB file, initially 4 chunks, chunk 0 fully done, chunk 2 half done.
 	total := int64(10 << 20)
-	sc := newSidecar("u", &Probe{TotalBytes: total, AcceptRanges: true}, 4, 1<<20)
+	sc := newSidecar("u", "", &Probe{TotalBytes: total, AcceptRanges: true}, 4, 1<<20)
 	if len(sc.Chunks) != 4 {
 		t.Fatalf("want 4 chunks, got %d", len(sc.Chunks))
 	}
@@ -535,7 +535,7 @@ func TestWorkStealingOnResume(t *testing.T) {
 	}
 	// 8 chunks, the first 7 already finished — only the tail remains. Their real
 	// bytes must already be in the .part, or the final checksum can't match.
-	sc := newSidecar(srv.URL, &Probe{TotalBytes: total, AcceptRanges: true}, 8, 256<<10)
+	sc := newSidecar(srv.URL, "", &Probe{TotalBytes: total, AcceptRanges: true}, 8, 256<<10)
 	for i := 0; i < len(sc.Chunks)-1; i++ {
 		c := &sc.Chunks[i]
 		if _, err := f.WriteAt(body[c.Start:c.End+1], c.Start); err != nil {
@@ -558,5 +558,73 @@ func TestWorkStealingOnResume(t *testing.T) {
 	}
 	if peak.Load() < 2 {
 		t.Fatalf("work-stealing never engaged on resume: peak %d concurrent request(s)", peak.Load())
+	}
+}
+
+// A signed CDN URL differs on every resolve (googlevideo re-signs each time), so
+// keying the sidecar on the URL would restart every resume from zero. With an
+// Identity the resume continues, and the bytes still come out right.
+func TestResumeAcrossChangedURL(t *testing.T) {
+	body := make([]byte, 6<<20)
+	rand.New(rand.NewSource(21)).Read(body)
+	srv := httptest.NewServer(throttle(serveBlob(body, true, 0), 3<<20))
+	defer srv.Close()
+
+	e := New(Config{MaxConns: 2, MinChunk: 1 << 20, Timeout: 10 * time.Second})
+	dest := filepath.Join(t.TempDir(), "signed.bin")
+	const ident = "page|video|6291456"
+
+	// First attempt, cancelled part-way.
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(500 * time.Millisecond); cancel() }()
+	if _, err := e.Run(ctx, DownloadSpec{
+		URL: srv.URL + "/?sig=first", Dest: dest, Identity: ident,
+	}, nil); err != context.Canceled {
+		t.Fatalf("want context.Canceled, got %v", err)
+	}
+	sc := loadSidecar(dest)
+	if sc == nil || sc.completedBytes() == 0 {
+		t.Fatalf("no partial progress recorded: %v", sc)
+	}
+	partial := sc.completedBytes()
+
+	// Resume with a different URL for the same resource.
+	if _, err := e.Run(context.Background(), DownloadSpec{
+		URL: srv.URL + "/?sig=second", Dest: dest, Identity: ident,
+	}, nil); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if sha(got) != sha(body) {
+		t.Fatalf("content mismatch after resuming on a new URL")
+	}
+	t.Logf("resumed from %d of %d bytes", partial, len(body))
+}
+
+// Without an Identity a changed URL must still invalidate the sidecar — that is
+// the safety net for an ordinary download whose URL now points elsewhere.
+func TestSidecarMatching(t *testing.T) {
+	p := &Probe{TotalBytes: 100}
+	sc := newSidecar("http://a/x", "", p, 1, 1<<20)
+	if !sc.matches("http://a/x", "", p) {
+		t.Error("same URL should match")
+	}
+	if sc.matches("http://a/y", "", p) {
+		t.Error("different URL must not match without an identity")
+	}
+
+	idc := newSidecar("http://a/x?sig=1", "vid|123", p, 1, 1<<20)
+	if !idc.matches("http://a/x?sig=2", "vid|123", p) {
+		t.Error("same identity should match despite a different URL")
+	}
+	if idc.matches("http://a/x?sig=1", "vid|999", p) {
+		t.Error("different identity must not match even with the same URL")
+	}
+	if idc.matches("http://a/x?sig=1", "", p) {
+		t.Error("an identity-keyed sidecar must not match a URL-keyed request")
+	}
+	// A size change always invalidates: it is a different resource.
+	if idc.matches("http://a/x?sig=2", "vid|123", &Probe{TotalBytes: 101}) {
+		t.Error("a different size must not match")
 	}
 }

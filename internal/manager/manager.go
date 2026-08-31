@@ -204,9 +204,12 @@ func (m *Manager) SetConns(id string, n int) error {
 	if _, err := m.st.Update(id, func(jj *store.Job) { jj.Connections = n }); err != nil {
 		return err
 	}
-	// A live re-split only helps a resumable multi-connection HTTP download.
-	// Bouncing a non-resumable job would restart it from zero, so don't.
-	if j.Kind == store.KindHTTP && j.Resumable {
+	// A live re-split only helps a download the engine drives and can resume.
+	// That is a resumable HTTP job, and now also an extract job on the direct
+	// path — its streams go through the same engine, and the sidecar keys on a
+	// stable identity rather than the re-signed URL, so a bounce continues
+	// instead of starting over. Bouncing anything else would restart from zero.
+	if (j.Kind == store.KindHTTP && j.Resumable) || j.Kind == store.KindExtract {
 		m.mu.Lock()
 		_, running := m.running[id]
 		m.mu.Unlock()
