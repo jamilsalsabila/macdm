@@ -477,7 +477,17 @@ func fetchURL(ctx context.Context, url string, _ bool, like *extractor.DirectMed
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	// One byte over the cap: a LimitReader that simply stops gives back a
+	// truncated file and no error at all, which for a subtitle means a track
+	// that quietly ends early.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 16<<20 {
+		return nil, fmt.Errorf("GET %s: larger than the 16 MB subtitle limit", url)
+	}
+	return data, nil
 }
 
 // moveSubtitleSidecars carries the .srt/.vtt files yt-dlp wrote beside the

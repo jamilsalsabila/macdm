@@ -288,7 +288,7 @@ func (c *Client) get(ctx context.Context, rawurl string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: %s", rawurl, resp.Status)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	return readCapped(resp.Body, 64<<20, "playlist")
 }
 
 // FetchSubtitles downloads every segment of a WebVTT subtitle playlist and
@@ -886,4 +886,19 @@ func after(s, sep string) string {
 func atoiSafe(s string) int {
 	n, _ := strconv.Atoi(strings.TrimSpace(s))
 	return n
+}
+
+// readCapped reads at most max bytes and refuses anything larger, rather than
+// handing back a silently truncated one. A truncated manifest parses fine and
+// downloads part of a video — a failure nobody would notice until the file was
+// short.
+func readCapped(r io.Reader, max int64, what string) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("%s is larger than %d MB", what, max>>20)
+	}
+	return data, nil
 }

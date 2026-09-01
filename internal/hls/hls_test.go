@@ -847,3 +847,23 @@ func TestAssembleRespectsTheSpeedLimit(t *testing.T) {
 		t.Errorf("unlimited run took %v vs %v limited; the comparison proves nothing", unlimited, limited)
 	}
 }
+
+// A LimitReader that simply stops hands back a truncated manifest and no error.
+// That parses fine and downloads part of a video — a failure nobody notices
+// until the file turns out short. It must be refused instead.
+func TestOversizedPlaylistIsRefusedNotTruncated(t *testing.T) {
+	huge := strings.Repeat("x", 64<<20+1024)
+	if _, err := readCapped(strings.NewReader(huge), 64<<20, "playlist"); err == nil {
+		t.Error("a playlist over the cap must be refused, not silently truncated")
+	}
+	body := "#EXTM3U\n#EXT-X-ENDLIST\n"
+	got, err := readCapped(strings.NewReader(body), 64<<20, "playlist")
+	if err != nil || string(got) != body {
+		t.Errorf("an ordinary playlist must pass through untouched: %q, %v", got, err)
+	}
+	// Exactly at the cap is still fine.
+	exact := strings.Repeat("y", 1024)
+	if got, err := readCapped(strings.NewReader(exact), 1024, "playlist"); err != nil || len(got) != 1024 {
+		t.Errorf("a playlist exactly at the cap should pass: %d bytes, %v", len(got), err)
+	}
+}
