@@ -34,11 +34,23 @@ type Config struct {
 	MinChunk  int64         // never split a file into pieces smaller than this
 	UserAgent string        // fallback UA when a job carries none
 	Timeout   time.Duration // per-request timeout (not whole-download)
+	// FragmentStall is how long a fragment may go without delivering a byte
+	// before its attempt is abandoned; 0 uses defaultFragmentStall.
+	//
+	// It measures silence, not elapsed time. An absolute deadline here used to
+	// cut off fragments that were merely slow — the same 90 seconds on every
+	// one of their three attempts — and failed the assembly even though the
+	// connection was healthy throughout.
+	FragmentStall time.Duration
+
 	// Limiter paces transfers against a user-set ceiling. It is shared with the
 	// stream clients so one figure covers everything MacDM is downloading; nil
 	// means no limit. The bucket itself is safe to retune while jobs run.
 	Limiter *ratelimit.Bucket
 }
+
+// defaultFragmentStall is the silence a fragment fetch tolerates.
+const defaultFragmentStall = 45 * time.Second
 
 // DefaultUserAgent is a current Chrome UA. Many CDNs 403 a non-browser
 // User-Agent, and the sniffer often can't capture the real one (MV3 hides it on

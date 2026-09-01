@@ -233,10 +233,37 @@ func (e *Engine) RunFragments(ctx context.Context, dest string, headers map[stri
 }
 
 func (e *Engine) fetchFragment(ctx context.Context, f *os.File, fr Fragment, headers map[string]string) (int64, error) {
-	// A fragment is small (a few hundred KB); a minute is generous, and it caps
-	// a stalled connection instead of hanging the whole assembly.
-	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	stall := e.cfg.FragmentStall
+	if stall <= 0 {
+		stall = defaultFragmentStall
+	}
+
+	var lastRead atomic.Int64
+	lastRead.Store(time.Now().UnixNano())
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		tick := stall / 4
+		if tick > 5*time.Second {
+			tick = 5 * time.Second
+		}
+		t := time.NewTicker(tick)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, lastRead.Load())) > stall {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	r, err := e.req(ctx, http.MethodGet, fr.URL, headers)
 	if err != nil {
 		return 0, err
@@ -265,6 +292,7 @@ func (e *Engine) fetchFragment(ctx context.Context, f *os.File, fr Fragment, hea
 			if nr <= 0 {
 				return n, nil
 			}
+			lastRead.Store(time.Now().UnixNano())
 			if _, ew := f.WriteAt(buf[:nr], off); ew != nil {
 				return n, ew
 			}

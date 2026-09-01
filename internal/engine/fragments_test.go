@@ -244,3 +244,88 @@ func TestRunFragmentsRespectsTheSpeedLimit(t *testing.T) {
 		t.Errorf("unlimited run took %v vs %v limited; the comparison proves nothing", unlimited, limited)
 	}
 }
+
+// dribbleServer serves one fragment in `steps` pieces, pausing `gap` between
+// them — a connection that is slow but never silent.
+func dribbleServer(t *testing.T, size, steps int, gap time.Duration, stallAfter int) (*httptest.Server, []Fragment, []byte) {
+	t.Helper()
+	payload := make([]byte, size)
+	for i := range payload {
+		payload[i] = byte(i * 3)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bs, _ := strconv.Atoi(r.URL.Query().Get("bytestart"))
+		be, _ := strconv.Atoi(r.URL.Query().Get("byteend"))
+		body := payload[bs : be+1]
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		step := len(body)/steps + 1
+		for i, sent := 0, 0; i < len(body); i, sent = i+step, sent+1 {
+			if stallAfter > 0 && sent >= stallAfter {
+				<-r.Context().Done() // go quiet and stay quiet
+				return
+			}
+			end := i + step
+			if end > len(body) {
+				end = len(body)
+			}
+			if _, err := w.Write(body[i:end]); err != nil {
+				return
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			time.Sleep(gap)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	frags := []Fragment{{
+		URL:   srv.URL + "/f?bytestart=0&byteend=" + strconv.Itoa(size-1),
+		Start: 0, End: int64(size - 1),
+	}}
+	return srv, frags, payload
+}
+
+// The bug: the fetch had an absolute 90-second deadline, on the assumption that
+// a fragment is only ever a few hundred KB. On a slow line that assumption
+// breaks — a fragment needing longer was cut off at the same point on every one
+// of its three attempts, and the assembly failed, even though the connection
+// was healthy and delivering steadily throughout.
+func TestSlowButSteadyFragmentIsNotCutOff(t *testing.T) {
+	// 20 pieces, 300ms apart: 6 seconds of steady delivery, far longer than the
+	// stall window, and never once silent for it.
+	_, frags, want := dribbleServer(t, 200<<10, 20, 300*time.Millisecond, 0)
+
+	e := New(Config{MaxConns: 1, Timeout: 30 * time.Second, FragmentStall: 2 * time.Second})
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	start := time.Now()
+	if err := e.RunFragments(context.Background(), dest, nil, frags, 1, nil); err != nil {
+		t.Fatalf("a fragment that is merely slow must still finish: %v", err)
+	}
+	got, _ := os.ReadFile(dest)
+	if sha(got) != sha(want) {
+		t.Fatal("content mismatch")
+	}
+	if el := time.Since(start); el < 4*time.Second {
+		t.Errorf("finished in %v — the server cannot have dribbled as intended", el)
+	}
+}
+
+// The other half: a connection that actually goes quiet must still be given up
+// on, or one dead fragment would hang the whole assembly forever.
+func TestStalledFragmentIsAbandoned(t *testing.T) {
+	// Sends 3 pieces then goes silent for good.
+	_, frags, _ := dribbleServer(t, 200<<10, 20, 100*time.Millisecond, 3)
+
+	e := New(Config{MaxConns: 1, Timeout: 30 * time.Second, FragmentStall: 2 * time.Second})
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	start := time.Now()
+	err := e.RunFragments(context.Background(), dest, nil, frags, 1, nil)
+	el := time.Since(start)
+	if err == nil {
+		t.Fatal("a fragment whose connection went silent must be given up on")
+	}
+	if el > 30*time.Second {
+		t.Errorf("took %v to give up across 3 attempts", el)
+	}
+}
