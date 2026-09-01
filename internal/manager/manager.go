@@ -24,6 +24,7 @@ import (
 
 	"crypto/rand"
 	"encoding/hex"
+	"mime"
 )
 
 // Config for a Manager.
@@ -618,6 +619,19 @@ func (m *Manager) execHTTP(ctx context.Context, id string, j *store.Job) error {
 				jj.Filename = filepath.Base(dest)
 			})
 		}
+		// A CDN media URL often has no extension in its path — TikTok's
+		// v16-webapp-prime links end in an opaque id — and if the server does
+		// not name the file either, the download lands as an extensionless
+		// blob. It plays fine once renamed, but macOS will not open it and
+		// Finder shows it as a generic document, so the download looks broken.
+		// The response says what it is; use that.
+		if ext := extensionForType(pr.ContentType); ext != "" && filepath.Ext(dest) == "" {
+			dest += ext
+			_, _ = m.st.Update(id, func(jj *store.Job) {
+				jj.Dest = dest
+				jj.Filename = filepath.Base(dest)
+			})
+		}
 	}
 
 	if j.Status == store.StatusQueued {
@@ -876,6 +890,54 @@ func guessName(u *url.URL) string {
 
 // safeName reduces an arbitrary string to a single path-safe filename component:
 // no directory separators, no "..", no leading/trailing dots, bounded length.
+// extensionForType maps a media Content-Type to the extension a person expects
+// on disk. Deliberately a short list of what MacDM actually downloads rather
+// than mime.ExtensionsByType, which is driven by the system's mime.types and
+// happily answers ".mp2" or ".mpga" for the audio types here.
+func extensionForType(contentType string) string {
+	ct, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		ct = strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+	}
+	switch ct {
+	case "video/mp4", "application/mp4":
+		return ".mp4"
+	case "video/quicktime":
+		return ".mov"
+	case "video/webm":
+		return ".webm"
+	case "video/x-matroska":
+		return ".mkv"
+	case "video/mp2t":
+		return ".ts"
+	case "audio/mpeg":
+		return ".mp3"
+	case "audio/mp4", "audio/x-m4a":
+		return ".m4a"
+	case "audio/ogg", "video/ogg":
+		return ".ogg"
+	case "audio/webm":
+		return ".weba"
+	case "audio/wav", "audio/x-wav":
+		return ".wav"
+	case "audio/flac":
+		return ".flac"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "application/pdf":
+		return ".pdf"
+	case "application/zip":
+		return ".zip"
+	}
+	return ""
+}
+
 func safeName(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.NewReplacer("/", "_", "\\", "_", "\x00", "").Replace(s)

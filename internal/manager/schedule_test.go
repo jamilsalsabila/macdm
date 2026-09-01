@@ -411,3 +411,80 @@ func TestManifestWithoutAnExtensionIsRecognised(t *testing.T) {
 		t.Errorf("the saved file is %d bytes — that is the playlist text, not the video", fi.Size())
 	}
 }
+
+// A CDN media URL often has no extension in its path — TikTok's links end in an
+// opaque id — and when the server does not name the file either, the download
+// used to land as an extensionless blob. It plays once renamed, but macOS will
+// not open it and Finder shows a generic document, so a perfectly good download
+// looks broken.
+func TestExtensionIsAddedFromTheContentType(t *testing.T) {
+	body := bytes.Repeat([]byte{0x21}, 4096)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	m := newManager(t, openWindow(t))
+	// A path ending in an opaque id, exactly like the real thing.
+	j, err := m.Add(srv.URL+"/video/tos/alisg/o8kYI4FGXfUuPiEoBQDAE1K3RdqgrB8EBKE9fj", AddOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitFor(t, m, j.ID, func(jj *store.Job) bool {
+		return jj.Status == store.StatusCompleted
+	}, "the download to finish")
+
+	if got := filepath.Ext(done.Dest); got != ".mp4" {
+		t.Errorf("saved as %q — extension %q, want .mp4", filepath.Base(done.Dest), got)
+	}
+	if _, err := os.Stat(done.Dest); err != nil {
+		t.Errorf("the named file is not on disk: %v", err)
+	}
+}
+
+func TestExtensionForType(t *testing.T) {
+	cases := map[string]string{
+		"video/mp4":                         ".mp4",
+		"video/mp4; codecs=\"avc1.64001e\"": ".mp4",
+		"audio/mp4":                         ".m4a",
+		"video/webm":                        ".webm",
+		"image/jpeg":                        ".jpg",
+		"application/pdf":                   ".pdf",
+		// Nothing sensible to add: leave the name alone.
+		"application/octet-stream": "",
+		"text/html":                "",
+		"":                         "",
+	}
+	for ct, want := range cases {
+		if got := extensionForType(ct); got != want {
+			t.Errorf("extensionForType(%q) = %q, want %q", ct, got, want)
+		}
+	}
+}
+
+// A name that already has an extension must be left untouched.
+func TestExistingExtensionIsNotDoubled(t *testing.T) {
+	body := bytes.Repeat([]byte{0x22}, 2048)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	m := newManager(t, openWindow(t))
+	j, err := m.Add(srv.URL+"/clip.mkv", AddOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitFor(t, m, j.ID, func(jj *store.Job) bool {
+		return jj.Status == store.StatusCompleted
+	}, "the download to finish")
+	if base := filepath.Base(done.Dest); base != "clip.mkv" {
+		t.Errorf("saved as %q, want clip.mkv left alone", base)
+	}
+}
