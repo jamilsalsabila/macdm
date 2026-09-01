@@ -90,3 +90,60 @@ func TestDiskSpaceFailureIsNotRetried(t *testing.T) {
 		t.Error("an ordinary network error should still be retried")
 	}
 }
+
+// The progress bar is driven by bytes while the text counts segments, so the
+// size estimate has to be right or the two visibly disagree. Dividing the
+// running byte count by completed segments counts the partial bytes of
+// everything still in flight: measured on a 28 MB stream over eight
+// connections, that guessed 247 MB, and the old monotonic clamp then locked the
+// guess in — at 97% of segments done the bar still read 12%.
+func TestEstimateStreamTotalUsesFinishedSegmentsOnly(t *testing.T) {
+	// 60 segments of 500 KB each. Eight workers are mid-flight, so the running
+	// byte count runs ahead of what has actually completed.
+	const segSize = 500 << 10
+	sp := streamProg{
+		doneSeg:        10,
+		totalSeg:       60,
+		completedBytes: 10 * segSize,
+		bytes:          10*segSize + 8*(segSize/2), // eight half-finished
+	}
+	got := estimateStreamTotal(sp, 0)
+	want := int64(60 * segSize)
+	if got != want {
+		t.Errorf("estimate = %s, want %s", humanBytes(got), humanBytes(want))
+	}
+	// The old formula, for contrast: it would have answered far higher.
+	naive := sp.bytes * int64(sp.totalSeg) / int64(sp.doneSeg)
+	if naive <= want {
+		t.Fatalf("the test case does not reproduce the inflation (naive %s)", humanBytes(naive))
+	}
+}
+
+// A stale estimate must be revisable, not clamped forever.
+func TestEstimateStreamTotalIsRevisable(t *testing.T) {
+	sp := streamProg{doneSeg: 20, totalSeg: 100, completedBytes: 20 << 20, bytes: 20 << 20}
+	got := estimateStreamTotal(sp, 900<<20) // an earlier, wildly high guess
+	if want := int64(100 << 20); got != want {
+		t.Errorf("estimate = %s, want %s — an old guess must not be locked in",
+			humanBytes(got), humanBytes(want))
+	}
+}
+
+// Whatever it estimates, the bar must never read past 100%.
+func TestEstimateStreamTotalNeverBelowBytesInHand(t *testing.T) {
+	// A final segment much larger than the average would otherwise leave the
+	// estimate under what is already downloaded.
+	sp := streamProg{doneSeg: 9, totalSeg: 10, completedBytes: 9 << 20, bytes: 50 << 20}
+	if got := estimateStreamTotal(sp, 0); got < sp.bytes {
+		t.Errorf("estimate %s is below the %s already downloaded", humanBytes(got), humanBytes(sp.bytes))
+	}
+}
+
+// Before any segment finishes there is nothing to divide; keep the previous
+// value rather than inventing one.
+func TestEstimateStreamTotalWithNothingFinished(t *testing.T) {
+	sp := streamProg{doneSeg: 0, totalSeg: 60, completedBytes: 0, bytes: 3 << 20}
+	if got := estimateStreamTotal(sp, 0); got != sp.bytes {
+		t.Errorf("estimate = %s, want the bytes in hand (%s)", humanBytes(got), humanBytes(sp.bytes))
+	}
+}

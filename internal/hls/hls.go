@@ -506,7 +506,12 @@ type Progress struct {
 	Segment   int // segments completed
 	Total     int
 	DoneBytes int64
-	Workers   []WorkerState
+	// CompletedBytes counts only the segments that finished. DoneBytes also
+	// carries the partial bytes of everything still in flight, so dividing it
+	// by the completed count to guess the total inflates the answer by roughly
+	// the number of workers.
+	CompletedBytes int64
+	Workers        []WorkerState
 }
 
 // Assemble downloads every segment of a media playlist using a fixed pool of
@@ -527,7 +532,7 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 	}
 
 	parts := make([]string, len(p.Segments))
-	var done, doneBytes atomic.Int64
+	var done, doneBytes, completedBytes atomic.Int64
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
@@ -548,7 +553,7 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 		emitMu.Lock()
 		onProgress(Progress{
 			Segment: int(done.Load()), Total: len(p.Segments),
-			DoneBytes: doneBytes.Load(), Workers: ws,
+			DoneBytes: doneBytes.Load(), CompletedBytes: completedBytes.Load(), Workers: ws,
 		})
 		emitMu.Unlock()
 	}
@@ -581,8 +586,10 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 				mu.Unlock()
 				emit()
 				var lastEmit time.Time
+				var segBytes int64
 				fn := filepath.Join(opt.Dir, fmt.Sprintf("seg-%06d", i))
 				err := c.fetchSegment(ctx, seg, fn, keyCache, func(n int) {
+					atomic.AddInt64(&segBytes, int64(n))
 					doneBytes.Add(int64(n))
 					mu.Lock()
 					states[w].Bytes += int64(n)
@@ -597,6 +604,7 @@ func (c *Client) Assemble(ctx context.Context, p *Playlist, opt AssembleOptions,
 					return
 				}
 				parts[i] = fn
+				completedBytes.Add(atomic.LoadInt64(&segBytes))
 				done.Add(1)
 				mu.Lock()
 				states[w].Segment, states[w].Status = -1, "idle"

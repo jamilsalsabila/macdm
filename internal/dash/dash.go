@@ -712,7 +712,10 @@ type Progress struct {
 	Segment   int
 	Total     int
 	DoneBytes int64
-	Workers   []WorkerState
+	// CompletedBytes counts only the segments that finished — see the same
+	// field on hls.Progress for why DoneBytes cannot be used to size a track.
+	CompletedBytes int64
+	Workers        []WorkerState
 }
 
 // AssembleTrack downloads a track's init + segments using a fixed pool of
@@ -731,7 +734,7 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var firstErr error
-	var done, doneBytes atomic.Int64
+	var done, doneBytes, completedBytes atomic.Int64
 
 	states := make([]WorkerState, opt.Conns)
 	for i := range states {
@@ -748,7 +751,7 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 		emitMu.Lock()
 		onProgress(Progress{
 			Segment: int(done.Load()), Total: len(t.Segments),
-			DoneBytes: doneBytes.Load(), Workers: ws,
+			DoneBytes: doneBytes.Load(), CompletedBytes: completedBytes.Load(), Workers: ws,
 		})
 		emitMu.Unlock()
 	}
@@ -775,8 +778,10 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 				mu.Unlock()
 				emit()
 				var lastEmit time.Time
+				var segBytes int64
 				fn := filepath.Join(opt.Dir, fmt.Sprintf("%s-%06d", t.Kind, i))
 				err := c.fetchSegment(ctx, t.Segments[i], fn, func(n int) {
+					atomic.AddInt64(&segBytes, int64(n))
 					doneBytes.Add(int64(n))
 					mu.Lock()
 					states[w].Bytes += int64(n)
@@ -791,6 +796,7 @@ func (c *Client) AssembleTrack(ctx context.Context, t *Track, outFile string, op
 					return
 				}
 				parts[i] = fn
+				completedBytes.Add(atomic.LoadInt64(&segBytes))
 				done.Add(1)
 				mu.Lock()
 				states[w].Segment, states[w].Status = -1, "idle"

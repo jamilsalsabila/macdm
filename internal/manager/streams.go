@@ -92,14 +92,7 @@ func (m *Manager) execStream(ctx context.Context, id string, j *store.Job) error
 			}
 			bps = int64(avgBps)
 		}
-		// Estimate the whole size from bytes-so-far vs segments-so-far so the %
-		// bar advances continuously instead of jumping one segment at a time.
-		if sp.doneSeg > 0 && sp.totalSeg > 0 {
-			e := sp.bytes * int64(sp.totalSeg) / int64(sp.doneSeg)
-			if e > estTotal {
-				estTotal = e // monotonic — never let the bar slide backwards
-			}
-		}
+		estTotal = estimateStreamTotal(sp, estTotal)
 		_, _ = m.st.Update(id, func(jj *store.Job) {
 			jj.Status = store.StatusDownloading
 			jj.DoneBytes = sp.bytes
@@ -140,7 +133,10 @@ func (m *Manager) execStream(ctx context.Context, id string, j *store.Job) error
 type streamProg struct {
 	doneSeg, totalSeg int
 	bytes             int64
-	conns             []store.ConnStat
+	// completedBytes counts only finished segments, and is what the size
+	// estimate must divide — bytes includes everything still in flight.
+	completedBytes int64
+	conns          []store.ConnStat
 }
 type segProgFn = func(streamProg)
 type muxProgFn = func(stage string) func(mux.Progress)
@@ -244,10 +240,11 @@ func (m *Manager) execHLS(ctx context.Context, id string, j *store.Job, wd, dest
 	var doneBytesBase int64
 	track := func(p hls.Progress) {
 		prog(streamProg{
-			doneSeg:  doneSegBase + p.Segment,
-			totalSeg: totalSeg,
-			bytes:    doneBytesBase + p.DoneBytes,
-			conns:    hlsConns(p.Workers),
+			doneSeg:        doneSegBase + p.Segment,
+			totalSeg:       totalSeg,
+			bytes:          doneBytesBase + p.DoneBytes,
+			completedBytes: doneBytesBase + p.CompletedBytes,
+			conns:          hlsConns(p.Workers),
 		})
 	}
 
@@ -642,7 +639,10 @@ func (m *Manager) execDASH(ctx context.Context, id string, j *store.Job, wd, des
 			doneSeg:  int(doneSegBase) + p.Segment,
 			totalSeg: total,
 			bytes:    doneBytesBase + p.DoneBytes,
-			conns:    dashConns(p.Workers),
+			// A finished track's bytes are all completed bytes, so the same
+			// base serves both.
+			completedBytes: doneBytesBase + p.CompletedBytes,
+			conns:          dashConns(p.Workers),
 		})
 	}
 
@@ -1091,6 +1091,30 @@ func bitrateBytes(seconds float64, bitsPerSec int) int64 {
 		return 0
 	}
 	return int64(seconds * float64(bitsPerSec) / 8)
+}
+
+// estimateStreamTotal sizes a whole stream from the segments that have already
+// finished, so the % bar can advance smoothly instead of stepping once per
+// segment.
+//
+// Only completed segments may be divided. Dividing the running byte count
+// instead counts the partial bytes of every segment still in flight, which
+// inflates the answer by roughly the number of workers — measured at 247 MB
+// for a 28 MB stream on eight connections. The old code then clamped the
+// estimate to never decrease, locking that first wild guess in: at 97% of
+// segments done the bar still read 12%, and only snapped to 100% at the end.
+//
+// The estimate is therefore allowed to be revised, and is floored at the bytes
+// already in hand so the bar can never read past 100%.
+func estimateStreamTotal(sp streamProg, prev int64) int64 {
+	est := prev
+	if sp.doneSeg > 0 && sp.totalSeg > 0 && sp.completedBytes > 0 {
+		est = sp.completedBytes * int64(sp.totalSeg) / int64(sp.doneSeg)
+	}
+	if est < sp.bytes {
+		est = sp.bytes
+	}
+	return est
 }
 
 func humanBytes(n int64) string {
