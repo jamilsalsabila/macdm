@@ -22,7 +22,24 @@ enum Notifier {
         let path = (job.dest?.isEmpty == false) ? job.dest : nil
         Toast.show(title: "Download complete", body: job.filename) {
             guard let path, FileManager.default.fileExists(atPath: path) else { return }
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            Reveal.inFinder(path)
+        }
+    }
+}
+
+/// Reveals a file in Finder without blocking the caller.
+///
+/// NSWorkspace.activateFileViewerSelecting sends the request to Finder and
+/// waits for an answer. When Finder is busy it does not answer, and the call
+/// sits there for a full 30 seconds ("didn't return pasteboard data in time").
+/// On the main thread that freezes the whole app — the button looks broken and
+/// nothing repaints — so the wait happens off it.
+enum Reveal {
+    static func inFinder(_ path: String) {
+        guard !path.isEmpty else { return }
+        let url = URL(fileURLWithPath: path)
+        DispatchQueue.global(qos: .userInitiated).async {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
         }
     }
 }

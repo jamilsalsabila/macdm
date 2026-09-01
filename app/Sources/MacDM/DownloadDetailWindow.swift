@@ -243,10 +243,7 @@ final class DownloadDetailWindowController: NSWindowController, NSTableViewDataS
         window?.close()
     }
     @objc private func openFolder() {
-        let path = job.dest ?? ""
-        if !path.isEmpty {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-        }
+        Reveal.inFinder(job.dest ?? "")
     }
 
     // conn table

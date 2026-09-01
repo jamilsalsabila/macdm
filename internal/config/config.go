@@ -16,7 +16,7 @@ const DefaultAddr = "127.0.0.1:7345"
 // Version is bumped whenever the daemon's wire behaviour changes. The menu-bar
 // app compares it against its own build and restarts a mismatched daemon so a
 // stale background macdmd never lingers after a rebuild.
-const Version = "0.7.0"
+const Version = "0.7.1"
 
 // Config is the on-disk settings file (config.json in the support dir). Every
 // field has a working default, so the file is optional.
