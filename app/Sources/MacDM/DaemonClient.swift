@@ -48,7 +48,19 @@ struct Job: Codable, Identifiable {
     var statusText: String { (scheduled_hold ?? false) ? "scheduled" : status }
 
     var percent: Double {
-        total_bytes > 0 ? min(100, Double(done_bytes) / Double(total_bytes) * 100) : 0
+        // A segmented stream knows exactly how many segments it has, and that
+        // count only ever rises. Deriving the bar from bytes meant dividing by
+        // an estimate of the total size, and every time that estimate was
+        // revised upward the bar slid *backwards* — 6 of 143 segments read
+        // 12.5%, then 9 of 143 read 12.0%.
+        //
+        // Segments are the honest measure here, and they are already what the
+        // window prints underneath. 143 of them make steps of 0.7%, which is
+        // smooth enough that nothing is lost by not interpolating.
+        if streamingSegments, let total = segments, total > 0 {
+            return min(100, Double(segments_done ?? 0) / Double(total) * 100)
+        }
+        return total_bytes > 0 ? min(100, Double(done_bytes) / Double(total_bytes) * 100) : 0
     }
     var isRunning: Bool { status == "downloading" || status == "probing" || status == "queued" }
 
