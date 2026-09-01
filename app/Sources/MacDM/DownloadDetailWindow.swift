@@ -160,7 +160,14 @@ final class DownloadDetailWindowController: NSWindowController, NSTableViewDataS
         etaField.stringValue = j.etaText
         resumeField.stringValue = (j.resumable ?? false) ? "Yes" : "No"
 
-        connStepper.isEnabled = (j.resumable ?? false) && j.kind == "http"
+        // The daemon accepts a live re-split for a resumable HTTP job and for
+        // an extract job on the direct path — its streams run through the same
+        // engine. The stepper was still gated on "http" alone, from before the
+        // extract path gained it, so the arrows were dead for every YouTube,
+        // Instagram and TikTok download even though the change would have
+        // worked. HLS and DASH stay fixed: their segment pools are sized from
+        // the global setting, not per job.
+        connStepper.isEnabled = (j.resumable ?? false) && (j.kind == "http" || j.kind == "extract")
         if !connEditing {
             connStepper.integerValue = max(1, j.connections)
             connValue.stringValue = connStepper.isEnabled ? "\(max(1, j.connections))"

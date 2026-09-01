@@ -386,6 +386,13 @@ func (m *Manager) execExtractDirect(ctx context.Context, id string, j *store.Job
 				jj.TotalBytes = total
 				jj.DoneBytes = doneBase + p.DoneBytes
 				jj.SpeedBps = p.SpeedBps
+				// Every other download path reports these; this one did not,
+				// so the window said "1 (fixed)" and "Resume capability: No"
+				// for every YouTube, Instagram and TikTok download — while the
+				// engine was in fact running eight connections and keeping a
+				// resume sidecar. The numbers were wrong, not the download.
+				jj.Connections = p.NumConns
+				jj.Resumable = p.Resumable
 			})
 		})
 		if err == nil {
@@ -878,6 +885,11 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 				jj.TotalBytes = p.TotalBytes
 			}
 			jj.SpeedBps = p.SpeedBps
+			// yt-dlp downloads a progressive format over one stream. Saying so
+			// beats leaving the count at zero, which the window rendered as "1"
+			// only because it floors the value — an accident that happened to
+			// look right.
+			jj.Connections = 1
 			jj.Conns = []store.ConnStat{{
 				Downloaded: p.DoneBytes, Total: 0, Status: "receiving",
 				Info: fmt.Sprintf("yt-dlp · %s of %s @ %s/s",
