@@ -795,6 +795,15 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		}
 	}
 	segProg := func(sp streamProg) {
+		// Disarm the watchdog. It exists to catch an extraction that never
+		// starts, and it was only ever disarmed by yt-dlp's own progress
+		// callback — so on this path, which is the one YouTube normally takes,
+		// it stayed armed and cancelled the job at 150 seconds. Every download
+		// longer than that died silently, reported as "paused" with no reason.
+		select {
+		case started <- struct{}{}:
+		default:
+		}
 		_, _ = m.st.Update(id, func(jj *store.Job) {
 			jj.Status = store.StatusDownloading
 			jj.Conns = sp.conns
@@ -804,6 +813,14 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		err := m.execExtractDirect(wdCtx, id, j, ex, opt, outDir, finalDir, mx, segProg, muxProg)
 		if err == nil {
 			return nil
+		}
+		// A watchdog kill arrives here as a plain cancellation, which the caller
+		// reads as "the user paused it" — a job that stopped for a reason would
+		// then sit there explaining nothing. Say what happened.
+		select {
+		case <-stalled:
+			return fmt.Errorf("gave up waiting for this video to start downloading (150s) — it may be throttled or need a newer yt-dlp (Settings → Update now)")
+		default:
 		}
 		if !errors.Is(err, errNoDirectPath) {
 			return err
