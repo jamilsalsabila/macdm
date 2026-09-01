@@ -945,16 +945,25 @@ func moveFile(src, dst string) error {
 }
 
 func finalize(m *Manager, id, path string) error {
-	fi, _ := os.Stat(path)
+	// Never report success for a file that is not there. The stat error used
+	// to be discarded, so a job whose output went missing — interrupted mux,
+	// a scratch dir cleared underneath it, a daemon killed at the wrong
+	// moment — still showed as completed, and the user found nothing in the
+	// download folder with nothing on screen to explain it.
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("finished but the file is missing at %s: %w", path, err)
+	}
+	if fi.Size() == 0 {
+		return fmt.Errorf("finished but the file is empty at %s", path)
+	}
 	_, _ = m.st.Update(id, func(jj *store.Job) {
 		jj.Status = store.StatusCompleted
 		jj.Dest = path
 		jj.Filename = filepath.Base(path)
 		jj.SpeedBps = 0
-		if fi != nil {
-			jj.TotalBytes = fi.Size()
-			jj.DoneBytes = fi.Size()
-		}
+		jj.TotalBytes = fi.Size()
+		jj.DoneBytes = fi.Size()
 		// normalise the detail row so the bar/table read 100%
 		jj.Conns = []store.ConnStat{{
 			Downloaded: jj.TotalBytes, Total: jj.TotalBytes,

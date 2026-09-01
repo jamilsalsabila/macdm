@@ -488,3 +488,45 @@ func TestExistingExtensionIsNotDoubled(t *testing.T) {
 		t.Errorf("saved as %q, want clip.mkv left alone", base)
 	}
 }
+
+// A job must never report success for a file that is not on disk. The stat
+// error used to be discarded, so a download whose output went missing still
+// showed as completed and the user found nothing in the folder.
+func TestFinalizeRefusesAMissingFile(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/jobs.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	m := New(Config{DownloadDir: t.TempDir()}, st)
+	t.Cleanup(func() { m.Shutdown(time.Second) })
+
+	dir := t.TempDir()
+	st.Put(&store.Job{ID: "j1", Status: store.StatusDownloading})
+
+	if err := finalize(m, "j1", filepath.Join(dir, "never-written.mp4")); err == nil {
+		t.Error("a missing file must not be reported as finished")
+	}
+	empty := filepath.Join(dir, "empty.mp4")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(m, "j1", empty); err == nil {
+		t.Error("an empty file must not be reported as finished")
+	}
+	if j, _ := st.Get("j1"); j.Status == store.StatusCompleted {
+		t.Error("the job was marked completed despite no usable file")
+	}
+
+	good := filepath.Join(dir, "real.mp4")
+	if err := os.WriteFile(good, []byte("some video bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(m, "j1", good); err != nil {
+		t.Fatalf("a real file must finalize cleanly: %v", err)
+	}
+	j, _ := st.Get("j1")
+	if j.Status != store.StatusCompleted || j.Dest != good {
+		t.Errorf("status=%q dest=%q", j.Status, j.Dest)
+	}
+}
