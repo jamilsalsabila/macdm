@@ -229,6 +229,10 @@ final class SettingsWindowController: NSWindowController {
             self.subLangsField.stringValue = info.subtitle_langs ?? ""
             self.autoSubsBox.state = (info.auto_subs ?? false) ? .on : .off
             self.audioLangField.stringValue = info.audio_lang ?? ""
+            if let dir = info.download_dir, !dir.isEmpty {
+                self.folder = dir
+                self.folderLabel.stringValue = (dir as NSString).abbreviatingWithTildeInPath
+            }
             let bps = info.speed_limit_bps ?? 0
             self.speedLimitField.stringValue = bps > 0 ? "\(bps / 1024)" : ""
             if let sc = info.schedule {
@@ -360,6 +364,20 @@ final class SettingsWindowController: NSWindowController {
         if panel.runModal() == .OK, let url = panel.url {
             folder = url.path
             folderLabel.stringValue = (folder as NSString).abbreviatingWithTildeInPath
+            // Tell the daemon too. Keeping this in the app's own defaults only
+            // prefilled the New Download dialog — anything accepted without the
+            // dialog still went to the built-in folder, so the setting looked
+            // ignored.
+            let chosen = folder
+            DaemonClient.shared.setConfig(["download_dir": chosen]) { [weak self] error in
+                guard let self = self, let error = error else { return }
+                self.folder = (NSHomeDirectory() as NSString).appendingPathComponent("Downloads/MacDM")
+                let a = NSAlert()
+                a.messageText = "Cannot use that folder"
+                a.informativeText = error
+                a.runModal()
+                self.refreshTools()
+            }
         }
     }
 

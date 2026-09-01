@@ -752,7 +752,7 @@ func (m *Manager) execExtract(ctx context.Context, id string, j *store.Job) erro
 		return err
 	}
 
-	finalDir := m.cfg.DownloadDir
+	finalDir := m.DownloadDir()
 	if d := filepath.Dir(j.Dest); d != "." && d != "" {
 		finalDir = d
 	}

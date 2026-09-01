@@ -273,7 +273,7 @@ func (m *Manager) Accept(id string, opt AcceptOptions) (*store.Job, error) {
 	dest := opt.Dest
 	switch {
 	case dest == "":
-		dest = filepath.Join(m.cfg.DownloadDir, name)
+		dest = filepath.Join(m.DownloadDir(), name)
 	case isDir(dest):
 		dest = filepath.Join(dest, name)
 	}

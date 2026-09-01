@@ -102,6 +102,7 @@ func (s *Server) getTools(w http.ResponseWriter, r *http.Request) {
 		"audio_lang":     cfg.AudioLang,
 		// From the manager, not the file: this is the ceiling in force now.
 		"speed_limit_bps": s.mgr.SpeedLimit(),
+		"download_dir":    s.mgr.DownloadDir(),
 		"schedule": map[string]any{
 			"enabled": sched.Enabled,
 			"start":   schedule.FormatHM(sched.Start),
@@ -134,6 +135,7 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 		ScheduleStart   *string `json:"schedule_start"`
 		ScheduleStop    *string `json:"schedule_stop"`
 		ScheduleDays    *[]int  `json:"schedule_days"`
+		DownloadDir     *string `json:"download_dir"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
@@ -167,6 +169,21 @@ func (s *Server) patchConfig(w http.ResponseWriter, r *http.Request) {
 		c.SpeedLimitBps = *req.SpeedLimitBps
 		touchedSpeed = true
 	}
+	// The download folder is the one setting that could not reach the daemon at
+	// all: the window kept it in its own defaults and used it only to prefill
+	// the New Download dialog, so anything accepted without the dialog still
+	// landed in the built-in folder. Applied here, before the file is written,
+	// so a folder that cannot be used is refused while the user is still
+	// looking at the picker.
+	if req.DownloadDir != nil {
+		dir := strings.TrimSpace(*req.DownloadDir)
+		if err := s.mgr.SetDownloadDir(dir); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		c.DownloadDir = dir
+	}
+
 	touchedSchedule := false
 	if req.ScheduleEnabled != nil {
 		c.ScheduleEnabled = *req.ScheduleEnabled

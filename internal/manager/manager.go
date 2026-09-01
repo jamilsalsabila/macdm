@@ -61,6 +61,12 @@ type Manager struct {
 	// stream clients, so one figure covers everything at once.
 	limiter *ratelimit.Bucket
 
+	// dirMu guards downloadDir, which the user can change from Settings while
+	// the daemon runs. WorkDir is deliberately not moved with it: scratch for
+	// jobs already in flight has to stay where those jobs left it.
+	dirMu       sync.RWMutex
+	downloadDir string
+
 	// schedMu guards sched only. Kept apart from mu, which start() already
 	// holds while it reads the window.
 	schedMu  sync.RWMutex
@@ -86,15 +92,16 @@ func New(cfg Config, st *store.Store) *Manager {
 	limiter := ratelimit.New(cfg.SpeedLimitBps)
 	cfg.Engine.Limiter = limiter
 	m := &Manager{
-		cfg:     cfg,
-		st:      st,
-		limiter: limiter,
-		eng:     engine.New(cfg.Engine),
-		slots:   make(chan struct{}, cfg.MaxActive),
-		running: map[string]context.CancelFunc{},
-		hub:     newProposalHub(),
-		sched:   cfg.Schedule,
-		stopped: make(chan struct{}),
+		cfg:         cfg,
+		st:          st,
+		limiter:     limiter,
+		eng:         engine.New(cfg.Engine),
+		slots:       make(chan struct{}, cfg.MaxActive),
+		running:     map[string]context.CancelFunc{},
+		hub:         newProposalHub(),
+		sched:       cfg.Schedule,
+		downloadDir: cfg.DownloadDir,
+		stopped:     make(chan struct{}),
 	}
 	m.pruneWorkDirs()
 	go m.watchSchedule(30 * time.Second)
@@ -229,6 +236,36 @@ func (m *Manager) pruneWorkDirs() {
 	}
 }
 
+// DownloadDir is the folder new downloads are saved to.
+func (m *Manager) DownloadDir() string {
+	m.dirMu.RLock()
+	defer m.dirMu.RUnlock()
+	return m.downloadDir
+}
+
+// SetDownloadDir changes where new downloads are saved, while the daemon runs.
+// Jobs already under way keep the destination they were given.
+func (m *Manager) SetDownloadDir(dir string) error {
+	if dir == "" {
+		return errors.New("download folder cannot be empty")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("cannot use %s: %w", dir, err)
+	}
+	// Writable, not merely present: an external drive can be mounted read-only,
+	// and finding that out only when a download finishes is too late.
+	probe := filepath.Join(dir, ".macdm-write-test")
+	if err := os.WriteFile(probe, []byte("x"), 0o644); err != nil {
+		return fmt.Errorf("cannot write to %s: %w", dir, err)
+	}
+	_ = os.Remove(probe)
+
+	m.dirMu.Lock()
+	m.downloadDir = dir
+	m.dirMu.Unlock()
+	return nil
+}
+
 // SetSpeedLimit changes the total transfer ceiling in bytes per second while
 // downloads are running; 0 removes it. Takes effect on the next block of bytes,
 // with no restart and no interruption to jobs in flight.
@@ -280,7 +317,7 @@ func (m *Manager) Add(rawurl string, opt AddOptions) (*store.Job, error) {
 	dest := opt.Dest
 	switch {
 	case dest == "":
-		dest = filepath.Join(m.cfg.DownloadDir, name)
+		dest = filepath.Join(m.DownloadDir(), name)
 	case isDir(dest):
 		dest = filepath.Join(dest, name)
 	default:

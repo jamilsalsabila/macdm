@@ -149,6 +149,8 @@ struct ToolsInfo: Codable {
     var audio_lang: String?
     /// Total transfer ceiling in bytes per second; 0 means unlimited.
     var speed_limit_bps: Int64?
+    /// Where the daemon saves downloads that arrive without an explicit folder.
+    var download_dir: String?
     var schedule: ScheduleInfo?
 }
 

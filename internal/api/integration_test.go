@@ -17,6 +17,7 @@ import (
 	"macdm/internal/engine"
 	"macdm/internal/manager"
 	"macdm/internal/store"
+	"path/filepath"
 )
 
 func fileServer(size int) *httptest.Server {
@@ -322,5 +323,72 @@ func TestEnablingScheduleWithoutTimesIsRefused(t *testing.T) {
 	}
 	if !mgr.Schedule().Enabled {
 		t.Error("schedule should be enabled")
+	}
+}
+
+// The download folder is the one setting that could not reach the daemon at
+// all: the window kept it in its own defaults and used it only to prefill the
+// New Download dialog, so anything accepted without the dialog still landed in
+// the built-in folder and the setting looked ignored.
+func TestDownloadDirCanBeChangedAndIsValidated(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	st, err := store.Open(t.TempDir() + "/jobs.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	original := t.TempDir()
+	mgr := manager.New(manager.Config{DownloadDir: original}, st)
+	defer mgr.Shutdown(time.Second)
+	srv := httptest.NewServer(api.New(mgr))
+	defer srv.Close()
+
+	post := func(body string) int {
+		t.Helper()
+		resp, err := http.Post(srv.URL+"/api/config", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	if got := mgr.DownloadDir(); got != original {
+		t.Fatalf("DownloadDir = %q, want %q", got, original)
+	}
+
+	elsewhere := filepath.Join(t.TempDir(), "External Drive")
+	if code := post(`{"download_dir": ` + strconv.Quote(elsewhere) + `}`); code != http.StatusNoContent {
+		t.Fatalf("changing the folder returned %d, want 204", code)
+	}
+	if got := mgr.DownloadDir(); got != elsewhere {
+		t.Errorf("DownloadDir = %q, want %q", got, elsewhere)
+	}
+	// It is created if it does not exist yet, the way picking a fresh folder
+	// on a drive would need.
+	if fi, err := os.Stat(elsewhere); err != nil || !fi.IsDir() {
+		t.Errorf("the chosen folder was not created: %v", err)
+	}
+
+	// A folder that cannot be written to is refused while the user is still
+	// looking at the picker, rather than failing when a download finishes.
+	readonly := filepath.Join(t.TempDir(), "readonly")
+	if err := os.MkdirAll(readonly, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(readonly, 0o700) })
+	blocked := filepath.Join(readonly, "sub")
+	if code := post(`{"download_dir": ` + strconv.Quote(blocked) + `}`); code != http.StatusBadRequest {
+		t.Errorf("an unusable folder returned %d, want 400", code)
+	}
+	if got := mgr.DownloadDir(); got != elsewhere {
+		t.Errorf("a refused change moved the folder to %q", got)
+	}
+
+	// And an empty value is refused rather than silently meaning "root".
+	if code := post(`{"download_dir": ""}`); code != http.StatusBadRequest {
+		t.Errorf("an empty folder returned %d, want 400", code)
 	}
 }
